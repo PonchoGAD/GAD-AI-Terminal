@@ -1,8 +1,15 @@
-export default {
-  nav: { home: 'Главная', pricing: 'Тарифы', faq: 'Вопросы', contact: 'Контакты' },
-  hero: {
-    title: 'Быстрый запуск SaaS лендинга',
-    subtitle: 'Чистый демо-проект на Next.js',
-    cta: 'Начать',
+const ru = {
+  nav: {
+    home: 'Главная',
+    pricing: 'Тарифы',
+    faq: 'FAQ',
+    contact: 'Контакты'
   },
+  hero: {
+    title: 'Демо SaaS лендинг',
+    subtitle: 'Чистый MVP на Next.js',
+    cta: 'Смотреть тарифы'
+  }
 };
+
+export default ru;

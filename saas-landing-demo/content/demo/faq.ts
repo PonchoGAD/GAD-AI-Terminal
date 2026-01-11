@@ -1,4 +1,15 @@
-export const faq = [
-  { q: 'Is this production ready?', a: 'Yes, as a demo SaaS landing.' },
-  { q: 'Is backend included?', a: 'No, intentionally.' },
+export type FAQItem = {
+  q: string;
+  a: string;
+};
+
+export const faq: FAQItem[] = [
+  {
+    q: 'Is this project production ready?',
+    a: 'Yes, as a SaaS landing demo.'
+  },
+  {
+    q: 'Does it include backend?',
+    a: 'No. Backend is intentionally excluded.'
+  }
 ];

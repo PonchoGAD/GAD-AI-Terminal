@@ -33,3 +33,18 @@ To demonstrate clean architecture, i18n, SEO and MVP discipline.
 - Real contact submit
 - CMS
 - Analytics
+
+
+## Who is this for
+Founders and teams who need a fast, SEO-ready SaaS landing.
+
+## What you see in 3 minutes
+- Clean UI
+- Pricing logic
+- i18n routing
+- SEO setup
+
+## What is intentionally missing
+- Backend
+- Payments
+- Analytics
