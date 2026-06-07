@@ -13,8 +13,8 @@ exports.executeAutoSell = executeAutoSell;
 const web3_js_1 = require("@solana/web3.js");
 const axios_1 = __importDefault(require("axios"));
 const NATIVE_SOL_MINT = 'So11111111111111111111111111111111111111112';
-const JUPITER_QUOTE_URL = 'https://quote-api.jup.ag/v6/quote';
-const JUPITER_SWAP_URL = 'https://quote-api.jup.ag/v6/swap';
+const JUPITER_QUOTE_URL = 'https://api.jup.ag/swap/v1/quote';
+const JUPITER_SWAP_URL = 'https://api.jup.ag/swap/v1/swap';
 const LAMPORTS_PER_SOL = 1000000000;
 // ─── Staged sell config ───────────────────────────────────────────────────────
 exports.SELL_STAGES = [

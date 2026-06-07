@@ -8,8 +8,8 @@ import {
 import axios from 'axios';
 
 const NATIVE_SOL_MINT = 'So11111111111111111111111111111111111111112';
-const JUPITER_QUOTE_URL = 'https://quote-api.jup.ag/v6/quote';
-const JUPITER_SWAP_URL  = 'https://quote-api.jup.ag/v6/swap';
+const JUPITER_QUOTE_URL = 'https://api.jup.ag/swap/v1/quote';
+const JUPITER_SWAP_URL  = 'https://api.jup.ag/swap/v1/swap';
 const LAMPORTS_PER_SOL  = 1_000_000_000;
 
 export interface BuyParams {
@@ -147,12 +147,34 @@ async function sendAndConfirm(
   const txBuffer = Buffer.from(swapTransaction, 'base64');
   const tx = VersionedTransaction.deserialize(txBuffer);
   tx.sign([keypair]);
-  const signature = await connection.sendRawTransaction(tx.serialize(), {
-    skipPreflight: false,
-    maxRetries: 2
-  });
-  const latestBlockhash = await connection.getLatestBlockhash();
-  await connection.confirmTransaction({ signature, ...latestBlockhash }, 'confirmed');
+
+  // sendRawTransaction may succeed while confirmTransaction can throw.
+  // Capture signature before confirmation so callers can log it even on failure.
+  let signature: string | undefined;
+  try {
+    signature = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      maxRetries: 3
+    });
+  } catch (sendErr) {
+    // TX never reached the network — safe to propagate
+    throw sendErr;
+  }
+
+  try {
+    const latestBlockhash = await connection.getLatestBlockhash('confirmed');
+    await connection.confirmTransaction({ signature, ...latestBlockhash }, 'confirmed');
+  } catch (confirmErr) {
+    // TX was sent to Solana but confirmation failed (RPC timeout, network issue).
+    // Attach signature to the error so the caller can record it and later verify.
+    (confirmErr as any).txSignature = signature;
+    console.warn(
+      `[autobuy] TX sent (${signature}) but confirmation threw — ` +
+      `verify on-chain before assuming failure. Error: ${(confirmErr as Error).message}`
+    );
+    throw confirmErr;
+  }
+
   return signature;
 }
 
@@ -208,8 +230,18 @@ export async function executeAutoBuy(
       outputAmountRaw,
       entryPriceSol
     };
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
+  } catch (error: any) {
+    const msg = error?.message ?? String(error);
+    // TX may have landed on-chain even if confirmation threw — surface the signature
+    const partialSig: string | undefined = error?.txSignature;
+    if (partialSig) {
+      console.warn(`[autobuy] BUY: TX may have landed — signature ${partialSig} — verify on-chain`);
+      return {
+        success: false,
+        txSignature: partialSig,
+        error: `Confirmation failed (TX may be on-chain: ${partialSig}): ${msg}`.slice(0, 500),
+      };
+    }
     return { success: false, error: msg.length > 300 ? msg.slice(0, 300) + '...' : msg };
   }
 }
@@ -249,8 +281,21 @@ export async function executeAutoSell(
       solReceived,
       currentPriceSol
     };
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
+  } catch (error: any) {
+    const msg = error?.message ?? String(error);
+    const partialSig: string | undefined = error?.txSignature;
+    if (partialSig) {
+      console.warn(`[autobuy] SELL: TX may have landed — signature ${partialSig} — verify on-chain`);
+      // Treat as success with a warning — tokens likely sold, record it
+      return {
+        success: true,
+        txSignature: partialSig,
+        tokensIn: tokenAmount,
+        solReceived: 0, // unknown — confirmation failed
+        currentPriceSol: 0,
+        error: `Confirmation uncertain — TX may be on-chain: ${partialSig}`,
+      };
+    }
     return { success: false, error: msg.length > 300 ? msg.slice(0, 300) + '...' : msg };
   }
 }

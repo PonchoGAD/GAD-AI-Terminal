@@ -6,7 +6,7 @@ dotenv.config();
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const API_BASE  = process.env.API_BASE_URL || 'http://localhost:4000';
-const SITE_URL  = process.env.SITE_URL     || 'https://gadai.com';
+const SITE_URL  = process.env.SITE_URL     || 'https://gadai.shop';
 const ADMIN_ID  = process.env.TELEGRAM_ADMIN_CHAT_ID;
 const PAGE_SIZE = 8;
 
@@ -99,8 +99,8 @@ async function requireSub(chatId: number, telegramId: number): Promise<boolean> 
 
   const payUrl = `${SITE_URL}/pay?tg_id=${telegramId}`;
   const msg = status.walletLinked
-    ? `🔒 *Subscription expired.*\nRenew to continue using GAD AI Terminal.\n\n🧪 Trial — 0.1 SOL / 1 day\n💎 Monthly — 1 SOL / 30 days`
-    : `🔒 *Access Required*\n\nSubscription needed to use this feature.\n\n🧪 Trial — 0.1 SOL / 1 day\n💎 Monthly — 1 SOL / 30 days\n\nConnect Phantom or Solflare on the payment page.`;
+    ? `🔒 *Subscription expired.*\nRenew to continue using GAD AI Terminal.\n\n🧪 1-Day Trial — 0.05 SOL\n⚡ 3-Day Access — 0.1 SOL\n💎 Monthly — 1 SOL / 30 days`
+    : `🔒 *Access Required*\n\nSubscription needed to use this feature.\n\n🧪 1-Day Trial — 0.05 SOL\n⚡ 3-Day Access — 0.1 SOL\n💎 Monthly — 1 SOL / 30 days\n\nConnect Phantom or Solflare on the payment page.`;
 
   await send(chatId, msg, {
     reply_markup: { inline_keyboard: [[{ text: '💳 Get Access', url: payUrl }]] }
@@ -173,8 +173,9 @@ bot.onText(/\/subscribe/, (msg) => guard(msg.chat.id, async () => {
   const payUrl = `${SITE_URL}/pay?tg_id=${tgId}`;
   send(msg.chat.id,
     `💳 *Subscription Plans*\n\n` +
-    `🧪 *1-Day Trial* — 0.1 SOL\n  24 hours access, one trial per wallet\n\n` +
-    `💎 *Monthly Full Access* — 1 SOL\n  30 days, all features unlocked\n\n` +
+    `🧪 *1-Day Trial* — 0.05 SOL\n  24h full access, one trial per wallet\n\n` +
+    `⚡ *3-Day Access* — 0.1 SOL\n  72h full access, all Alpha Engine features\n\n` +
+    `💎 *Monthly Full Access* — 1 SOL\n  30 days, all features + Auto-buy\n\n` +
     `Payment goes directly to treasury on Solana mainnet.\nAccepted wallets: Phantom, Solflare.`,
     { reply_markup: { inline_keyboard: [[{ text: '💳 Pay & Get Access', url: payUrl }]] } }
   );
@@ -396,7 +397,7 @@ bot.on('callback_query', async (query) => {
   if (action === 'subscribe') {
     const payUrl = `${SITE_URL}/pay?tg_id=${tgId}`;
     await send(chatId,
-      `💳 *Subscription Plans*\n\n🧪 Trial — 0.1 SOL / 1 day\n💎 Monthly — 1 SOL / 30 days`,
+      `💳 *Subscription Plans*\n\n🧪 1-Day Trial — 0.05 SOL\n⚡ 3-Day Access — 0.1 SOL\n💎 Monthly — 1 SOL / 30 days`,
       { reply_markup: { inline_keyboard: [[{ text: '💳 Open Payment Page', url: payUrl }]] } }
     );
     return;

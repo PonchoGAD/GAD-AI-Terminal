@@ -1,4 +1,4 @@
-import { query } from '@lib/db';
+import { query, transaction } from '@lib/db';
 import {
   executeAutoBuy,
   executeAutoSell,
@@ -7,9 +7,17 @@ import {
   getConnection,
   SELL_STAGES,
 } from '@lib/autobuy';
+import { processAutoSignals, AUTO_BUY_ENABLED } from './auto-signal';
 
-const POLL_MS   = Number(process.env.AUTOBUY_POLL_SECONDS || '15') * 1000;
-const MAX_ERRORS = Number(process.env.AUTOBUY_MAX_ERRORS  || '5');
+const POLL_MS    = Number(process.env.AUTOBUY_POLL_SECONDS  || '15') * 1000;
+const MAX_ERRORS = Number(process.env.AUTOBUY_MAX_ERRORS    || '5');
+
+// Configurable via env — safe defaults for real money
+const AUTOSELL_SLIPPAGE_BPS = Number(process.env.AUTOSELL_SLIPPAGE_BPS || '150');
+const AUTOBUY_SLIPPAGE_BPS  = Number(process.env.AUTOBUY_SLIPPAGE_BPS  || '100');
+
+// Stop-loss: sell ALL if price drops this % below entry (0 = disabled)
+const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || '50') / 100;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -37,13 +45,26 @@ interface AutosellStage {
 
 // ─── Buy helpers ──────────────────────────────────────────────────────────────
 
-async function fetchDueJobs(): Promise<AutobuyJob[]> {
+/**
+ * Fetch due jobs with FOR UPDATE SKIP LOCKED — prevents two concurrent scheduler
+ * instances from processing the same job simultaneously (double-buy protection).
+ * Atomically pushes next_run_at forward so the job won't re-appear this cycle.
+ */
+async function fetchAndLockDueJobs(): Promise<AutobuyJob[]> {
   const { rows } = await query<AutobuyJob>(
-    `SELECT id, mint_address, label, amount_sol, slippage_bps, interval_seconds,
-            error_count, autosell_enabled
-     FROM autobuy_jobs
-     WHERE active = true AND next_run_at <= now()
-     ORDER BY next_run_at ASC LIMIT 20`
+    `WITH locked AS (
+       SELECT id FROM autobuy_jobs
+       WHERE active = true AND next_run_at <= now()
+       ORDER BY next_run_at ASC LIMIT 20
+       FOR UPDATE SKIP LOCKED
+     )
+     UPDATE autobuy_jobs SET next_run_at = now() + interval '1 hour'
+     FROM locked
+     WHERE autobuy_jobs.id = locked.id
+     RETURNING autobuy_jobs.id, autobuy_jobs.mint_address, autobuy_jobs.label,
+               autobuy_jobs.amount_sol, autobuy_jobs.slippage_bps,
+               autobuy_jobs.interval_seconds, autobuy_jobs.error_count,
+               autobuy_jobs.autosell_enabled`
   );
   return rows;
 }
@@ -148,7 +169,6 @@ async function checkAndExecuteSells(walletAddress: string) {
   }
 
   for (const [mint, mintStages] of byMint) {
-    // Check price once per mint (use first stage's token amount for reference)
     const refStage = mintStages[0];
     if (!refStage.tokens_at_stage || Number(refStage.tokens_at_stage) <= 0) continue;
 
@@ -161,6 +181,65 @@ async function checkAndExecuteSells(walletAddress: string) {
       continue;
     }
 
+    // ── Stop-loss check ───────────────────────────────────────────────────────
+    if (STOP_LOSS_PCT > 0) {
+      const refEntry = Number(mintStages[0]?.entry_price_sol ?? 0);
+      if (refEntry > 0 && currentPriceSol < refEntry * (1 - STOP_LOSS_PCT)) {
+        console.warn(
+          `[autosell] 🛑 STOP-LOSS triggered for ${mint.slice(0, 8)} — ` +
+          `price ${currentPriceSol.toFixed(10)} < stop ${(refEntry * (1 - STOP_LOSS_PCT)).toFixed(10)} ` +
+          `(${(STOP_LOSS_PCT * 100).toFixed(0)}% below entry ${refEntry.toFixed(10)})`
+        );
+        // Sell all pending stages immediately — claim stage 1 and sell all tokens
+        const pendingStages = mintStages.filter(s => s.status === 'pending' && s.tokens_at_stage);
+        const totalTokens = pendingStages.reduce((acc, s) => acc + Number(s.tokens_at_stage ?? 0), 0n as unknown as number);
+        // Sum up tokens across all pending stages for stage-1 amount (this covers everything)
+        const firstPending = pendingStages[0];
+        if (firstPending && firstPending.tokens_at_stage) {
+          const { rows: claimed } = await query(
+            `UPDATE autosell_stages SET status = 'triggered'
+             WHERE autobuy_job_id = $1 AND status = 'pending'
+             RETURNING id, tokens_at_stage`,
+            [firstPending.autobuy_job_id]
+          );
+          if (claimed.length) {
+            const totalToSell = claimed.reduce(
+              (acc, r) => acc + BigInt(Math.floor(Number(r.tokens_at_stage ?? 0))), 0n
+            );
+            const sellResult = await executeAutoSell(
+              { mintAddress: mint, tokenAmount: totalToSell, slippageBps: AUTOSELL_SLIPPAGE_BPS },
+              connection, keypair
+            );
+            const stageIds = claimed.map(r => r.id);
+            if (sellResult.success) {
+              await query(
+                `UPDATE autosell_stages SET status = 'executed', sol_received = $1,
+                   tx_signature = $2, executed_at = now()
+                 WHERE id = ANY($3)`,
+                [sellResult.solReceived, sellResult.txSignature, stageIds]
+              );
+              await query(
+                `UPDATE autobuy_jobs SET active = false, total_sold_sol = total_sold_sol + $1
+                 WHERE id = $2`,
+                [sellResult.solReceived, firstPending.autobuy_job_id]
+              );
+              console.info(
+                `[autosell] 🛑 Stop-loss EXECUTED — ${totalToSell}tok → ${sellResult.solReceived?.toFixed(4)}SOL ` +
+                `tx:${sellResult.txSignature}`
+              );
+            } else {
+              await query(
+                `UPDATE autosell_stages SET status = 'pending' WHERE id = ANY($1)`,
+                [stageIds]
+              );
+              console.error(`[autosell] 🛑 Stop-loss FAILED: ${sellResult.error}`);
+            }
+          }
+        }
+        continue; // Skip normal stage processing for this mint
+      }
+    }
+
     for (const stage of mintStages.sort((a, b) => a.stage_number - b.stage_number)) {
       const targetPrice = Number(stage.entry_price_sol) * stage.trigger_mult;
 
@@ -170,28 +249,37 @@ async function checkAndExecuteSells(walletAddress: string) {
           `current ${currentPriceSol.toFixed(10)} < target ${targetPrice.toFixed(10)} ` +
           `(${stage.trigger_mult}x of entry)`
         );
-        break; // lower stages must fire first — stop checking higher ones
+        break;
       }
 
-      // ✅ Target hit — execute sell
       console.info(
         `[autosell] 🎯 Stage ${stage.stage_number} TRIGGERED for ${mint.slice(0,8)} — ` +
-        `${stage.trigger_mult}x (${(stage.trigger_mult - 1) * 100}% gain) — ` +
-        `selling ${stage.sell_percent}% of position`
+        `${stage.trigger_mult}x — selling ${stage.sell_percent}% of position`
       );
 
       const tokensToSell = BigInt(Math.floor(
         Number(stage.tokens_at_stage) * stage.sell_percent / 100
       ));
 
-      // Mark as triggered so we don't double-sell if something fails
-      await query(
-        `UPDATE autosell_stages SET status = 'triggered' WHERE id = $1`,
+      // Atomic claim: only one scheduler instance will succeed here.
+      // If another instance already changed status away from 'pending', skip.
+      const { rows: claimed } = await query(
+        `UPDATE autosell_stages SET status = 'triggered'
+         WHERE id = $1 AND status = 'pending'
+         RETURNING id`,
         [stage.id]
       );
+      if (!claimed.length) {
+        console.warn(`[autosell] Stage ${stage.id} already claimed by another process — skipping`);
+        break;
+      }
 
       const sellResult = await executeAutoSell(
-        { mintAddress: mint, tokenAmount: tokensToSell, slippageBps: 150 },
+        {
+          mintAddress: mint,
+          tokenAmount: tokensToSell,
+          slippageBps: AUTOSELL_SLIPPAGE_BPS,
+        },
         connection,
         keypair
       );
@@ -215,14 +303,19 @@ async function checkAndExecuteSells(walletAddress: string) {
         console.info(
           `[autosell] ✅ Stage ${stage.stage_number} SOLD — ` +
           `${tokensToSell.toString()} tokens → ${sellResult.solReceived?.toFixed(4)} SOL ` +
-          `tx: ${sellResult.txSignature}`
+          `(job:${stage.autobuy_job_id.slice(0,8)}) tx: ${sellResult.txSignature}`
         );
       } else {
+        // Revert so next cycle retries — but only if we still own 'triggered'
         await query(
-          `UPDATE autosell_stages SET status = 'pending' WHERE id = $1`,
+          `UPDATE autosell_stages SET status = 'pending'
+           WHERE id = $1 AND status = 'triggered'`,
           [stage.id]
         );
-        console.error(`[autosell] ❌ Stage ${stage.stage_number} sell failed: ${sellResult.error}`);
+        console.error(
+          `[autosell] ❌ Stage ${stage.stage_number} sell failed ` +
+          `(mint:${mint.slice(0,8)} job:${stage.autobuy_job_id.slice(0,8)}): ${sellResult.error}`
+        );
         break;
       }
     }
@@ -239,17 +332,19 @@ async function runBuyCycle() {
   }
 
   const connection = getConnection();
-  const jobs = await fetchDueJobs();
+  // FOR UPDATE SKIP LOCKED prevents double-buy across concurrent instances
+  const jobs = await fetchAndLockDueJobs();
   if (!jobs.length) return;
 
   console.info(`[autobuy] Processing ${jobs.length} buy job(s).`);
 
   for (const job of jobs) {
     const tag = job.label ? `"${job.label}"` : job.mint_address.slice(0, 8) + '...';
-    console.info(`[autobuy] Buying ${job.amount_sol} SOL of ${tag}`);
+    const slippage = job.slippage_bps ?? AUTOBUY_SLIPPAGE_BPS;
+    console.info(`[autobuy] Buying ${job.amount_sol} SOL of ${tag} (slippage: ${slippage}bps)`);
 
     const result = await executeAutoBuy(
-      { mintAddress: job.mint_address, amountSol: Number(job.amount_sol), slippageBps: job.slippage_bps },
+      { mintAddress: job.mint_address, amountSol: Number(job.amount_sol), slippageBps: slippage },
       connection, keypair
     );
 
@@ -261,7 +356,6 @@ async function runBuyCycle() {
         result.outputAmountRaw ?? null
       );
 
-      // Create staged sell orders if autosell is enabled
       if (job.autosell_enabled && result.outputAmountRaw && result.entryPriceSol) {
         await createSellStages(
           job.id, job.mint_address, keypair.publicKey.toBase58(),
@@ -269,7 +363,7 @@ async function runBuyCycle() {
         );
       }
     } else {
-      console.error(`[autobuy] ❌ FAIL ${tag} — ${result.error}`);
+      console.error(`[autobuy] ❌ FAIL ${tag} (job:${job.id.slice(0,8)}) — ${result.error}`);
       await markBuyError(job.id, result.error ?? 'unknown', job.interval_seconds);
     }
   }
@@ -280,6 +374,9 @@ async function runBuyCycle() {
 export async function startAutobuyScheduler() {
   console.info(`[autobuy] Scheduler started. Poll every ${POLL_MS / 1000}s.`);
   console.info(`[autobuy] Sell stages: ${SELL_STAGES.map(s => `${s.multiplier}x(${s.sellPct}%)`).join(' → ')}`);
+  console.info(`[autobuy] Slippage — buy: ${AUTOBUY_SLIPPAGE_BPS}bps, sell: ${AUTOSELL_SLIPPAGE_BPS}bps`);
+  console.info(`[autobuy] Stop-loss: ${STOP_LOSS_PCT > 0 ? `${(STOP_LOSS_PCT * 100).toFixed(0)}%` : 'disabled'}`);
+  console.info(`[autobuy] Auto-signal: ${AUTO_BUY_ENABLED ? 'ENABLED' : 'disabled (set AUTO_BUY_ENABLED=true to activate)'}`);
 
   let shouldStop = false;
   process.on('SIGINT',  () => { shouldStop = true; });
@@ -289,12 +386,21 @@ export async function startAutobuyScheduler() {
   const walletAddress = keypair?.publicKey.toBase58() ?? '';
 
   while (!shouldStop) {
+    // 1. Process scanner signals → create buy jobs automatically
+    try {
+      if (walletAddress) await processAutoSignals(walletAddress);
+    } catch (err) {
+      console.error('[autobuy] Auto-signal error:', err);
+    }
+
+    // 2. Execute pending buy jobs
     try {
       await runBuyCycle();
     } catch (err) {
       console.error('[autobuy] Buy cycle error:', err);
     }
 
+    // 3. Check sell stages + stop-loss
     try {
       if (walletAddress) await checkAndExecuteSells(walletAddress);
     } catch (err) {

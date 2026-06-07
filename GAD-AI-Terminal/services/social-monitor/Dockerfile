@@ -6,5 +6,5 @@ COPY services/social-monitor/package.json ./services/social-monitor/package.json
 COPY libs ./libs
 COPY services/social-monitor ./services/social-monitor
 RUN npm install
-RUN npm --workspace social-monitor run build
+RUN npm --workspace services/social-monitor run build
 CMD ["node", "services/social-monitor/dist/index.js"]
