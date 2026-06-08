@@ -41,6 +41,7 @@ interface AutosellStage {
   sell_percent: number;
   entry_price_sol: number;
   tokens_at_stage: number | null;
+  status: string;
 }
 
 // ─── Buy helpers ──────────────────────────────────────────────────────────────
