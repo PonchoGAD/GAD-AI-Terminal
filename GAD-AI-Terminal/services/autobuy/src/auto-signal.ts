@@ -24,7 +24,9 @@ export const AUTO_BUY_ENABLED   = process.env.AUTO_BUY_ENABLED === 'true';
 const MAX_AUTO_POSITIONS        = Number(process.env.MAX_AUTO_POSITIONS    || '5');
 const AUTO_BUY_SOL              = Number(process.env.AUTO_BUY_SOL          || '0.02');
 const DAILY_MAX_SOL             = Number(process.env.DAILY_MAX_SOL         || '0.3');
-const MIN_SIGNAL_SCORE          = Number(process.env.MIN_SIGNAL_SCORE      || '80');
+// 93+ = top ~1% of tokens by AI score — only highest-conviction entries
+// Telegram bot uses 80 for informational alerts; auto-buy requires 93 to filter false positives
+const MIN_SIGNAL_SCORE          = Number(process.env.MIN_SIGNAL_SCORE      || '93');
 const SIGNAL_COOLDOWN_HOURS     = Number(process.env.SIGNAL_COOLDOWN_HOURS || '6');
 
 // Only act on top-quality signals
@@ -37,6 +39,8 @@ const MIN_VOLUME_H1_USD  = Number(process.env.MIN_VOLUME_H1_USD  || '5000');
 const MIN_TOKEN_AGE_SEC  = Number(process.env.MIN_TOKEN_AGE_SEC  || '7200');  // 2h
 // Minimum allowed 1h price change % (stop buying free-falling tokens)
 const MIN_PRICE_CHANGE_1H = Number(process.env.MIN_PRICE_CHANGE_1H || '-20');
+// Maximum 1h price change — don't buy at the top after a huge pump
+const MAX_PRICE_CHANGE_1H = Number(process.env.MAX_PRICE_CHANGE_1H || '150');
 
 // Time limit for positions (seconds) — sell 95% if no activity
 const TIME_LIMIT_SECONDS = Number(process.env.TIME_LIMIT_SECONDS || '1800');
@@ -118,6 +122,9 @@ async function checkLiquidity(mint: string): Promise<LiqCheck> {
     }
     if (pc1h < MIN_PRICE_CHANGE_1H) {
       return { ok: false, reason: `1h price ${pc1h.toFixed(1)}% < min ${MIN_PRICE_CHANGE_1H}% (freefall)` };
+    }
+    if (pc1h > MAX_PRICE_CHANGE_1H) {
+      return { ok: false, reason: `1h price +${pc1h.toFixed(0)}% > max ${MAX_PRICE_CHANGE_1H}% (already at top)` };
     }
 
     return {

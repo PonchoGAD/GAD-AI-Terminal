@@ -205,10 +205,31 @@ async function claimAndSell(
   );
   if (!claimed.length) return 'fail';
 
-  const totalTokens = claimed.reduce(
-    (acc, r) => acc + BigInt(Math.floor(Number(r.tokens_at_stage ?? 0))), 0n
-  );
-  const tokensToSell = BigInt(Math.floor(Number(totalTokens) * sellPct / 100));
+  // tokens_at_stage stores the REMAINING balance at each stage trigger point (cumulative, not incremental).
+  // Stage 1 = full initial balance, Stage 2 = 60% remaining, etc.
+  // Summing them all would produce 11x the real balance → 0x1788 InsufficientFunds.
+  // Correct approach: read the actual on-chain wallet balance and sell sellPct% of that.
+  let tokensToSell: bigint;
+  try {
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+      keypair.publicKey, { mint: new PublicKey(mint) }
+    );
+    const onChainBalance = BigInt(
+      (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
+    );
+    tokensToSell = BigInt(Math.floor(Number(onChainBalance) * sellPct / 100));
+    if (tokensToSell <= 0n) {
+      console.warn(`[sell] ${mint.slice(0,8)} on-chain balance is 0 — marking as unsellable`);
+      await query(`UPDATE autosell_stages SET status='pending' WHERE id=ANY($1)`, [claimed.map(r => r.id)]);
+      return 'fail';
+    }
+  } catch (balErr: any) {
+    // Fallback to stage 1 tokens_at_stage if on-chain check fails
+    const stage1 = claimed.sort((a, b) => Number(b.tokens_at_stage ?? 0) - Number(a.tokens_at_stage ?? 0))[0];
+    const stage1Tokens = BigInt(Math.floor(Number(stage1?.tokens_at_stage ?? 0)));
+    tokensToSell = BigInt(Math.floor(Number(stage1Tokens) * sellPct / 100));
+    console.warn(`[sell] On-chain balance check failed for ${mint.slice(0,8)}, using stage1 tokens: ${stage1Tokens}`);
+  }
   const stageIds = claimed.map(r => r.id);
 
   const sellResult = await executeAutoSell(
