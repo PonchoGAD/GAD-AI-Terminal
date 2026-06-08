@@ -51,13 +51,17 @@ export interface PriceResult {
 }
 
 // ─── Staged sell config ───────────────────────────────────────────────────────
+// Stage 1 at 2x: already in profit, sell half → rest rides for free
+// Stage 2 at 5x: lock more gains
+// Stage 3 at 10x: serious moonshot territory
+// Stage 4 at 25x: exit majority
+// Stage 5 at 50x: sell everything — rare but happens on memecoins
 export const SELL_STAGES = [
-  { stage: 1, multiplier: 4.0,  sellPct: 75 },   // +300% → sell 75%
-  { stage: 2, multiplier: 7.0,  sellPct: 75 },   // +600% → sell 75% of remaining
-  { stage: 3, multiplier: 11.0, sellPct: 75 },   // +1000%
-  { stage: 4, multiplier: 16.0, sellPct: 75 },   // +1500%
-  { stage: 5, multiplier: 21.0, sellPct: 75 },   // +2000%
-  { stage: 6, multiplier: 31.0, sellPct: 100 },  // +3000% → sell ALL remaining
+  { stage: 1, multiplier: 1.3,  sellPct: 40 },  // +30%   → sell 40% (immediate risk reduction)
+  { stage: 2, multiplier: 2.0,  sellPct: 40 },  // +100%  → sell 40% remaining (recover capital)
+  { stage: 3, multiplier: 5.0,  sellPct: 40 },  // +400%  → sell 40% remaining
+  { stage: 4, multiplier: 10.0, sellPct: 50 },  // +900%  → sell half
+  { stage: 5, multiplier: 20.0, sellPct: 100 }, // +1900% → full exit (moonshot)
 ] as const;
 
 // ─── Keypair loader ───────────────────────────────────────────────────────────
