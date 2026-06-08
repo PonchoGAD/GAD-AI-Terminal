@@ -24,9 +24,9 @@ export const AUTO_BUY_ENABLED   = process.env.AUTO_BUY_ENABLED === 'true';
 const MAX_AUTO_POSITIONS        = Number(process.env.MAX_AUTO_POSITIONS    || '5');
 const AUTO_BUY_SOL              = Number(process.env.AUTO_BUY_SOL          || '0.02');
 const DAILY_MAX_SOL             = Number(process.env.DAILY_MAX_SOL         || '0.3');
-// 93+ = top ~1% of tokens by AI score — only highest-conviction entries
-// Telegram bot uses 80 for informational alerts; auto-buy requires 93 to filter false positives
-const MIN_SIGNAL_SCORE          = Number(process.env.MIN_SIGNAL_SCORE      || '93');
+// 80 = actual max score for NEW_HIGH_SCORE/AI_SCORE_INCREASE signals from the scanner.
+// Real quality filtering is done by the DexScreener gate (Raydium, $20k liq, age, momentum).
+const MIN_SIGNAL_SCORE          = Number(process.env.MIN_SIGNAL_SCORE      || '80');
 const SIGNAL_COOLDOWN_HOURS     = Number(process.env.SIGNAL_COOLDOWN_HOURS || '6');
 
 // Only act on top-quality signals

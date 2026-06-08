@@ -51,8 +51,8 @@ export async function runIntelligenceEngines(
       [tokenId]
     ),
     query('SELECT regime, confidence FROM market_regime ORDER BY computed_at DESC LIMIT 1'),
-    query<{ tag: string; strength: number; current_rank: number; momentum: string }>(
-      'SELECT tag, strength, current_rank, momentum FROM narrative_rotation', []
+    query<{ narrative_tag: string; avg_gad_score: number; current_rank: number; momentum: string }>(
+      'SELECT narrative_tag, avg_gad_score, current_rank, momentum FROM narrative_rotation', []
     )
   ]);
 
@@ -68,7 +68,7 @@ export async function runIntelligenceEngines(
 
   // Narrative trend index
   const narrativeRotation = trendQ.rows.reduce<Record<string, { strength: number; rank: number; momentum: string }>>((acc, r) => {
-    acc[r.tag] = { strength: r.strength, rank: r.current_rank, momentum: r.momentum };
+    acc[r.narrative_tag] = { strength: r.avg_gad_score, rank: r.current_rank, momentum: r.momentum };
     return acc;
   }, {});
 
