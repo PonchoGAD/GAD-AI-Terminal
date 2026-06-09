@@ -7,6 +7,7 @@ import {
   getConnection,
   SELL_STAGES,
 } from '@lib/autobuy';
+import { sellViaPumpPortal, buyViaPumpPortal } from './pumpportal';
 import { PublicKey } from '@solana/web3.js';
 import { processAutoSignals, AUTO_BUY_ENABLED } from './auto-signal';
 
@@ -251,13 +252,31 @@ async function claimAndSell(
       [sellResult.solReceived, jobId]
     );
     return 'success';
-  } else {
-    await query(
-      `UPDATE autosell_stages SET status = 'pending' WHERE id = ANY($1)`,
-      [stageIds]
-    );
-    return 'fail';
   }
+
+  // Jupiter failed — try PumpPortal as fallback (handles pump.fun/pumpswap/fluxbeam)
+  console.warn(`[sell] Jupiter failed for ${mint.slice(0,8)}, trying PumpPortal fallback...`);
+  const ppResult = await sellViaPumpPortal(mint, sellPct, keypair, connection);
+  if (ppResult.success) {
+    await query(
+      `UPDATE autosell_stages
+         SET status = 'executed', sol_received = $1, tx_signature = $2,
+             executed_at = now(), sell_reason = $3
+       WHERE id = ANY($4)`,
+      [ppResult.solReceived ?? 0, ppResult.txSignature, `${reason}_PUMPPORTAL`, stageIds]
+    );
+    await query(
+      `UPDATE autobuy_jobs SET active = false, total_sold_sol = total_sold_sol + $1
+       WHERE id = $2`,
+      [ppResult.solReceived ?? 0, jobId]
+    );
+    console.info(`[sell] ✅ PumpPortal fallback succeeded for ${mint.slice(0,8)} → ${ppResult.solReceived?.toFixed(5)} SOL`);
+    return 'success';
+  }
+
+  console.warn(`[sell] PumpPortal fallback also failed for ${mint.slice(0,8)}: ${ppResult.error}`);
+  await query(`UPDATE autosell_stages SET status = 'pending' WHERE id = ANY($1)`, [stageIds]);
+  return 'fail';
 }
 
 // ─── Sell cycle ───────────────────────────────────────────────────────────────
@@ -512,12 +531,30 @@ async function runBuyCycle() {
     const slippage = job.slippage_bps ?? AUTOBUY_SLIPPAGE_BPS;
     console.info(`[autobuy] Buying ${job.amount_sol} SOL of ${tag} (slippage: ${slippage}bps)`);
 
-    const result = await executeAutoBuy(
-      { mintAddress: job.mint_address, amountSol: Number(job.amount_sol), slippageBps: slippage },
-      connection, keypair
-    );
+    // Use PumpPortal for pump.fun tokens (label contains ':pumpportal'), Jupiter for Raydium
+    const usePumpPortal = (job.label ?? '').includes(':pumpportal');
+    let result: Awaited<ReturnType<typeof executeAutoBuy>>;
 
-    await new Promise(r => setTimeout(r, 3000)); // Jupiter rate limit
+    if (usePumpPortal) {
+      console.info(`[autobuy] Using PumpPortal for pump.fun token ${tag}`);
+      const ppBuy = await buyViaPumpPortal(job.mint_address, Number(job.amount_sol), keypair, connection);
+      result = {
+        success: ppBuy.success,
+        txSignature: ppBuy.txSignature,
+        error: ppBuy.error,
+        outputAmount: undefined,
+        outputAmountRaw: undefined,
+        entryPriceSol: undefined,
+        inputAmountSol: Number(job.amount_sol),
+      } as any;
+    } else {
+      result = await executeAutoBuy(
+        { mintAddress: job.mint_address, amountSol: Number(job.amount_sol), slippageBps: slippage },
+        connection, keypair
+      );
+    }
+
+    await new Promise(r => setTimeout(r, 3000)); // rate limit
 
     if (result.success && result.txSignature) {
       // Verify actual on-chain balance — Jupiter quote ≠ what wallet received

@@ -1,16 +1,18 @@
 /**
  * Auto-Signal Processor
  *
- * Only trades tokens that have GRADUATED from pump.fun (have a Raydium/Orca pool).
- * Pre-graduation pump.fun tokens have no real exit liquidity and are untradeable.
+ * Two trading tracks:
+ *  1. Jupiter track  — Raydium/Orca/Meteora only, $20k+ liq, 30+ min age
+ *  2. PumpPortal track — pump.fun/pumpswap/meteoradbc, $3k+ liq, 20+ min age
+ *                        Uses PumpPortal Local TX API (pool:"auto") for buy+sell
  *
  * Safety gates (in order):
  *  1. Daily spend limit (only actual successful buys count)
  *  2. Concurrent position limit
- *  3. DexScreener: must be on Raydium/Orca (not pump.fun bonding curve)
- *  4. Minimum liquidity $20k
+ *  3. DexScreener: must be on a routable DEX
+ *  4. Minimum liquidity (DEX-dependent)
  *  5. Minimum 1h volume $5k
- *  6. Token age >= 2h (avoid newly launched rugs)
+ *  6. Token age minimum (DEX-dependent)
  *  7. Price momentum: not in freefall (1h change > -20%)
  *  8. Cooldown: don't rebuy same mint within SIGNAL_COOLDOWN_HOURS
  */
@@ -45,8 +47,15 @@ const MAX_PRICE_CHANGE_1H = Number(process.env.MAX_PRICE_CHANGE_1H || '150');
 // Time limit for positions (seconds) — sell 95% if no activity
 const TIME_LIMIT_SECONDS = Number(process.env.TIME_LIMIT_SECONDS || '1800');
 
-// DEX IDs that indicate a real liquidity pool (not pump.fun bonding curve)
-const VALID_DEX_IDS = ['raydium', 'orca', 'meteora', 'lifinity', 'saber', 'aldrin'];
+// Jupiter track: established DEXes with real liquidity pools
+const JUPITER_DEX_IDS = ['raydium', 'orca', 'meteora', 'lifinity', 'saber', 'aldrin'];
+// PumpPortal track: pump.fun ecosystem DEXes — routed via pool:"auto"
+const PUMP_DEX_IDS = ['pumpfun', 'pumpswap', 'meteoradbc', 'fluxbeam'];
+const PUMP_PORTAL_ENABLED = process.env.PUMP_PORTAL_ENABLED === 'true';
+
+// Thresholds for pump.fun tokens (lower since bonding curve has different dynamics)
+const PUMP_MIN_LIQUIDITY_USD = Number(process.env.PUMP_MIN_LIQUIDITY_USD || '3000');
+const PUMP_MIN_TOKEN_AGE_SEC = Number(process.env.PUMP_MIN_TOKEN_AGE_SEC || '1200'); // 20 min
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -78,11 +87,12 @@ interface LiqCheck {
   vol1h?: number;
   priceChange1h?: number;
   pairAgeSeconds?: number;
+  executor?: 'jupiter' | 'pumpportal';
 }
 
 /**
  * Full pre-trade validation via DexScreener.
- * Rejects tokens on pump.fun bonding curve — they have no real sell-side liquidity.
+ * Returns which executor to use: 'jupiter' (Raydium/Orca) or 'pumpportal' (pump.fun).
  */
 async function checkLiquidity(mint: string): Promise<LiqCheck> {
   try {
@@ -93,48 +103,58 @@ async function checkLiquidity(mint: string): Promise<LiqCheck> {
     const pairs: any[] = res.data?.pairs ?? [];
     if (!pairs.length) return { ok: false, reason: 'no pairs on DexScreener' };
 
-    // Sort by liquidity descending, prefer established DEXes
     const sorted = pairs.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
 
-    // Find best pair on a real DEX (not pump.fun bonding curve)
-    const realDexPair = sorted.find(p => VALID_DEX_IDS.includes(p.dexId?.toLowerCase() ?? ''));
+    // Check Jupiter track first (Raydium/Orca — higher liquidity threshold)
+    const jupiterPair = sorted.find(p => JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? ''));
+    if (jupiterPair) {
+      const liq       = jupiterPair.liquidity?.usd ?? 0;
+      const vol1h     = jupiterPair.volume?.h1 ?? 0;
+      const pc1h      = Number(jupiterPair.priceChange?.h1 ?? 0);
+      const createdAt = jupiterPair.pairCreatedAt;
+      const ageSec    = createdAt ? (Date.now() - Number(createdAt)) / 1000 : 0;
 
-    if (!realDexPair) {
-      const bestDex = sorted[0]?.dexId ?? 'unknown';
-      return { ok: false, reason: `no Raydium/Orca pool — best DEX: ${bestDex} (pump.fun bonding curve only)` };
-    }
+      if (liq < MIN_LIQUIDITY_USD)
+        return { ok: false, reason: `liquidity $${liq.toFixed(0)} < min $${MIN_LIQUIDITY_USD}` };
+      if (vol1h < MIN_VOLUME_H1_USD)
+        return { ok: false, reason: `1h volume $${vol1h.toFixed(0)} < min $${MIN_VOLUME_H1_USD}` };
+      if (ageSec > 0 && ageSec < MIN_TOKEN_AGE_SEC)
+        return { ok: false, reason: `pair only ${(ageSec / 60).toFixed(0)}min old (min ${MIN_TOKEN_AGE_SEC / 60}min)` };
+      if (pc1h < MIN_PRICE_CHANGE_1H)
+        return { ok: false, reason: `1h price ${pc1h.toFixed(1)}% < min ${MIN_PRICE_CHANGE_1H}% (freefall)` };
+      if (pc1h > MAX_PRICE_CHANGE_1H)
+        return { ok: false, reason: `1h price +${pc1h.toFixed(0)}% > max ${MAX_PRICE_CHANGE_1H}% (already at top)` };
 
-    const liq          = realDexPair.liquidity?.usd ?? 0;
-    const vol1h        = realDexPair.volume?.h1 ?? 0;
-    const pc1h         = Number(realDexPair.priceChange?.h1 ?? 0);
-    const createdAt    = realDexPair.pairCreatedAt;  // unix ms
-    const ageSeconds   = createdAt ? (Date.now() - Number(createdAt)) / 1000 : 0;
-
-    if (liq < MIN_LIQUIDITY_USD) {
-      return { ok: false, reason: `liquidity $${liq.toFixed(0)} < min $${MIN_LIQUIDITY_USD}` };
-    }
-    if (vol1h < MIN_VOLUME_H1_USD) {
-      return { ok: false, reason: `1h volume $${vol1h.toFixed(0)} < min $${MIN_VOLUME_H1_USD}` };
-    }
-    if (ageSeconds > 0 && ageSeconds < MIN_TOKEN_AGE_SEC) {
-      const ageMins = (ageSeconds / 60).toFixed(0);
-      return { ok: false, reason: `pair only ${ageMins}min old (min ${MIN_TOKEN_AGE_SEC / 60}min)` };
-    }
-    if (pc1h < MIN_PRICE_CHANGE_1H) {
-      return { ok: false, reason: `1h price ${pc1h.toFixed(1)}% < min ${MIN_PRICE_CHANGE_1H}% (freefall)` };
-    }
-    if (pc1h > MAX_PRICE_CHANGE_1H) {
-      return { ok: false, reason: `1h price +${pc1h.toFixed(0)}% > max ${MAX_PRICE_CHANGE_1H}% (already at top)` };
+      return { ok: true, executor: 'jupiter', dexId: jupiterPair.dexId, liquidityUsd: liq, vol1h, priceChange1h: pc1h, pairAgeSeconds: ageSec };
     }
 
-    return {
-      ok: true,
-      dexId: realDexPair.dexId,
-      liquidityUsd: liq,
-      vol1h,
-      priceChange1h: pc1h,
-      pairAgeSeconds: ageSeconds,
-    };
+    // Check PumpPortal track (pump.fun/pumpswap — lower thresholds)
+    if (PUMP_PORTAL_ENABLED) {
+      const pumpPair = sorted.find(p => PUMP_DEX_IDS.includes(p.dexId?.toLowerCase() ?? ''));
+      if (pumpPair) {
+        const liq       = pumpPair.liquidity?.usd ?? 0;
+        const vol1h     = pumpPair.volume?.h1 ?? 0;
+        const pc1h      = Number(pumpPair.priceChange?.h1 ?? 0);
+        const createdAt = pumpPair.pairCreatedAt;
+        const ageSec    = createdAt ? (Date.now() - Number(createdAt)) / 1000 : 0;
+
+        if (liq < PUMP_MIN_LIQUIDITY_USD)
+          return { ok: false, reason: `pump.fun liq $${liq.toFixed(0)} < min $${PUMP_MIN_LIQUIDITY_USD}` };
+        if (vol1h < MIN_VOLUME_H1_USD)
+          return { ok: false, reason: `1h volume $${vol1h.toFixed(0)} < min $${MIN_VOLUME_H1_USD}` };
+        if (ageSec > 0 && ageSec < PUMP_MIN_TOKEN_AGE_SEC)
+          return { ok: false, reason: `pump pair only ${(ageSec / 60).toFixed(0)}min old (min ${PUMP_MIN_TOKEN_AGE_SEC / 60}min)` };
+        if (pc1h < MIN_PRICE_CHANGE_1H)
+          return { ok: false, reason: `1h price ${pc1h.toFixed(1)}% < min ${MIN_PRICE_CHANGE_1H}% (freefall)` };
+        if (pc1h > MAX_PRICE_CHANGE_1H)
+          return { ok: false, reason: `1h price +${pc1h.toFixed(0)}% > max ${MAX_PRICE_CHANGE_1H}% (already at top)` };
+
+        return { ok: true, executor: 'pumpportal', dexId: pumpPair.dexId, liquidityUsd: liq, vol1h, priceChange1h: pc1h, pairAgeSeconds: ageSec };
+      }
+    }
+
+    const bestDex = sorted[0]?.dexId ?? 'unknown';
+    return { ok: false, reason: `no routable pool — best DEX: ${bestDex}` };
   } catch (err: any) {
     return { ok: false, reason: `DexScreener error: ${err.message?.slice(0, 80)}` };
   }
@@ -218,6 +238,8 @@ export async function processAutoSignals(walletAddress: string): Promise<void> {
     }
 
     try {
+      const executor = liqCheck.executor ?? 'jupiter';
+      const label = `auto:${signal.type.toLowerCase()}:score${signal.score}${executor === 'pumpportal' ? ':pumpportal' : ''}`;
       await query(
         `INSERT INTO autobuy_jobs
            (mint_address, label, amount_sol, slippage_bps, interval_seconds,
@@ -225,7 +247,7 @@ export async function processAutoSignals(walletAddress: string): Promise<void> {
          VALUES ($1, $2, $3, $4, $5, $6, true, $7, true)`,
         [
           signal.mint,
-          `auto:${signal.type.toLowerCase()}:score${signal.score}`,
+          label,
           AUTO_BUY_SOL,
           100,
           86400,
@@ -234,7 +256,7 @@ export async function processAutoSignals(walletAddress: string): Promise<void> {
         ]
       );
       console.info(
-        `[auto-signal] ✅ Buy ${signal.mint.slice(0, 8)} ` +
+        `[auto-signal] ✅ Buy ${signal.mint.slice(0, 8)} via ${executor.toUpperCase()} ` +
         `score:${signal.score} dex:${liqCheck.dexId} ` +
         `liq:$${liqCheck.liquidityUsd?.toFixed(0)} ` +
         `vol1h:$${liqCheck.vol1h?.toFixed(0)} ` +
