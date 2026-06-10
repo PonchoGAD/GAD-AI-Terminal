@@ -319,6 +319,8 @@ export async function processAutoSignals(walletAddress: string): Promise<void> {
 // Uses DexScreener (not GeckoTerminal) to avoid rate-limiting scanner's endpoint.
 
 const DEXSCREENER_BASE = 'https://api.dexscreener.com/latest/dex';
+const GECKO_BASE = 'https://api.geckoterminal.com/api/v2';
+const GECKO_HEADERS = { 'Accept': 'application/json;version=20230302' };
 
 // Max liquidity — avoid large-cap tokens (slow movers)
 const RAYDIUM_MAX_LIQUIDITY_USD = Number(process.env.RAYDIUM_MAX_LIQUIDITY_USD || '500000');
@@ -406,6 +408,41 @@ const SKIP_MINTS = new Set([
   'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1',
 ]);
 
+// Convert GeckoTerminal pool to DexScreener-like pair format.
+// GeckoTerminal doesn't provide m5 data — m5 fields are set to 0.
+// Caller must skip m5-based filters when vol.m5 === 0 (no 5m data available).
+function geckoPoolToPair(pool: any): any | null {
+  const tokenId: string = pool.relationships?.base_token?.data?.id ?? '';
+  const parts = tokenId.split('_');
+  if (parts.length !== 2) return null;
+  const mint = parts[1];
+  const attrs = pool.attributes ?? {};
+  return {
+    baseToken: { address: mint, symbol: attrs.name ?? '' },
+    dexId: 'raydium',
+    chainId: 'solana',
+    liquidity: { usd: Number(attrs.reserve_in_usd ?? 0) },
+    volume: {
+      m5: 0,   // Not available in GeckoTerminal — skip m5 acceleration filter for these pairs
+      h1: Number(attrs.volume_usd?.h1 ?? 0),
+      h24: Number(attrs.volume_usd?.h24 ?? 0),
+    },
+    priceChange: {
+      m5: 0,   // Not available in GeckoTerminal
+      h1: Number(attrs.price_change_percentage?.h1 ?? 0),
+      h6: Number(attrs.price_change_percentage?.h6 ?? 0),
+    },
+    txns: {
+      m5: { buys: 0, sells: 0 },
+      h1: {
+        buys: attrs.transactions?.h1?.buys ?? 0,
+        sells: attrs.transactions?.h1?.sells ?? 0,
+      },
+    },
+    pairCreatedAt: attrs.pool_created_at ? new Date(attrs.pool_created_at).getTime() : null,
+  };
+}
+
 // Run at most once per RAYDIUM_SCAN_INTERVAL_MS (120s to avoid rate limits)
 let lastRaydiumScan = 0;
 const RAYDIUM_SCAN_INTERVAL_MS = 120_000;
@@ -431,65 +468,69 @@ async function fetchTokenPairs(mintAddress: string): Promise<any | null> {
 async function fetchRaydiumPairs(): Promise<any[]> {
   const results: any[] = [];
 
-  // Source 1: DexScreener search with momentum keywords — tokens actively gaining NOW
-  const momentumQueries = ['solana new', 'solana moon', 'raydium solana', 'solana pump'];
-  for (const q of momentumQueries) {
-    try {
-      const r = await axios.get(`${DEXSCREENER_BASE}/search?q=${encodeURIComponent(q)}`, { timeout: 6_000 });
-      const pairs: any[] = r.data?.pairs ?? [];
-      for (const p of pairs) {
-        if (p.chainId !== 'solana') continue;
-        if (!JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')) continue;
-        // Pre-filter: only include pairs with positive short-term momentum
-        const pc5m = Number(p.priceChange?.m5 ?? 0);
-        const pc1h = Number(p.priceChange?.h1 ?? 0);
-        if (pc5m > 0 || pc1h > 0) results.push(p);
-      }
-    } catch { /* skip */ }
+  // Source 1: GeckoTerminal Raydium pools — direct DEX query, all pairs are guaranteed Raydium.
+  // Replaces DexScreener keyword searches that returned well-known tokens (BONK, WIF, SOL)
+  // which are silently filtered by SKIP_MINTS without appearing in any skip counter.
+  try {
+    const r = await axios.get(
+      `${GECKO_BASE}/networks/solana/dexes/raydium/pools?page=1`,
+      { headers: GECKO_HEADERS, timeout: 8_000 }
+    );
+    for (const pool of (r.data?.data ?? [])) {
+      const pair = geckoPoolToPair(pool);
+      if (pair) results.push(pair);
+    }
+    console.debug(`[raydium-scan] GeckoTerminal raydium/pools: ${results.length} pairs`);
+  } catch (e: any) {
+    console.debug(`[raydium-scan] GeckoTerminal raydium/pools error: ${e.message?.slice(0, 60)}`);
   }
 
-  // Source 2: DexScreener new pairs — freshly created Raydium pools
+  // Source 2: GeckoTerminal new Solana pools → DexScreener lookup for full m5 data
   try {
     const r = await axios.get(
-      `https://api.dexscreener.com/token-profiles/latest/v1`,
-      { timeout: 6_000 }
+      `${GECKO_BASE}/networks/solana/new_pools?page=1`,
+      { headers: GECKO_HEADERS, timeout: 8_000 }
     );
-    const items: any[] = r.data ?? [];
-    for (const item of items.slice(0, 20)) {  // top 20 newest
-      if (item.chainId !== 'solana') continue;
-      const pair = await fetchTokenPairs(item.tokenAddress);
-      if (pair) results.push(pair);
-    }
-  } catch { /* skip */ }
-
-  // Source 3: DexScreener boosted tokens — active community + volume
-  try {
-    const r = await axios.get(`https://api.dexscreener.com/token-boosts/top/v1`, { timeout: 6_000 });
-    const items: any[] = r.data ?? [];
-    for (const item of items.slice(0, 15)) {
-      if (item.chainId !== 'solana') continue;
-      const pair = await fetchTokenPairs(item.tokenAddress);
-      if (pair) results.push(pair);
-    }
-  } catch { /* skip */ }
-
-  // Source 4: Jupiter high-volume tokens (real on-chain trading activity)
-  // Jupiter /tokens/top returns tokens by swap volume — these have REAL demand
-  try {
-    const r = await axios.get(
-      `https://tokens.jup.ag/tokens?tags=community`,
-      { timeout: 6_000 }
-    );
-    const tokens: any[] = r.data ?? [];
-    // Take a random sample to avoid always checking same tokens
-    const sample = tokens
-      .filter((t: any) => t.chainId === 'solana' || !t.chainId)
-      .sort(() => Math.random() - 0.5)
-      .slice(0, 10);
-    for (const token of sample) {
-      const mint = token.address ?? token.mint;
-      if (!mint) continue;
+    const newMints: string[] = (r.data?.data ?? []).slice(0, 15)
+      .map((p: any) => (p.relationships?.base_token?.data?.id ?? '').split('_')[1])
+      .filter(Boolean);
+    for (const mint of newMints) {
       const pair = await fetchTokenPairs(mint);
+      if (pair) results.push(pair);
+    }
+  } catch { /* skip */ }
+
+  // Source 3: GeckoTerminal trending Solana pools → DexScreener lookup for full m5 data
+  try {
+    const r = await axios.get(
+      `${GECKO_BASE}/networks/solana/trending_pools?page=1`,
+      { headers: GECKO_HEADERS, timeout: 8_000 }
+    );
+    const trendMints: string[] = (r.data?.data ?? []).slice(0, 15)
+      .map((p: any) => (p.relationships?.base_token?.data?.id ?? '').split('_')[1])
+      .filter(Boolean);
+    for (const mint of trendMints) {
+      const pair = await fetchTokenPairs(mint);
+      if (pair) results.push(pair);
+    }
+  } catch { /* skip */ }
+
+  // Source 4: DexScreener newest token profiles
+  try {
+    const r = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
+    for (const item of (r.data ?? []).slice(0, 20)) {
+      if (item.chainId !== 'solana') continue;
+      const pair = await fetchTokenPairs(item.tokenAddress);
+      if (pair) results.push(pair);
+    }
+  } catch { /* skip */ }
+
+  // Source 5: DexScreener active boosts — tokens with active ad spend → real community
+  try {
+    const r = await axios.get('https://api.dexscreener.com/token-boosts/active/v1', { timeout: 6_000 });
+    for (const item of (r.data ?? []).slice(0, 15)) {
+      if (item.chainId !== 'solana') continue;
+      const pair = await fetchTokenPairs(item.tokenAddress);
       if (pair) results.push(pair);
     }
   } catch { /* skip */ }
@@ -535,7 +576,7 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
   }
 
   let newJobs = 0;
-  let skipped = { liq: 0, age: 0, momentum: 0, vol: 0, cooldown: 0 };
+  let skipped = { liq: 0, age: 0, momentum: 0, vol: 0, cooldown: 0, known: 0 };
 
   for (const pair of uniquePairs) {
     if (activePositions + newJobs >= MAX_AUTO_POSITIONS) break;
@@ -554,7 +595,7 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     const mint   = pair.baseToken?.address ?? '';
 
     if (!mint || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) continue;
-    if (SKIP_MINTS.has(mint)) continue;
+    if (SKIP_MINTS.has(mint)) { skipped.known++; continue; }
 
     // ── Gate 1: Liquidity / volume basics ──
     if (liq < MIN_LIQUIDITY_USD || liq > RAYDIUM_MAX_LIQUIDITY_USD || vol1h < MIN_VOLUME_H1_USD) { skipped.liq++; continue; }
@@ -562,19 +603,19 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     // ── Gate 2: Age ──
     if (ageSec > 0 && (ageSec < RAYDIUM_MIN_AGE_SEC || ageSec > RAYDIUM_MAX_AGE_SEC)) { skipped.age++; continue; }
 
-    // ── Gate 3: 5m momentum — buying DURING the move, not after ──
-    // pc5m > 0.5% = token is actively moving UP right now
-    // pc1h within [2%, 25%] = healthy 1h trend, not overextended
-    // pc6h > -15% = not in long-term downtrend
-    if (pc5m < RAYDIUM_MIN_PC5M) { skipped.momentum++; continue; }
+    // ── Gate 3: momentum ──
+    // Skip pc5m check when vol5m=0 (GeckoTerminal source has no m5 data).
+    // pc1h and pc6h are always available.
+    if (vol5m > 0 && pc5m < RAYDIUM_MIN_PC5M) { skipped.momentum++; continue; }
     if (pc1h < RAYDIUM_MIN_PC1H || pc1h > RAYDIUM_MAX_PC1H) { skipped.momentum++; continue; }
     if (pc6h < -15) { skipped.momentum++; continue; }
 
     // ── Gate 4: Volume quality ──
     // vol/liq ratio > 10% = real trading activity
-    // vol5m * 12 > vol1h * 0.3 = 5m pace is at least 30% faster than hourly average (accelerating)
+    // vol acceleration check only when 5m data is available (vol5m > 0).
+    // Without m5 data, vol5m*12 < vol1h*0.25 always triggers (0 < anything) — false positive.
     if (liq > 0 && vol1h / liq < RAYDIUM_MIN_VOL_LIQ_RATIO) { skipped.vol++; continue; }
-    if (vol1h > 0 && vol5m * 12 < vol1h * 0.25) { skipped.vol++; continue; }
+    if (vol5m > 0 && vol1h > 0 && vol5m * 12 < vol1h * 0.25) { skipped.vol++; continue; }
 
     if (await recentlyBought(mint)) { skipped.cooldown++; continue; }
 
@@ -647,7 +688,7 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     );
   } else {
     console.info(
-      `[raydium-scan] ❌ No entries — skip: liq/vol=${skipped.liq} age=${skipped.age} momentum=${skipped.momentum} ratio=${skipped.vol} cooldown=${skipped.cooldown}`
+      `[raydium-scan] ❌ No entries — skip: liq/vol=${skipped.liq} age=${skipped.age} momentum=${skipped.momentum} ratio=${skipped.vol} cooldown=${skipped.cooldown} known=${skipped.known}`
     );
   }
 }
