@@ -342,8 +342,8 @@ const GECKO_HEADERS = { 'Accept': 'application/json;version=20230302' };
 const RAYDIUM_MIN_LIQUIDITY_USD = Number(process.env.RAYDIUM_MIN_LIQUIDITY_USD || '8000');
 // Max liquidity — avoid large-cap tokens (slow movers)
 const RAYDIUM_MAX_LIQUIDITY_USD = Number(process.env.RAYDIUM_MAX_LIQUIDITY_USD || '500000');
-// Min 1h volume — $500 floor; vol/liq ratio gate (10%) is the real quality check for stale pools
-const RAYDIUM_MIN_VOLUME_H1_USD = Number(process.env.RAYDIUM_MIN_VOLUME_H1_USD || '500');
+// No separate vol1h floor — Gate 4 vol/liq ratio check is the real stale-pool filter
+const RAYDIUM_MIN_VOLUME_H1_USD = Number(process.env.RAYDIUM_MIN_VOLUME_H1_USD || '0');
 // Min 1h price change — require positive momentum (5% = significant, filters noise)
 const RAYDIUM_MIN_PC1H = Number(process.env.RAYDIUM_MIN_PC1H || '5');
 // Max 1h price change — allow strong pumps (pump.fun graduates often 50-100% in first hour)
@@ -356,8 +356,8 @@ const RAYDIUM_MAX_AGE_SEC = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(14 
 // Min token age — 30min prevents buying in the first minutes of Raydium launch
 // Uses own env var, NOT MIN_TOKEN_AGE_SEC (which is 2h for auto-signal strategy)
 const RAYDIUM_MIN_AGE_SEC = Number(process.env.RAYDIUM_MIN_AGE_SEC || '1800');
-// Min vol/liq ratio — ensures real active trading (not stale pools)
-const RAYDIUM_MIN_VOL_LIQ_RATIO = Number(process.env.RAYDIUM_MIN_VOL_LIQ_RATIO || '0.10');
+// Min vol/liq ratio — 5% hourly turnover is the stale-pool gate; 10% was too strict in quiet hours
+const RAYDIUM_MIN_VOL_LIQ_RATIO = Number(process.env.RAYDIUM_MIN_VOL_LIQ_RATIO || '0.05');
 
 // ─── Adaptive Tier System ─────────────────────────────────────────────────────
 // Different liquidity tiers need different strategies:
@@ -524,13 +524,13 @@ async function fetchRaydiumPairs(): Promise<any[]> {
         if (!mint || seen.has(mint)) continue;
         seen.add(mint);
         const pc1h = Number(p.priceChange?.h1 ?? 0);
-        if (pc1h >= 2) {
+        if (pc1h >= 0) {
           results.push(p);
           added++;
         }
       }
       const solDexCount = pairs.filter(p => p.chainId === 'solana' && JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')).length;
-      console.debug(`[raydium-scan] search "${q}": ${solDexCount} sol_dex, ${added} candidates (pc1h≥2%)`);
+      console.debug(`[raydium-scan] search "${q}": ${solDexCount} sol_dex, ${added} candidates (pc1h≥0%)`);
     } catch (e: any) {
       console.debug(`[raydium-scan] search "${q}" error: ${(e as any).message?.slice(0, 40)}`);
     }
