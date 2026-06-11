@@ -421,7 +421,7 @@ async function processNewToken(
          (mint_address, label, amount_sol, slippage_bps, interval_seconds,
           autosell_enabled, active, last_tx_signature, bought_at, last_activity_at,
           total_spent_sol, time_limit_seconds, time_limit_enabled)
-       VALUES ($1,$2,$3,250,0,false,true,$4,now(),now(),$3,$5,true)
+       VALUES ($1,$2,$3,250,60,false,true,$4,now(),now(),$3,$5,true)
        ON CONFLICT DO NOTHING`,
       [mint, `auto:bonding:${symbol}:mcap${Math.round(mcapSol)}sol`,
        BONDING_BUY_SOL, buyResult.txSignature ?? '', BONDING_TIME_LIMIT_SEC]
