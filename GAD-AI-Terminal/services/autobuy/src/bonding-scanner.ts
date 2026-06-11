@@ -35,15 +35,19 @@ const BONDING_BUY_SOL       = Number(process.env.BONDING_BUY_SOL       || '0.02'
 const BONDING_MAX_SOL_DAILY = Number(process.env.BONDING_MAX_SOL_DAILY || '0.2');
 const BONDING_MAX_POSITIONS = Number(process.env.BONDING_MAX_POSITIONS || '3');
 // Dev must have bought at least this much SOL at launch (skin in the game)
-const BONDING_MIN_DEV_BUY   = Number(process.env.BONDING_MIN_DEV_BUY   || '1.0');  // raised 0.5→1.0
+const BONDING_MIN_DEV_BUY   = Number(process.env.BONDING_MIN_DEV_BUY   || '1.5');  // raised again → 1.5 SOL
 // Max dev/mcap ratio (high = dev controls too much of supply = dump risk)
-const BONDING_MAX_DEV_RATIO = Number(process.env.BONDING_MAX_DEV_RATIO || '0.15'); // 15%
+const BONDING_MAX_DEV_RATIO = Number(process.env.BONDING_MAX_DEV_RATIO || '0.12'); // tightened 15→12%
 // Time limit before force-exit on bonding curve (seconds)
 const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '600'); // 10 min
-// Max market cap in SOL at time of detection (cheap = early)
-const BONDING_MAX_MCAP_SOL  = Number(process.env.BONDING_MAX_MCAP_SOL  || '60');   // tightened 80→60
+// Min market cap in SOL = $13k / SOL_PRICE (~$150) ≈ 87 SOL
+const BONDING_MIN_MCAP_SOL  = Number(process.env.BONDING_MIN_MCAP_SOL  || '87');
+// Max market cap in SOL at time of detection (buy early but not after pump)
+const BONDING_MAX_MCAP_SOL  = Number(process.env.BONDING_MAX_MCAP_SOL  || '200');
 // Min name score to buy (requires at least 1 viral keyword OR short name)
 const BONDING_MIN_NAME_SCORE = Number(process.env.BONDING_MIN_NAME_SCORE || '5');
+// Min unique buyers before we consider entering (require community interest)
+const BONDING_MIN_BUYERS    = Number(process.env.BONDING_MIN_BUYERS || '250');
 // Sell 50% at 2x, rest at 5x
 const BONDING_TP1_MULT  = Number(process.env.BONDING_TP1_MULT  || '2.0');
 const BONDING_TP2_MULT  = Number(process.env.BONDING_TP2_MULT  || '5.0');
@@ -374,7 +378,8 @@ async function processNewToken(
   // ── Filter 1: dev initial buy ──
   if (devBuySol < BONDING_MIN_DEV_BUY) return; // too small = no skin in the game
 
-  // ── Filter 2: market cap ──
+  // ── Filter 2: market cap range ($13k-$30k) ──
+  if (mcapSol < BONDING_MIN_MCAP_SOL) return; // too early — no community yet
   if (mcapSol > BONDING_MAX_MCAP_SOL) return; // already pumped
 
   // ── Filter 3: dev/mcap ratio (high ratio = dev controls supply = dump risk) ──
@@ -690,6 +695,12 @@ async function recoverOrphanedPositions(keypair: Keypair, connection: Connection
 
 export function startBondingScanner(): void {
   if (running) return;
+
+  // Explicit enable flag — disabled by default to avoid accidental losses
+  if (process.env.BONDING_SCANNER_ENABLED !== 'true') {
+    console.info('[bonding-scan] BONDING_SCANNER_ENABLED≠true — scanner disabled (set to true to enable)');
+    return;
+  }
 
   const pk = process.env.PUMPFUN_WALLET_PRIVATE_KEY;
   if (!pk) {

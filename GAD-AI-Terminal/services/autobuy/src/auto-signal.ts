@@ -375,45 +375,45 @@ export interface LiqTier {
 }
 
 export function getLiqTier(liqUsd: number): LiqTier {
+  // T1 ($8k-$80k): DISABLED — consistent losses due to high slippage and low stability.
+  // Use RAYDIUM_MIN_LIQUIDITY_USD=80000 env var to skip T1 entirely.
   if (liqUsd <= 80000) return {
     tier: 1, label: 't1',
-    timeLimitSec: 1800,  // 30 min — more time to develop
-    stopPct: 0.10,       // 10%: covers 1% buy + 5% sell slippage + 4% buffer
+    timeLimitSec: 1800,
+    stopPct: 0.08,
+    trailPct: 0.12,
+    earlyTrailPct: 0.04,
+    sellStages: [
+      { stage: 1, multiplier: 2.0,  sellPct: 40 },  // take 40% at 2x
+      { stage: 2, multiplier: 5.0,  sellPct: 100 }, // rest at 5x
+    ],
+  };
+  // T2 ($80k-$250k): primary target — proven profitable via FeMb (+10.1%).
+  // Keep large position for big moves — early trail exits most scenarios cleanly.
+  // Staged backup: 2x (30%) → 5x (50%) → 15x (100%)
+  if (liqUsd <= 250000) return {
+    tier: 2, label: 't2',
+    timeLimitSec: 2700,  // 45 min — give more time for the move to develop
+    stopPct: 0.08,
+    trailPct: 0.12,
+    earlyTrailPct: 0.04,  // exit when 4% below peak (was 5%, tighter = faster profit lock)
+    sellStages: [
+      { stage: 1, multiplier: 2.0,  sellPct: 30 },  // 2x: take only 30% — keep position for moon
+      { stage: 2, multiplier: 5.0,  sellPct: 50 },  // 5x: take 50% of remaining (35% original)
+      { stage: 3, multiplier: 15.0, sellPct: 100 }, // 15x: sell everything — max capture
+    ],
+  };
+  // T3 ($250k-$500k): steadier runners, tighter trail.
+  return {
+    tier: 3, label: 't3',
+    timeLimitSec: 3600,
+    stopPct: 0.07,
     trailPct: 0.12,
     earlyTrailPct: 0.05,
     sellStages: [
-      { stage: 1, multiplier: 1.12, sellPct: 60 },  // take 60% at +12% (past slippage)
-      { stage: 2, multiplier: 1.30, sellPct: 60 },
-      { stage: 3, multiplier: 3.0,  sellPct: 50 },
-      { stage: 4, multiplier: 7.0,  sellPct: 100 },
-    ],
-  };
-  if (liqUsd <= 250000) return {
-    tier: 2, label: 't2',
-    timeLimitSec: 1800,  // 30 min — same as T1 for consistency
-    stopPct: 0.10,       // 10%: covers slippage overhead, avoids stop-hunting on normal dips
-    trailPct: 0.15,
-    earlyTrailPct: 0.05,
-    sellStages: [
-      { stage: 1, multiplier: 1.12, sellPct: 50 },  // TP1 at +12% (above slippage break-even)
-      { stage: 2, multiplier: 1.25, sellPct: 50 },
-      { stage: 3, multiplier: 3.0,  sellPct: 50 },
-      { stage: 4, multiplier: 7.0,  sellPct: 50 },
-      { stage: 5, multiplier: 15.0, sellPct: 100 },
-    ],
-  };
-  return {
-    tier: 3, label: 't3',
-    timeLimitSec: 3600,  // 60 min — mid-caps need time to run
-    stopPct: 0.08,       // wider stop — less volatile, rarely dumps 8% fast
-    trailPct: 0.15,      // wider trail — let winners breathe
-    earlyTrailPct: 0.06,
-    sellStages: [
-      { stage: 1, multiplier: 1.15, sellPct: 30 },  // only take 30% at +15%
-      { stage: 2, multiplier: 1.40, sellPct: 30 },  // +40% take another 30%
-      { stage: 3, multiplier: 2.0,  sellPct: 30 },  // 2x take 30%
-      { stage: 4, multiplier: 5.0,  sellPct: 50 },
-      { stage: 5, multiplier: 10.0, sellPct: 100 },
+      { stage: 1, multiplier: 1.5,  sellPct: 25 },
+      { stage: 2, multiplier: 3.0,  sellPct: 50 },
+      { stage: 3, multiplier: 8.0,  sellPct: 100 },
     ],
   };
 }
@@ -660,6 +660,14 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     if (pc1h < RAYDIUM_MIN_PC1H || pc1h > RAYDIUM_MAX_PC1H) {
       console.debug(`[raydium-scan] ✗mom  ${sym.padEnd(10)} pc1h:${pc1h.toFixed(1)}% liq:$${liq.toFixed(0)}`);
       skipped.momentum++; continue;
+    }
+
+    // ── MAYHEM MODE filter: skip tokens in violent pump/dump phase ──
+    // pc5m > 50% = already in blow-off top, likely about to dump hard
+    // pc5m < -20% = already crashing, don't catch the falling knife
+    if (vol5m > 0 && (pc5m > 50 || pc5m < -20)) {
+      console.debug(`[raydium-scan] ✗mayhem ${sym.padEnd(10)} pc5m:${pc5m.toFixed(1)}% (MAYHEM MODE — skip)`);
+      skipped.hype++; continue;
     }
 
     // ── Gate 3b: Buy/sell ratio — require net buying pressure ──

@@ -126,6 +126,7 @@ async function fetchAndLockDueJobs(): Promise<AutobuyJob[]> {
     `WITH locked AS (
        SELECT id FROM autobuy_jobs
        WHERE active = true AND next_run_at <= now()
+         AND (label IS NULL OR label NOT LIKE 'auto:bonding%')
        ORDER BY next_run_at ASC LIMIT 20
        FOR UPDATE SKIP LOCKED
      )
