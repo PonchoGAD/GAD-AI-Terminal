@@ -21,7 +21,7 @@
 
 import WebSocket from 'ws';
 import axios from 'axios';
-import { Keypair, Connection } from '@solana/web3.js';
+import { Keypair, Connection, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { query } from '@lib/db';
 
@@ -222,6 +222,15 @@ async function sellOnBondingCurve(
     const balAfter = await connection.getBalance(keypair.publicKey).catch(() => 0);
     const solReceived = Math.max(0, (balAfter - balBefore) / 1e9);
     console.info(`[bonding-scan] 💰 Sold ${pct}% of ${mint.slice(0, 8)} → ${solReceived.toFixed(5)} SOL`);
+
+    // Mark DB record closed if this is a full exit
+    if (pct >= 95) {
+      await query(
+        `UPDATE autobuy_jobs SET active = false, total_sold_sol = $1
+         WHERE mint_address = $2 AND label LIKE 'auto:bonding%' AND active = true`,
+        [solReceived, mint]
+      ).catch(() => {});
+    }
     return { success: true, solReceived };
   } catch (err: any) {
     console.warn(`[bonding-scan] Sell failed ${mint.slice(0, 8)}: ${err.message?.slice(0, 80)}`);
@@ -339,6 +348,23 @@ async function processNewToken(
   if (!buyResult.success) return;
 
   bondingDailySpent += BONDING_BUY_SOL;
+
+  // Record in DB so position survives container restarts
+  try {
+    await query(
+      `INSERT INTO autobuy_jobs
+         (mint_address, label, amount_sol, slippage_bps, interval_seconds,
+          autosell_enabled, active, last_tx_signature, bought_at, last_activity_at,
+          total_spent_sol, time_limit_seconds, time_limit_enabled)
+       VALUES ($1,$2,$3,250,0,false,true,$4,now(),now(),$3,$5,true)
+       ON CONFLICT DO NOTHING`,
+      [mint, `auto:bonding:${symbol}:mcap${Math.round(mcapSol)}sol`,
+       BONDING_BUY_SOL, buyResult.txSignature ?? '', BONDING_TIME_LIMIT_SEC]
+    );
+  } catch (dbErr: any) {
+    console.warn(`[bonding-scan] DB record failed for ${mint.slice(0,8)}: ${dbErr.message?.slice(0,100)}`);
+  }
+
   positions.set(mint, {
     mint, symbol, name,
     buyTx: buyResult.txSignature ?? '',
@@ -511,6 +537,87 @@ function connectBondingWS(): void {
   });
 }
 
+// ─── Recover positions from DB after restart ──────────────────────────────────
+
+async function recoverOrphanedPositions(keypair: Keypair, connection: Connection): Promise<void> {
+  try {
+    const rows = await query<{
+      mint_address: string; label: string; amount_sol: string; bought_at: Date; time_limit_seconds: string;
+    }>(
+      `SELECT mint_address, label, amount_sol, bought_at, time_limit_seconds
+       FROM autobuy_jobs WHERE label LIKE 'auto:bonding%' AND active = true`
+    );
+    if (!rows.length) return;
+    console.info(`[bonding-scan] 🔄 Recovering ${rows.length} orphaned bonding position(s)...`);
+
+    const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+
+    for (const row of rows) {
+      const mint = row.mint_address;
+      const buySol = Number(row.amount_sol);
+      const boughtAt = new Date(row.bought_at).getTime();
+      const timeLimitSec = Number(row.time_limit_seconds) || BONDING_TIME_LIMIT_SEC;
+      const elapsed = (Date.now() - boughtAt) / 1000;
+
+      // Check if still holding tokens by scanning all token accounts
+      let tokenBalance = 0;
+      try {
+        const tokenAccounts = await connection.getParsedTokenAccountsByOwner(keypair.publicKey, { programId: TOKEN_PROGRAM_ID });
+        for (const { account } of tokenAccounts.value) {
+          const info = account.data.parsed?.info;
+          if (info?.mint === mint) {
+            tokenBalance = Number(info.tokenAmount?.uiAmount ?? 0);
+            break;
+          }
+        }
+      } catch { /* fail-open */ }
+
+      if (tokenBalance <= 0) {
+        // Already sold externally or token burned — close DB record
+        await query(`UPDATE autobuy_jobs SET active = false WHERE mint_address = $1 AND label LIKE 'auto:bonding%' AND active = true`, [mint]).catch(() => {});
+        console.info(`[bonding-scan] ✅ ${mint.slice(0,8)} already sold (no balance) — closed`);
+        continue;
+      }
+
+      // Still holding — restore to in-memory positions
+      const labelParts = row.label.split(':');
+      const symbol = labelParts[2] ?? mint.slice(0, 4);
+      const mcapMatch = row.label.match(/mcap(\d+)sol/);
+      const entryMcapSol = mcapMatch ? Number(mcapMatch[1]) : 0;
+      const remainingMs = Math.max(5000, (timeLimitSec - elapsed) * 1000);
+
+      positions.set(mint, {
+        mint, symbol, name: symbol,
+        buyTx: '', buyTime: boughtAt,
+        buySol, entryMcapSol, currentMcapSol: entryMcapSol,
+        tp1Hit: false,
+        uniqueBuyers: new Set(),
+        recentBuySol: 0, recentSellSol: 0,
+        windowResetAt: Date.now() + 90_000,
+      });
+      recentMints.add(mint);
+
+      console.info(`[bonding-scan] ♻️  Restored ${symbol} (${mint.slice(0,8)}) elapsed:${elapsed.toFixed(0)}s remaining:${(remainingMs/1000).toFixed(0)}s`);
+
+      // Set remaining time limit timer
+      setTimeout(async () => {
+        const pos = positions.get(mint);
+        if (!pos) return;
+        console.info(`[bonding-scan] ⏱ TIME_LIMIT (recovered) ${pos.symbol} — selling 100%`);
+        await sellOnBondingCurve(mint, 100, keypair, connection);
+        positions.delete(mint);
+      }, remainingMs);
+    }
+
+    // Subscribe to trade events for recovered positions
+    if (positions.size > 0 && wsInstance?.readyState === WebSocket.OPEN) {
+      wsInstance.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [...positions.keys()] }));
+    }
+  } catch (err: any) {
+    console.warn(`[bonding-scan] recoverOrphanedPositions error: ${err.message?.slice(0, 80)}`);
+  }
+}
+
 // ─── Public API ────────────────────────────────────────────────────────────────
 
 export function startBondingScanner(): void {
@@ -534,6 +641,10 @@ export function startBondingScanner(): void {
     `wallet:${keypair.publicKey.toBase58().slice(0, 8)}... ` +
     `buy:${BONDING_BUY_SOL} SOL daily:${BONDING_MAX_SOL_DAILY} SOL`
   );
+
+  // Recover any positions that survived a container restart
+  recoverOrphanedPositions(keypair, connectionInstance).catch(() => {});
+
   connectBondingWS();
 }
 
