@@ -35,15 +35,21 @@ const BONDING_BUY_SOL       = Number(process.env.BONDING_BUY_SOL       || '0.02'
 const BONDING_MAX_SOL_DAILY = Number(process.env.BONDING_MAX_SOL_DAILY || '0.2');
 const BONDING_MAX_POSITIONS = Number(process.env.BONDING_MAX_POSITIONS || '3');
 // Dev must have bought at least this much SOL at launch (skin in the game)
-const BONDING_MIN_DEV_BUY   = Number(process.env.BONDING_MIN_DEV_BUY   || '0.5');
+const BONDING_MIN_DEV_BUY   = Number(process.env.BONDING_MIN_DEV_BUY   || '1.0');  // raised 0.5→1.0
+// Max dev/mcap ratio (high = dev controls too much of supply = dump risk)
+const BONDING_MAX_DEV_RATIO = Number(process.env.BONDING_MAX_DEV_RATIO || '0.15'); // 15%
 // Time limit before force-exit on bonding curve (seconds)
 const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '600'); // 10 min
 // Max market cap in SOL at time of detection (cheap = early)
-const BONDING_MAX_MCAP_SOL  = Number(process.env.BONDING_MAX_MCAP_SOL  || '80');
+const BONDING_MAX_MCAP_SOL  = Number(process.env.BONDING_MAX_MCAP_SOL  || '60');   // tightened 80→60
+// Min name score to buy (requires at least 1 viral keyword OR short name)
+const BONDING_MIN_NAME_SCORE = Number(process.env.BONDING_MIN_NAME_SCORE || '5');
 // Sell 50% at 2x, rest at 5x
 const BONDING_TP1_MULT  = Number(process.env.BONDING_TP1_MULT  || '2.0');
 const BONDING_TP2_MULT  = Number(process.env.BONDING_TP2_MULT  || '5.0');
 const BONDING_STOP_MULT = Number(process.env.BONDING_STOP_MULT || '0.6'); // -40% stop
+// Dump detection: if sell volume > buy volume * this ratio → exit
+const BONDING_DUMP_RATIO = Number(process.env.BONDING_DUMP_RATIO || '2.5');
 
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY ?? '';
 const SOLANA_RPC      = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.solana.com';
@@ -53,17 +59,26 @@ const VIRAL_KEYWORDS = [
   'trump', 'elon', 'musk', 'ai', 'fte', 'grok', 'doge', 'pepe', 'maga',
   'bitcoin', 'btc', 'sol', 'moon', 'pump', 'based', 'chad', 'ape', 'giga',
   'sigma', 'alpha', 'space', 'rocket', 'laser', 'gold', 'rich', 'trillion',
+  'cat', 'dog', 'frog', 'wif', 'bonk', 'corn', 'pizza', 'burger', 'garden',
 ];
 
-// Known rug patterns — skip immediately
-const RUG_PATTERNS = ['rug', 'scam', 'fake', 'test', 'airdrop', 'free'];
+// Known rug / bot / manhive patterns — skip immediately
+// "manhive" / "манхейв" = tokens launched by bots with dev immediately dumping after pump
+const RUG_PATTERNS = [
+  'rug', 'scam', 'fake', 'test', 'airdrop', 'free', 'safe', 'legit',
+  'moonhav', 'manhiv', 'manhive', 'moonhive',  // manhive bot pattern
+];
+
+// Suspicious: dev name or keyword suggesting coordinated dump
+const SUSPICIOUS_PATTERNS = ['dev', 'team', 'project', 'token', 'coin', 'official'];
 
 function scoreTokenName(name: string, symbol: string): number {
   const text = `${name} ${symbol}`.toLowerCase();
   let score = 0;
   for (const kw of VIRAL_KEYWORDS) if (text.includes(kw)) score += 10;
   for (const rp of RUG_PATTERNS) if (text.includes(rp)) return -100;
-  if (text.length > 3 && text.length < 20) score += 5;  // reasonable length
+  for (const sp of SUSPICIOUS_PATTERNS) if (text.includes(sp)) score -= 5;
+  if (text.length > 3 && text.length < 25) score += 5;
   return score;
 }
 
@@ -226,6 +241,11 @@ interface BondingPosition {
   entryMcapSol: number;
   currentMcapSol: number;
   tp1Hit: boolean;
+  // Safety tracking
+  uniqueBuyers: Set<string>;     // unique wallet addresses that bought
+  recentBuySol: number;          // SOL volume in last 90s window
+  recentSellSol: number;         // SOL sell volume in last 90s window
+  windowResetAt: number;         // timestamp for window reset
 }
 
 const positions = new Map<string, BondingPosition>();
@@ -278,24 +298,27 @@ async function processNewToken(
   if (positions.size >= BONDING_MAX_POSITIONS) return;
 
   // ── Filter 1: dev initial buy ──
-  if (devBuySol < BONDING_MIN_DEV_BUY) {
-    // Dev bought too little — not confident in their own token
-    return;
-  }
+  if (devBuySol < BONDING_MIN_DEV_BUY) return; // too small = no skin in the game
 
   // ── Filter 2: market cap ──
-  if (mcapSol > BONDING_MAX_MCAP_SOL) {
-    // Already pumped before we saw it
+  if (mcapSol > BONDING_MAX_MCAP_SOL) return; // already pumped
+
+  // ── Filter 3: dev/mcap ratio (high ratio = dev controls supply = dump risk) ──
+  const devRatio = mcapSol > 0 ? devBuySol / mcapSol : 1;
+  if (devRatio > BONDING_MAX_DEV_RATIO) {
+    console.debug(`[bonding-scan] ✗ratio ${symbol} dev/mcap=${(devRatio*100).toFixed(0)}% (max ${BONDING_MAX_DEV_RATIO*100}%)`);
     return;
   }
 
-  // ── Filter 3: name quality ──
+  // ── Filter 4: name quality — require at least one viral keyword or short name ──
   const nameScore = scoreTokenName(name, symbol);
   if (nameScore < 0) return; // rug pattern
-  // Minimum score — require at least one viral keyword OR reasonable name
-  if (nameScore < 5 && name.length < 4) return;
+  if (nameScore < BONDING_MIN_NAME_SCORE) {
+    console.debug(`[bonding-scan] ✗name ${symbol} score:${nameScore} (min ${BONDING_MIN_NAME_SCORE})`);
+    return;
+  }
 
-  // ── Filter 4: Birdeye security (async, allow 3s) ──
+  // ── Filter 5: Birdeye security (async, allow 3s) ──
   const security = await Promise.race([
     checkBirdeyeSecurity(mint),
     new Promise<SecurityResult>(r => setTimeout(() => r({ safe: true }), 3000)),
@@ -324,14 +347,18 @@ async function processNewToken(
     entryMcapSol: mcapSol,
     currentMcapSol: mcapSol,
     tp1Hit: false,
+    uniqueBuyers: new Set(),
+    recentBuySol: 0,
+    recentSellSol: 0,
+    windowResetAt: Date.now() + 90_000,
   });
 
   // ── Time limit: force exit after BONDING_TIME_LIMIT_SEC ──
   setTimeout(async () => {
     const pos = positions.get(mint);
     if (!pos) return;
-    const pctToSell = pos.tp1Hit ? 100 : 100;
-    console.info(`[bonding-scan] ⏱ TIME_LIMIT ${pos.symbol} (${(BONDING_TIME_LIMIT_SEC/60).toFixed(0)}min) — selling ${pctToSell}%`);
+    const pctToSell = 100;
+    console.info(`[bonding-scan] ⏱ TIME_LIMIT ${pos.symbol} (${(BONDING_TIME_LIMIT_SEC/60).toFixed(0)}min) ${pos.uniqueBuyers.size} unique buyers — selling ${pctToSell}%`);
     await sellOnBondingCurve(mint, pctToSell, keypair, connection);
     positions.delete(mint);
   }, BONDING_TIME_LIMIT_SEC * 1000);
@@ -344,17 +371,59 @@ async function onTradeEvent(
   keypair: Keypair,
   connection: Connection
 ): Promise<void> {
-  const mint     = event.mint ?? '';
-  const mcapSol  = Number(event.marketCapSol ?? 0);
-  const pos      = positions.get(mint);
+  const mint       = event.mint ?? '';
+  const mcapSol    = Number(event.marketCapSol ?? 0);
+  const txType     = event.txType as 'buy' | 'sell';
+  const solAmount  = Number(event.solAmount ?? 0);
+  const traderWallet = event.traderPublicKey ?? '';
+  const pos        = positions.get(mint);
   if (!pos || !mcapSol) return;
+
+  // ── Track unique buyers and volume ───────────────────────────────────────────
+  if (txType === 'buy') {
+    if (traderWallet) pos.uniqueBuyers.add(traderWallet);
+    pos.recentBuySol += solAmount;
+  } else if (txType === 'sell') {
+    pos.recentSellSol += solAmount;
+  }
+
+  // Reset 90s rolling window
+  if (Date.now() > pos.windowResetAt) {
+    pos.recentBuySol = 0;
+    pos.recentSellSol = 0;
+    pos.windowResetAt = Date.now() + 90_000;
+  }
 
   pos.currentMcapSol = mcapSol;
   const mult = pos.entryMcapSol > 0 ? mcapSol / pos.entryMcapSol : 1;
 
+  // ── Dump detection: sell volume >> buy volume → early exit ────────────────────
+  if (pos.recentSellSol > pos.recentBuySol * BONDING_DUMP_RATIO && pos.recentSellSol > 1.0) {
+    console.warn(
+      `[bonding-scan] 🚨 DUMP SIGNAL ${pos.symbol} — ` +
+      `sell:${pos.recentSellSol.toFixed(2)} SOL > buy:${pos.recentBuySol.toFixed(2)} SOL * ${BONDING_DUMP_RATIO} — exiting`
+    );
+    positions.delete(mint);
+    await sellOnBondingCurve(mint, 100, keypair, connection);
+    return;
+  }
+
+  // ── Bot/manhive detection: single wallet > 60% of all buyers = bot ────────────
+  // (can't detect by wallet ratio from events alone, but if unique buyers << trades → likely bot)
+  // Check after 60s: if < 5 unique buyers but many trades → bot pattern
+  const heldSec = (Date.now() - pos.buyTime) / 1000;
+  if (heldSec > 60 && pos.uniqueBuyers.size < 5 && heldSec < 300) {
+    console.warn(
+      `[bonding-scan] 🤖 BOT PATTERN ${pos.symbol} — only ${pos.uniqueBuyers.size} unique buyers after ${heldSec.toFixed(0)}s — exiting`
+    );
+    positions.delete(mint);
+    await sellOnBondingCurve(mint, 100, keypair, connection);
+    return;
+  }
+
   // Stop loss at 40% down
   if (mult <= BONDING_STOP_MULT) {
-    console.info(`[bonding-scan] 🔴 STOP ${pos.symbol} ${mult.toFixed(2)}x — selling 100%`);
+    console.info(`[bonding-scan] 🔴 STOP ${pos.symbol} ${mult.toFixed(2)}x (${pos.uniqueBuyers.size} buyers) — selling 100%`);
     positions.delete(mint);
     await sellOnBondingCurve(mint, 100, keypair, connection);
     return;
@@ -363,17 +432,22 @@ async function onTradeEvent(
   // TP1 at 2x: sell 50%
   if (!pos.tp1Hit && mult >= BONDING_TP1_MULT) {
     pos.tp1Hit = true;
-    console.info(`[bonding-scan] 🟡 TP1 ${pos.symbol} ${mult.toFixed(2)}x — selling 50%`);
+    console.info(`[bonding-scan] 🟡 TP1 ${pos.symbol} ${mult.toFixed(2)}x (${pos.uniqueBuyers.size} buyers) — selling 50%`);
     await sellOnBondingCurve(mint, 50, keypair, connection);
     return;
   }
 
   // TP2 at 5x: sell rest
   if (pos.tp1Hit && mult >= BONDING_TP2_MULT) {
-    console.info(`[bonding-scan] 🟢 TP2 ${pos.symbol} ${mult.toFixed(2)}x — selling 100%`);
+    console.info(`[bonding-scan] 🟢 TP2 ${pos.symbol} ${mult.toFixed(2)}x (${pos.uniqueBuyers.size} buyers) — selling 100%`);
     positions.delete(mint);
     await sellOnBondingCurve(mint, 100, keypair, connection);
     return;
+  }
+
+  // Log organic growth if > 10 buyers
+  if (pos.uniqueBuyers.size % 10 === 0 && pos.uniqueBuyers.size > 0) {
+    console.info(`[bonding-scan] 👥 ${pos.symbol} ${pos.uniqueBuyers.size} unique buyers ${mult.toFixed(2)}x`);
   }
 }
 
