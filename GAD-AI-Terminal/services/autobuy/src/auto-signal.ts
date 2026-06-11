@@ -202,6 +202,22 @@ async function recentlyBought(mint: string): Promise<boolean> {
   return Number(rows[0]?.cnt ?? 0) > 0;
 }
 
+// Block tokens we previously lost money on (>20% loss in last 7 days).
+// Prevents re-buying rugs or already-crashed tokens after cooldown expires.
+async function previouslyLost(mint: string): Promise<boolean> {
+  const { rows } = await query<{ cnt: string }>(
+    `SELECT COUNT(*) AS cnt
+     FROM autobuy_jobs
+     WHERE mint_address = $1
+       AND active = false
+       AND amount_sol > 0
+       AND total_sold_sol < amount_sol * 0.80
+       AND created_at > now() - interval '7 days'`,
+    [mint]
+  );
+  return Number(rows[0]?.cnt ?? 0) > 0;
+}
+
 async function fetchQualifyingSignals(): Promise<Array<{ id: string; mint: string; score: number; type: string }>> {
   const { rows } = await query<{ id: string; subject: string; score: number; type: string }>(
     `SELECT id, type, subject, score
@@ -355,26 +371,26 @@ export interface LiqTier {
 export function getLiqTier(liqUsd: number): LiqTier {
   if (liqUsd <= 80000) return {
     tier: 1, label: 't1',
-    timeLimitSec: 900,   // 15 min — micro-caps move fast, exit quickly
-    stopPct: 0.05,
-    trailPct: 0.08,
-    earlyTrailPct: 0.04,
+    timeLimitSec: 1800,  // 30 min — more time to develop
+    stopPct: 0.10,       // 10%: covers 1% buy + 5% sell slippage + 4% buffer
+    trailPct: 0.12,
+    earlyTrailPct: 0.05,
     sellStages: [
-      { stage: 1, multiplier: 1.08, sellPct: 60 },  // take 60% at +8%
-      { stage: 2, multiplier: 1.20, sellPct: 60 },  // take 60% of rest at +20%
+      { stage: 1, multiplier: 1.12, sellPct: 60 },  // take 60% at +12% (past slippage)
+      { stage: 2, multiplier: 1.30, sellPct: 60 },
       { stage: 3, multiplier: 3.0,  sellPct: 50 },
       { stage: 4, multiplier: 7.0,  sellPct: 100 },
     ],
   };
   if (liqUsd <= 250000) return {
     tier: 2, label: 't2',
-    timeLimitSec: 1200,  // 20 min — standard small-cap
-    stopPct: 0.05,
-    trailPct: 0.12,
-    earlyTrailPct: 0.04,
+    timeLimitSec: 1800,  // 30 min — same as T1 for consistency
+    stopPct: 0.10,       // 10%: covers slippage overhead, avoids stop-hunting on normal dips
+    trailPct: 0.15,
+    earlyTrailPct: 0.05,
     sellStages: [
-      { stage: 1, multiplier: 1.05, sellPct: 50 },
-      { stage: 2, multiplier: 1.15, sellPct: 50 },
+      { stage: 1, multiplier: 1.12, sellPct: 50 },  // TP1 at +12% (above slippage break-even)
+      { stage: 2, multiplier: 1.25, sellPct: 50 },
       { stage: 3, multiplier: 3.0,  sellPct: 50 },
       { stage: 4, multiplier: 7.0,  sellPct: 50 },
       { stage: 5, multiplier: 15.0, sellPct: 100 },
@@ -498,16 +514,6 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     }
   } catch { /* skip */ }
 
-  // Source 3: DexScreener active boosts — tokens with active ad spend → real community
-  try {
-    const r3 = await axios.get('https://api.dexscreener.com/token-boosts/active/v1', { timeout: 6_000 });
-    for (const item of (r3.data ?? []).slice(0, 15)) {
-      if (item.chainId !== 'solana') continue;
-      const pair = await fetchTokenPairs(item.tokenAddress);
-      if (pair) results.push(pair);
-    }
-  } catch { /* skip */ }
-
   return results;
 }
 
@@ -581,6 +587,9 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     // pc1h and pc6h are always available.
     if (vol5m > 0 && pc5m < RAYDIUM_MIN_PC5M) { skipped.momentum++; continue; }
     if (pc1h < RAYDIUM_MIN_PC1H || pc1h > RAYDIUM_MAX_PC1H) { skipped.momentum++; continue; }
+    // For tokens older than 6h, require positive 6h trend — don't buy downtrends.
+    // Fresh tokens (<6h) may not have meaningful 6h data yet.
+    if (ageSec > 6 * 3600 && pc6h <= 0) { skipped.momentum++; continue; }
     if (pc6h < -15) { skipped.momentum++; continue; }
 
     // ── Gate 4: Volume quality ──
@@ -591,6 +600,7 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     if (vol5m > 0 && vol1h > 0 && vol5m * 12 < vol1h * 0.25) { skipped.vol++; continue; }
 
     if (await recentlyBought(mint)) { skipped.cooldown++; continue; }
+    if (await previouslyLost(mint)) { skipped.cooldown++; console.debug(`[raydium-scan] ♻️ Skip ${mint.slice(0,8)} — previously lost on this token (7-day blacklist)`); continue; }
 
     // ── Multi-module signal validation ──
     const trend = analyzeTrend(pair);
