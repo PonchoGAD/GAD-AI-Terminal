@@ -350,8 +350,9 @@ const RAYDIUM_MIN_PC1H = Number(process.env.RAYDIUM_MIN_PC1H || '5');
 const RAYDIUM_MAX_PC1H = Number(process.env.RAYDIUM_MAX_PC1H || '100');
 // Min 5m price change — require active momentum RIGHT NOW (key entry signal)
 const RAYDIUM_MIN_PC5M = Number(process.env.RAYDIUM_MIN_PC5M || '0.5');
-// Max token age for Raydium scan — prefer fresh pairs (< 48h)
-const RAYDIUM_MAX_AGE_SEC = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(48 * 3600));
+// Max token age — 7 days covers "rediscovered" pumpers (tokens sitting flat then getting KOL pump).
+// 48h was too restrictive: real pumping tokens on Raydium are often 2-10 days old.
+const RAYDIUM_MAX_AGE_SEC = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(7 * 24 * 3600));
 // Min token age — 30min prevents buying in the first minutes of Raydium launch
 // Uses own env var, NOT MIN_TOKEN_AGE_SEC (which is 2h for auto-signal strategy)
 const RAYDIUM_MIN_AGE_SEC = Number(process.env.RAYDIUM_MIN_AGE_SEC || '1800');
@@ -501,33 +502,41 @@ async function fetchTokenPairs(mintAddress: string): Promise<any | null> {
 }
 
 async function fetchRaydiumPairs(): Promise<any[]> {
+  const seen = new Set<string>();
   const results: any[] = [];
 
-  // Source: DexScreener token-profiles — includes pump.fun graduates that just launched on Raydium.
-  // GeckoTerminal was removed: scanner uses it continuously causing 429 for any autobuy call.
-  // Profile tokens are primarily pump.fun graduates (~$8k-$30k liq) — within our liq range.
-  try {
-    const r = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
-    const items: any[] = r.data ?? [];
-    let profileCount = 0;
-    for (const item of items.slice(0, 30)) {
-      if (item.chainId !== 'solana') continue;
-      profileCount++;
-      const pair = await fetchTokenPairs(item.tokenAddress);
-      if (pair) {
-        const liq = pair.liquidity?.usd ?? 0;
-        const pc1h = pair.priceChange?.h1 ?? 0;
-        const vol1h = pair.volume?.h1 ?? 0;
-        const sym = (pair.baseToken?.symbol ?? item.tokenAddress.slice(0, 8)).padEnd(10);
-        console.debug(`[raydium-scan] profile ${sym} liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc1h:${pc1h.toFixed(1)}% dex:${pair.dexId}`);
-        results.push(pair);
+  // DexScreener search returns full pair data — no per-token API calls needed.
+  // Queries chosen to surface Solana memecoins at different stages:
+  //  "new token sol" / "solana new" → fresh launches and pump.fun graduates
+  //  "raydium solana" / "sol pump"  → established memecoins getting KOL-driven pump
+  //  "moon sol"                     → tokens with community momentum
+  const queries = ['new token sol', 'raydium solana', 'solana new', 'sol pump', 'moon sol'];
+
+  for (const q of queries) {
+    try {
+      const r = await axios.get(`${DEXSCREENER_BASE}/search?q=${encodeURIComponent(q)}`, { timeout: 6_000 });
+      const pairs: any[] = r.data?.pairs ?? [];
+      let added = 0;
+      for (const p of pairs) {
+        if (p.chainId !== 'solana') continue;
+        if (!JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')) continue;
+        const mint = p.baseToken?.address;
+        if (!mint || seen.has(mint)) continue;
+        seen.add(mint);
+        const pc1h = Number(p.priceChange?.h1 ?? 0);
+        if (pc1h >= 2) {
+          results.push(p);
+          added++;
+        }
       }
+      const solDexCount = pairs.filter(p => p.chainId === 'solana' && JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')).length;
+      console.debug(`[raydium-scan] search "${q}": ${solDexCount} sol_dex, ${added} candidates (pc1h≥2%)`);
+    } catch (e: any) {
+      console.debug(`[raydium-scan] search "${q}" error: ${(e as any).message?.slice(0, 40)}`);
     }
-    console.debug(`[raydium-scan] DexScreener profiles: ${profileCount} Solana, ${results.length} with DEX pair`);
-  } catch (e: any) {
-    console.debug(`[raydium-scan] DexScreener profiles error: ${(e as any).message?.slice(0, 40)}`);
   }
 
+  console.debug(`[raydium-scan] total: ${results.length} unique candidates across ${queries.length} queries`);
   return results;
 }
 
