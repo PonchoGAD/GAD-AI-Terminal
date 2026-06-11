@@ -629,6 +629,10 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     }
 
     const slippage = shield.slippage_bps;
+    console.debug(
+      `[raydium-scan] 🟢 PASS ${pair.baseToken?.symbol ?? mint.slice(0,8)} (${mint.slice(0,8)}) ` +
+      `liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc1h:${pc1h.toFixed(1)}% pc6h:${pc6h.toFixed(1)}% age:${(ageSec/3600).toFixed(1)}h`
+    );
 
     try {
       const isFresh = ageSec < 6 * 3600;
