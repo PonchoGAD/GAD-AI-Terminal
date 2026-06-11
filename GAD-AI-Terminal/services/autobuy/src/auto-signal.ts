@@ -549,7 +549,7 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
   }
 
   let newJobs = 0;
-  let skipped = { liq: 0, age: 0, momentum: 0, vol: 0, cooldown: 0, known: 0 };
+  let skipped = { liq: 0, age: 0, momentum: 0, vol: 0, cooldown: 0, known: 0, trend: 0, hype: 0, liqH: 0, bot: 0, holder: 0 };
 
   for (const pair of uniquePairs) {
     if (activePositions + newJobs >= MAX_AUTO_POSITIONS) break;
@@ -594,16 +594,16 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
 
     // ── Multi-module signal validation ──
     const trend = analyzeTrend(pair);
-    if (trend.signal === 'SELL' || trend.stage === 'DEAD') { skipped.momentum++; continue; }
+    if (trend.signal === 'SELL' || trend.stage === 'DEAD') { skipped.trend++; continue; }
 
     const hype = detectHype(pair);
-    if (hype.exit_signal && !hype.entry_window) { skipped.momentum++; continue; }
+    if (hype.exit_signal && !hype.entry_window) { skipped.hype++; continue; }
 
     const liqHealth = assessLiquidity(pair, 60, AUTO_BUY_SOL);
-    if (liqHealth.auto_exit || liqHealth.rug_risk >= 60) { skipped.liq++; continue; }
+    if (liqHealth.auto_exit || liqHealth.rug_risk >= 60) { skipped.liqH++; continue; }
 
     const shield = detectBotActivity(pair);
-    if (!shield.safe_to_trade) { skipped.momentum++; continue; }
+    if (!shield.safe_to_trade) { skipped.bot++; continue; }
 
     // Apply bot-shield random delay before entry
     if (shield.recommended_delay > 0) {
@@ -613,6 +613,7 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     // ── Gate 5: Birdeye holder momentum ──
     const holderCheck = await checkHolderMomentum(mint);
     if (!holderCheck.ok) {
+      skipped.holder++;
       console.info(`[raydium-scan] ⚠️ Skip ${mint.slice(0, 8)} — ${holderCheck.reason}`);
       continue;
     }
@@ -661,7 +662,7 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     );
   } else {
     console.info(
-      `[raydium-scan] ❌ No entries — skip: liq/vol=${skipped.liq} age=${skipped.age} momentum=${skipped.momentum} ratio=${skipped.vol} cooldown=${skipped.cooldown} known=${skipped.known}`
+      `[raydium-scan] ❌ No entries — liq=${skipped.liq} age=${skipped.age} mom=${skipped.momentum} ratio=${skipped.vol} cooldown=${skipped.cooldown} known=${skipped.known} trend=${skipped.trend} hype=${skipped.hype} liqH=${skipped.liqH} bot=${skipped.bot} holders=${skipped.holder}`
     );
   }
 }
