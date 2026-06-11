@@ -1,8 +1,8 @@
+import axios from 'axios';
 import { query } from '@lib/db';
 import {
   executeAutoBuy,
   executeAutoSell,
-  getTokenPriceInSol,
   getKeypairFromEnv,
   getConnection,
   SELL_STAGES,
@@ -78,6 +78,34 @@ const MAX_TIME_LIMIT_FAILS = 3;
 
 // Previous price per mint for activity detection
 const prevPriceMap = new Map<string, number>();
+
+// DexScreener price cache — avoids hammering DS API every 5s per token
+const priceCache = new Map<string, { price: number; ts: number }>();
+const PRICE_CACHE_MS = 4000;
+
+// Sell attempt cooldown after 429 — prevents rapid-fire rate-limit cascades
+const sellCooldownMap = new Map<string, number>(); // stageId → unixMs when cooldown expires
+const SELL_COOLDOWN_MS = 30_000; // 30s after any sell 429
+
+// ─── DexScreener price fetch ──────────────────────────────────────────────────
+async function getPriceSolViaDS(mint: string): Promise<number> {
+  const cached = priceCache.get(mint);
+  if (cached && Date.now() - cached.ts < PRICE_CACHE_MS) return cached.price;
+  try {
+    const r = await axios.get(
+      `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
+      { timeout: 4000 }
+    );
+    const pairs: any[] = r.data?.pairs ?? [];
+    if (!pairs.length) return 0;
+    const best = pairs.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
+    const price = Number(best.priceNative ?? 0);
+    priceCache.set(mint, { price, ts: Date.now() });
+    return price;
+  } catch {
+    return priceCache.get(mint)?.price ?? 0;
+  }
+}
 
 // Peak price tracking for trailing stop (mint → highest price seen)
 const peakPriceMap = new Map<string, number>();
@@ -276,9 +304,10 @@ async function claimAndSell(
     connection, keypair
   );
 
-  // Attempt 2: if failed, retry with high slippage before giving up
+  // Attempt 2: if failed, wait 3s then retry with high slippage
   if (!sellResult.success) {
-    console.warn(`[sell] Jupiter attempt 1 failed for ${mint.slice(0,8)}, retrying with ${AUTOSELL_SLIPPAGE_RETRY_BPS}bps slippage...`);
+    console.warn(`[sell] Jupiter attempt 1 failed for ${mint.slice(0,8)}, retrying in 3s with ${AUTOSELL_SLIPPAGE_RETRY_BPS}bps...`);
+    await new Promise(r => setTimeout(r, 3000));
     sellResult = await executeAutoSell(
       { mintAddress: mint, tokenAmount: tokensToSell, slippageBps: AUTOSELL_SLIPPAGE_RETRY_BPS },
       connection, keypair
@@ -357,27 +386,28 @@ async function checkAndExecuteSells(walletAddress: string) {
     const refStage = mintStages[0];
     if (!refStage.tokens_at_stage || Number(refStage.tokens_at_stage) <= 0) continue;
 
-    // ── Price check ───────────────────────────────────────────────────────────
+    // ── Price check via DexScreener (no auth/rate-limit, avoids Jupiter 429) ─
     let currentPriceSol: number;
-    try {
-      const { priceSol } = await getTokenPriceInSol(mint, BigInt(Math.floor(refStage.tokens_at_stage)));
-      currentPriceSol = priceSol / Number(refStage.tokens_at_stage);
-      priceFailCount.delete(mint);
-    } catch (err: any) {
-      const fails = (priceFailCount.get(mint) ?? 0) + 1;
-      priceFailCount.set(mint, fails);
-      console.warn(`[autosell] Price check failed for ${mint.slice(0,8)} (${fails}/${MAX_PRICE_FAILS}): ${err.message}`);
-      if (fails >= MAX_PRICE_FAILS) {
-        console.warn(`[autosell] 💀 ${mint.slice(0,8)} — ${MAX_PRICE_FAILS} price failures, marking as dead loss`);
-        await query(
-          `UPDATE autosell_stages SET status = 'failed', sell_reason = 'PRICE_UNAVAILABLE'
-           WHERE mint_address = $1 AND status = 'pending'`,
-          [mint]
-        );
-        await query(`UPDATE autobuy_jobs SET active = false WHERE id = $1`, [refStage.autobuy_job_id]);
-        priceFailCount.delete(mint);
+    {
+      const price = await getPriceSolViaDS(mint);
+      if (price <= 0) {
+        const fails = (priceFailCount.get(mint) ?? 0) + 1;
+        priceFailCount.set(mint, fails);
+        console.warn(`[autosell] Price=0 for ${mint.slice(0,8)} (${fails}/${MAX_PRICE_FAILS})`);
+        if (fails >= MAX_PRICE_FAILS) {
+          console.warn(`[autosell] 💀 ${mint.slice(0,8)} — ${MAX_PRICE_FAILS} price failures, marking as dead`);
+          await query(
+            `UPDATE autosell_stages SET status = 'failed', sell_reason = 'PRICE_UNAVAILABLE'
+             WHERE mint_address = $1 AND status = 'pending'`,
+            [mint]
+          );
+          await query(`UPDATE autobuy_jobs SET active = false WHERE id = $1`, [refStage.autobuy_job_id]);
+          priceFailCount.delete(mint);
+        }
+        continue;
       }
-      continue;
+      priceFailCount.delete(mint);
+      currentPriceSol = price;
     }
 
     // ── Activity tracking (for time limit reset) ──────────────────────────────
@@ -591,6 +621,14 @@ async function checkAndExecuteSells(walletAddress: string) {
         break;
       }
 
+      // Cooldown after 429 — don't retry the same stage for SELL_COOLDOWN_MS
+      const cdUntil = sellCooldownMap.get(stage.id);
+      if (cdUntil && Date.now() < cdUntil) {
+        const remaining = Math.ceil((cdUntil - Date.now()) / 1000);
+        console.debug(`[autosell] ⏳ Stage ${stage.stage_number} ${mint.slice(0,8)} cooldown (${remaining}s)`);
+        break;
+      }
+
       console.info(
         `[autosell] 🎯 Stage ${stage.stage_number} TRIGGERED for ${mint.slice(0,8)} — ` +
         `${stage.trigger_mult}x — selling ${stage.sell_percent}%`
@@ -614,6 +652,8 @@ async function checkAndExecuteSells(walletAddress: string) {
         connection, keypair
       );
       if (!sellResult.success) {
+        // Brief pause before retry to reduce burst rate
+        await new Promise(r => setTimeout(r, 2000));
         sellResult = await executeAutoSell(
           { mintAddress: mint, tokenAmount: tokensToSell, slippageBps: AUTOSELL_SLIPPAGE_RETRY_BPS },
           connection, keypair
@@ -621,6 +661,7 @@ async function checkAndExecuteSells(walletAddress: string) {
       }
 
       if (sellResult.success) {
+        sellCooldownMap.delete(stage.id);
         await query(
           `UPDATE autosell_stages SET
              status = 'executed', tokens_sold = $1, sol_received = $2,
@@ -648,8 +689,10 @@ async function checkAndExecuteSells(walletAddress: string) {
           `UPDATE autosell_stages SET status = 'pending' WHERE id = $1 AND status = 'triggered'`,
           [stage.id]
         );
+        // Set cooldown — 30s before next attempt (prevents 429 cascade)
+        sellCooldownMap.set(stage.id, Date.now() + SELL_COOLDOWN_MS);
         console.error(
-          `[autosell] ❌ Stage ${stage.stage_number} FAILED (${mint.slice(0,8)}): ${sellResult.error?.slice(0,200)}`
+          `[autosell] ❌ Stage ${stage.stage_number} FAILED (${mint.slice(0,8)}): ${sellResult.error?.slice(0,200)} — cooldown 30s`
         );
         break;
       }
