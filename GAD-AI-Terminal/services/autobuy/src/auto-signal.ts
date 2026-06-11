@@ -505,15 +505,39 @@ async function fetchRaydiumPairs(): Promise<any[]> {
   const seen = new Set<string>();
   const results: any[] = [];
 
-  // DexScreener search returns full pair data — no per-token API calls needed.
-  // Queries chosen to surface Solana memecoins at different stages:
-  //  "new token sol" / "solana new" → fresh launches and pump.fun graduates
-  //  "raydium solana" / "sol pump"  → established memecoins getting KOL-driven pump
-  //  "moon sol"                     → tokens with community momentum
-  // "moon sol" returns 3-yr-old tokens (DMOON/SHDW). "sol pump" returns 0 sol_dex. Removed.
-  // "sol gem" and "sol launch" surface micro-caps being hyped as fresh discoveries.
-  const queries = ['new token sol', 'sol gem', 'solana new', 'sol meme', 'sol launch'];
+  // Source 1: GeckoTerminal new pools — 5 pages = up to 100 newest Solana pools.
+  // Best discovery source: sorted by creation time, includes txn buy/sell counts.
+  // geckoPoolToPair() filters to Raydium/Orca/Meteora/Lifinity only; skips pump.fun etc.
+  let geckoCount = 0;
+  for (let page = 1; page <= 5; page++) {
+    try {
+      const r = await axios.get(
+        `${GECKO_BASE}/networks/solana/new_pools?page=${page}&include=base_token,dex`,
+        { headers: GECKO_HEADERS, timeout: 8_000 }
+      );
+      const pools: any[] = r.data?.data ?? [];
+      for (const pool of pools) {
+        const pair = geckoPoolToPair(pool);
+        if (!pair) continue;
+        const mint = pair.baseToken?.address;
+        if (!mint || seen.has(mint)) continue;
+        seen.add(mint);
+        results.push(pair);
+        geckoCount++;
+      }
+    } catch (e: any) {
+      const status = (e as any).response?.status ?? (e as any).code;
+      console.debug(`[raydium-scan] GeckoTerminal new_pools page ${page}: ${status ?? (e as any).message?.slice(0, 30)}`);
+      break;
+    }
+  }
+  if (geckoCount > 0) {
+    console.debug(`[raydium-scan] GeckoTerminal new_pools: ${geckoCount} Raydium/Orca pairs`);
+  }
 
+  // Source 2: DexScreener search — trending memecoins that may not be "new" but are pumping now.
+  // Supplements GeckoTerminal with KOL-revival tokens (days/weeks old, sudden momentum).
+  const queries = ['new token sol', 'sol gem', 'solana new', 'sol meme', 'sol launch'];
   for (const q of queries) {
     try {
       const r = await axios.get(`${DEXSCREENER_BASE}/search?q=${encodeURIComponent(q)}`, { timeout: 6_000 });
@@ -526,19 +550,15 @@ async function fetchRaydiumPairs(): Promise<any[]> {
         if (!mint || seen.has(mint)) continue;
         seen.add(mint);
         const pc1h = Number(p.priceChange?.h1 ?? 0);
-        if (pc1h >= 0) {
-          results.push(p);
-          added++;
-        }
+        if (pc1h >= 0) { results.push(p); added++; }
       }
-      const solDexCount = pairs.filter(p => p.chainId === 'solana' && JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')).length;
-      console.debug(`[raydium-scan] search "${q}": ${solDexCount} sol_dex, ${added} candidates (pc1h≥0%)`);
+      if (added > 0) console.debug(`[raydium-scan] search "${q}": ${added} new candidates`);
     } catch (e: any) {
       console.debug(`[raydium-scan] search "${q}" error: ${(e as any).message?.slice(0, 40)}`);
     }
   }
 
-  console.debug(`[raydium-scan] total: ${results.length} unique candidates across ${queries.length} queries`);
+  console.debug(`[raydium-scan] total: ${results.length} unique candidates (${geckoCount} gecko + ${results.length - geckoCount} dexscreener)`);
   return results;
 }
 
@@ -626,6 +646,17 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       console.debug(`[raydium-scan] ✗mom  ${sym.padEnd(10)} pc1h:${pc1h.toFixed(1)}% liq:$${liq.toFixed(0)}`);
       skipped.momentum++; continue;
     }
+
+    // ── Gate 3b: Buy/sell ratio — require net buying pressure ──
+    // If 20%+ more sellers than buyers in the last hour: distribution phase, skip.
+    // Only apply when we have real txn data (buys > 0). GeckoTerminal always has this.
+    const buys1h = (pair.txns?.h1?.buys ?? 0) as number;
+    const sells1h = (pair.txns?.h1?.sells ?? 0) as number;
+    if (buys1h > 0 && sells1h > buys1h * 1.2) {
+      console.debug(`[raydium-scan] ✗sell ${sym.padEnd(10)} buys:${buys1h} sells:${sells1h} (distribution)`);
+      skipped.momentum++; continue;
+    }
+
     // For tokens older than 6h, require positive 6h trend — don't buy downtrends.
     // Fresh tokens (<6h) may not have meaningful 6h data yet.
     if (ageSec > 6 * 3600 && pc6h <= 0) {
@@ -676,7 +707,8 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     const slippage = shield.slippage_bps;
     console.info(
       `[raydium-scan] 🟢 PASS ${pair.baseToken?.symbol ?? mint.slice(0,8)} (${mint.slice(0,8)}) ` +
-      `liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc1h:${pc1h.toFixed(1)}% pc6h:${pc6h.toFixed(1)}% age:${(ageSec/3600).toFixed(1)}h`
+      `liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc1h:${pc1h.toFixed(1)}% pc6h:${pc6h.toFixed(1)}% ` +
+      `buys:${buys1h} sells:${sells1h} age:${(ageSec/3600).toFixed(1)}h`
     );
 
     try {
