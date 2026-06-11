@@ -684,6 +684,21 @@ async function checkAndExecuteSells(walletAddress: string) {
           `${tokensToSell} tok → ${sellResult.solReceived?.toFixed(4)} SOL ` +
           `tx:${sellResult.txSignature}`
         );
+
+        // Auto-close job when last sell stage executes (100% sell_percent or no pending stages left)
+        if (stage.sell_percent >= 100) {
+          await query(`UPDATE autobuy_jobs SET active = false WHERE id = $1`, [stage.autobuy_job_id]);
+          console.info(`[autosell] 🏁 Job ${stage.autobuy_job_id.slice(0,8)} closed — all tokens sold`);
+        } else {
+          const pending = await query(
+            `SELECT COUNT(*) as cnt FROM autosell_stages WHERE autobuy_job_id=$1 AND status='pending'`,
+            [stage.autobuy_job_id]
+          );
+          if (Number(pending.rows[0]?.cnt ?? 0) === 0) {
+            await query(`UPDATE autobuy_jobs SET active = false WHERE id = $1`, [stage.autobuy_job_id]);
+            console.info(`[autosell] 🏁 Job ${stage.autobuy_job_id.slice(0,8)} closed — no more pending stages`);
+          }
+        }
       } else {
         await query(
           `UPDATE autosell_stages SET status = 'pending' WHERE id = $1 AND status = 'triggered'`,

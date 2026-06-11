@@ -608,12 +608,13 @@ function connectBondingWS(): void {
 
 async function recoverOrphanedPositions(keypair: Keypair, connection: Connection): Promise<void> {
   try {
-    const rows = await query<{
+    const result = await query<{
       mint_address: string; label: string; amount_sol: string; bought_at: Date; time_limit_seconds: string;
     }>(
       `SELECT mint_address, label, amount_sol, bought_at, time_limit_seconds
        FROM autobuy_jobs WHERE label LIKE 'auto:bonding%' AND active = true`
     );
+    const rows = result.rows;
     if (!rows.length) return;
     console.info(`[bonding-scan] 🔄 Recovering ${rows.length} orphaned bonding position(s)...`);
 
