@@ -24,7 +24,7 @@ import { Keypair, Connection, VersionedTransaction, Transaction } from '@solana/
 
 dotenv.config();
 
-const PUMPPORTAL_IPFS   = 'https://pumpportal.fun/api/ipfs';
+const PUMPPORTAL_IPFS   = 'https://pump.fun/api/ipfs';
 const PUMPPORTAL_TRADE  = 'https://pumpportal.fun/api/trade-local';
 const SOLANA_RPC        = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.solana.com';
 const PUMPFUN_WALLET_PK = process.env.PUMPFUN_WALLET_PRIVATE_KEY ?? '';
