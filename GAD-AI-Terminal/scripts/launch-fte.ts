@@ -127,7 +127,10 @@ async function launch() {
   console.log(`✅ Metadata URI: ${metadataUri}`);
 
   // ── Step 2: Create token transaction ──
+  // New mint keypair — must sign the create TX alongside the dev wallet
+  const mintKeypair = Keypair.generate();
   console.log(`\n🪙  Creating $${TOKEN_SYMBOL} token with ${INITIAL_BUY_SOL} SOL initial buy...`);
+  console.log(`   Mint: ${mintKeypair.publicKey.toBase58()}`);
 
   const createResp = await axios.post(
     PUMPPORTAL_TRADE,
@@ -139,7 +142,7 @@ async function launch() {
         symbol: TOKEN_SYMBOL,
         uri: metadataUri,
       },
-      mint: Keypair.generate().publicKey.toBase58(),  // will be overridden by PumpPortal
+      mint: mintKeypair.publicKey.toBase58(),
       denominatedInSol: 'true',
       amount: INITIAL_BUY_SOL,
       slippage: 10,
@@ -149,16 +152,21 @@ async function launch() {
     { responseType: 'arraybuffer', timeout: 30_000 }
   );
 
+  if (createResp.status !== 200) {
+    console.error('❌ Create TX failed with status', createResp.status);
+    process.exit(1);
+  }
+
   const txBytes = new Uint8Array(createResp.data);
   let txSignature: string;
 
   try {
     const tx = VersionedTransaction.deserialize(txBytes);
-    tx.sign([keypair]);
+    tx.sign([keypair, mintKeypair]);  // both dev wallet AND mint keypair must sign
     txSignature = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 5 });
   } catch {
     const tx = Transaction.from(Buffer.from(txBytes));
-    tx.partialSign(keypair);
+    tx.partialSign(keypair, mintKeypair);
     txSignature = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
   }
 
