@@ -427,15 +427,29 @@ const SKIP_MINTS = new Set([
 // Convert GeckoTerminal pool to DexScreener-like pair format.
 // GeckoTerminal doesn't provide m5 data — m5 fields are set to 0.
 // Caller must skip m5-based filters when vol.m5 === 0 (no 5m data available).
+const GECKO_DEX_MAP: Record<string, string> = {
+  'raydium': 'raydium', 'raydium-amm': 'raydium', 'raydium-amm-v4': 'raydium',
+  'raydium-clmm': 'raydium', 'raydium-cp': 'raydium', 'raydium-cpmm': 'raydium',
+  'orca': 'orca', 'orca-whirlpool': 'orca',
+  'meteora': 'meteora', 'meteora-dlmm': 'meteora', 'meteora-dbc': 'meteora',
+  'lifinity': 'lifinity', 'lifinity-v2': 'lifinity',
+};
+
 function geckoPoolToPair(pool: any): any | null {
   const tokenId: string = pool.relationships?.base_token?.data?.id ?? '';
   const parts = tokenId.split('_');
   if (parts.length !== 2) return null;
   const mint = parts[1];
   const attrs = pool.attributes ?? {};
+
+  // Filter to only supported Jupiter-tradeable DEXes; skip pump.fun, fluxbeam, etc.
+  const geckoDexId: string = (pool.relationships?.dex?.data?.id ?? '').toLowerCase();
+  const dexId = GECKO_DEX_MAP[geckoDexId];
+  if (!dexId) return null;
+
   return {
     baseToken: { address: mint, symbol: attrs.name ?? '' },
-    dexId: 'raydium',
+    dexId,
     chainId: 'solana',
     liquidity: { usd: Number(attrs.reserve_in_usd ?? 0) },
     volume: {
@@ -484,24 +498,25 @@ async function fetchTokenPairs(mintAddress: string): Promise<any | null> {
 async function fetchRaydiumPairs(): Promise<any[]> {
   const results: any[] = [];
 
-  // Source 1: GeckoTerminal Raydium DEX pools — single call, handle 429 gracefully.
-  // Scanner also uses GeckoTerminal every 30s, so we stagger with a short delay
-  // and make only ONE GeckoTerminal call per cycle to avoid rate limiting.
+  // Source 1: GeckoTerminal new_pools — freshly created Solana pools (small liq, recent age).
+  // This is better than raydium/pools (top-by-volume = large caps that fail liq/age gates).
+  // Scanner also uses GeckoTerminal every 30s; stagger 3s to reduce 429 collisions.
   await new Promise(r => setTimeout(r, 3000));
   try {
     const r = await axios.get(
-      `${GECKO_BASE}/networks/solana/dexes/raydium/pools?page=1`,
+      `${GECKO_BASE}/networks/solana/new_pools?page=1`,
       { headers: GECKO_HEADERS, timeout: 8_000 }
     );
-    const pools = r.data?.data ?? [];
+    const pools: any[] = r.data?.data ?? [];
+    let accepted = 0;
     for (const pool of pools) {
       const pair = geckoPoolToPair(pool);
-      if (pair) results.push(pair);
+      if (pair) { results.push(pair); accepted++; }
     }
-    console.debug(`[raydium-scan] GeckoTerminal raydium/pools: ${pools.length} pairs`);
+    console.debug(`[raydium-scan] GeckoTerminal new_pools: ${pools.length} total, ${accepted} on supported DEX`);
   } catch (e: any) {
     const status = (e as any).response?.status ?? '';
-    console.debug(`[raydium-scan] GeckoTerminal raydium/pools ${status || e.message?.slice(0, 40)} — using DexScreener only`);
+    console.debug(`[raydium-scan] GeckoTerminal new_pools ${status || e.message?.slice(0, 40)} — using DexScreener only`);
   }
 
   // Source 2: DexScreener newest token profiles
