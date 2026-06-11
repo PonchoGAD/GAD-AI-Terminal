@@ -338,26 +338,31 @@ const DEXSCREENER_BASE = 'https://api.dexscreener.com/latest/dex';
 const GECKO_BASE = 'https://api.geckoterminal.com/api/v2';
 const GECKO_HEADERS = { 'Accept': 'application/json;version=20230302' };
 
+// Min liquidity for Raydium scan — $8k captures pump.fun graduates (~85 SOL pool ~$12k)
+const RAYDIUM_MIN_LIQUIDITY_USD = Number(process.env.RAYDIUM_MIN_LIQUIDITY_USD || '8000');
 // Max liquidity — avoid large-cap tokens (slow movers)
 const RAYDIUM_MAX_LIQUIDITY_USD = Number(process.env.RAYDIUM_MAX_LIQUIDITY_USD || '500000');
-// Min 1h price change — only buy tokens with positive 1h trend (not necessarily large)
-const RAYDIUM_MIN_PC1H = Number(process.env.RAYDIUM_MIN_PC1H || '2');
-// Max 1h price change — don't buy tokens that already pumped hard (overextended)
-const RAYDIUM_MAX_PC1H = Number(process.env.RAYDIUM_MAX_PC1H || '25');
+// Min 1h volume — real trading activity (lower than auto-signal, graduated tokens start slow)
+const RAYDIUM_MIN_VOLUME_H1_USD = Number(process.env.RAYDIUM_MIN_VOLUME_H1_USD || '2000');
+// Min 1h price change — require positive momentum (5% = significant, filters noise)
+const RAYDIUM_MIN_PC1H = Number(process.env.RAYDIUM_MIN_PC1H || '5');
+// Max 1h price change — allow strong pumps (pump.fun graduates often 50-100% in first hour)
+const RAYDIUM_MAX_PC1H = Number(process.env.RAYDIUM_MAX_PC1H || '100');
 // Min 5m price change — require active momentum RIGHT NOW (key entry signal)
 const RAYDIUM_MIN_PC5M = Number(process.env.RAYDIUM_MIN_PC5M || '0.5');
 // Max token age for Raydium scan — prefer fresh pairs (< 48h)
 const RAYDIUM_MAX_AGE_SEC = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(48 * 3600));
-// Min token age — avoid just-launched rugpulls
-const RAYDIUM_MIN_AGE_SEC = Number(process.env.MIN_TOKEN_AGE_SEC || '3600');  // 1h (was 2h)
+// Min token age — 30min prevents buying in the first minutes of Raydium launch
+// Uses own env var, NOT MIN_TOKEN_AGE_SEC (which is 2h for auto-signal strategy)
+const RAYDIUM_MIN_AGE_SEC = Number(process.env.RAYDIUM_MIN_AGE_SEC || '1800');
 // Min vol/liq ratio — ensures real active trading (not stale pools)
 const RAYDIUM_MIN_VOL_LIQ_RATIO = Number(process.env.RAYDIUM_MIN_VOL_LIQ_RATIO || '0.10');
 
 // ─── Adaptive Tier System ─────────────────────────────────────────────────────
 // Different liquidity tiers need different strategies:
-//  T1 Micro  ($20k–$80k):  explosive volatility, 15min hold, TP1 8%
-//  T2 Small  ($80k–$250k): normal memecoin, 20min hold, TP1 5% (current default)
-//  T3 Mid    ($250k–$500k): steady runner, 60min hold, TP1 15%, wider stop
+//  T1 Micro  ($8k–$80k):   pump.fun graduates, explosive, 30min hold, TP1 12%
+//  T2 Small  ($80k–$250k): normal memecoin, 30min hold, TP1 12%
+//  T3 Mid    ($250k–$500k): steady runner, 30min hold, TP1 12%
 export interface LiqTier {
   tier: 1 | 2 | 3;
   label: string;
@@ -498,36 +503,30 @@ async function fetchTokenPairs(mintAddress: string): Promise<any | null> {
 async function fetchRaydiumPairs(): Promise<any[]> {
   const results: any[] = [];
 
-  // Source 1: GeckoTerminal new_pools — freshly created Solana pools (small liq, recent age).
-  // This is better than raydium/pools (top-by-volume = large caps that fail liq/age gates).
-  // Scanner also uses GeckoTerminal every 30s; stagger 3s to reduce 429 collisions.
-  await new Promise(r => setTimeout(r, 3000));
+  // Source: DexScreener token-profiles — includes pump.fun graduates that just launched on Raydium.
+  // GeckoTerminal was removed: scanner uses it continuously causing 429 for any autobuy call.
+  // Profile tokens are primarily pump.fun graduates (~$8k-$30k liq) — within our liq range.
   try {
-    const r = await axios.get(
-      `${GECKO_BASE}/networks/solana/new_pools?page=1`,
-      { headers: GECKO_HEADERS, timeout: 8_000 }
-    );
-    const pools: any[] = r.data?.data ?? [];
-    let accepted = 0;
-    for (const pool of pools) {
-      const pair = geckoPoolToPair(pool);
-      if (pair) { results.push(pair); accepted++; }
-    }
-    console.debug(`[raydium-scan] GeckoTerminal new_pools: ${pools.length} total, ${accepted} on supported DEX`);
-  } catch (e: any) {
-    const status = (e as any).response?.status ?? '';
-    console.debug(`[raydium-scan] GeckoTerminal new_pools ${status || e.message?.slice(0, 40)} — using DexScreener only`);
-  }
-
-  // Source 2: DexScreener newest token profiles
-  try {
-    const r2 = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
-    for (const item of (r2.data ?? []).slice(0, 20)) {
+    const r = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
+    const items: any[] = r.data ?? [];
+    let profileCount = 0;
+    for (const item of items.slice(0, 30)) {
       if (item.chainId !== 'solana') continue;
+      profileCount++;
       const pair = await fetchTokenPairs(item.tokenAddress);
-      if (pair) results.push(pair);
+      if (pair) {
+        const liq = pair.liquidity?.usd ?? 0;
+        const pc1h = pair.priceChange?.h1 ?? 0;
+        const vol1h = pair.volume?.h1 ?? 0;
+        const sym = (pair.baseToken?.symbol ?? item.tokenAddress.slice(0, 8)).padEnd(10);
+        console.debug(`[raydium-scan] profile ${sym} liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc1h:${pc1h.toFixed(1)}% dex:${pair.dexId}`);
+        results.push(pair);
+      }
     }
-  } catch { /* skip */ }
+    console.debug(`[raydium-scan] DexScreener profiles: ${profileCount} Solana, ${results.length} with DEX pair`);
+  } catch (e: any) {
+    console.debug(`[raydium-scan] DexScreener profiles error: ${(e as any).message?.slice(0, 40)}`);
+  }
 
   return results;
 }
@@ -592,7 +591,7 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     if (SKIP_MINTS.has(mint)) { skipped.known++; continue; }
 
     // ── Gate 1: Liquidity / volume basics ──
-    if (liq < MIN_LIQUIDITY_USD || liq > RAYDIUM_MAX_LIQUIDITY_USD || vol1h < MIN_VOLUME_H1_USD) { skipped.liq++; continue; }
+    if (liq < RAYDIUM_MIN_LIQUIDITY_USD || liq > RAYDIUM_MAX_LIQUIDITY_USD || vol1h < RAYDIUM_MIN_VOLUME_H1_USD) { skipped.liq++; continue; }
 
     // ── Gate 2: Age ──
     if (ageSec > 0 && (ageSec < RAYDIUM_MIN_AGE_SEC || ageSec > RAYDIUM_MAX_AGE_SEC)) { skipped.age++; continue; }
