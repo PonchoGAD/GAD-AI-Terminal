@@ -31,6 +31,7 @@
     "@types/node-fetch": "^2.6.0",
     "@types/node-telegram-bot-api": "^0.64.14",
     "@types/pg": "^8.11.0",
+    "@types/ws": "^8.5.10",
     "@typescript-eslint/eslint-plugin": "^7.1.0",
     "@typescript-eslint/parser": "^7.1.0",
     "eslint": "^8.57.0",
@@ -53,6 +54,7 @@
     "node-telegram-bot-api": "^0.61.0",
     "pg": "^8.12.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "ws": "^8.17.1"
   }
 }
