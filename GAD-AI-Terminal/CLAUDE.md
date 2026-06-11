@@ -123,7 +123,16 @@ libs/
 
 ## Как деплоить на сервер (VPS Hetzner)
 
+> **ВАЖНО:** Локальный git имеет два remote:
+> - `gad` → `https://github.com/PonchoGAD/GAD-AI-Terminal.git` — **VPS тянет отсюда**
+> - `origin` → `https://github.com/PonchoGAD/SaaS-Landing-Demo.git` — лендинг, VPS не использует
+>
+> Всегда пушить через: `git push gad main` (не `git push origin main`)
+
 ```bash
+# На локальной машине — пушить в правильный remote:
+git push gad main
+
 # На сервере (/opt/gad-ai-terminal)
 git pull origin main
 
