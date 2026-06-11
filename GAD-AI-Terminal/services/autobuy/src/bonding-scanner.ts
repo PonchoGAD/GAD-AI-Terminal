@@ -272,6 +272,71 @@ async function getTokenPrice(mint: string): Promise<number | null> {
   }
 }
 
+// ─── DexScreener polling watchdog ────────────────────────────────────────────
+// Polls all open positions every 30s via DexScreener priceNative.
+// This is the BACKUP sell trigger if WS trade events are missed/lost.
+
+const DS_POLL_INTERVAL_MS = 30_000;
+const lastWsEventAt = new Map<string, number>(); // mint → last WS trade event ts
+
+async function getDSMcapSol(mint: string): Promise<number> {
+  try {
+    const r = await axios.get(
+      `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
+      { timeout: 5_000 }
+    );
+    const pairs: any[] = r.data?.pairs ?? [];
+    if (!pairs.length) return 0;
+    const best = pairs.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
+    const fdvSol = Number(best.fdv ?? 0) / Number(best.priceUsd ?? 1) * Number(best.priceNative ?? 0);
+    // Prefer marketCap directly if available
+    if (best.marketCap) return Number(best.marketCap) / (Number(best.priceUsd ?? 1) / Number(best.priceNative ?? 1));
+    return fdvSol;
+  } catch {
+    return 0;
+  }
+}
+
+async function pollBondingPositions(keypair: Keypair, connection: Connection): Promise<void> {
+  if (positions.size === 0) return;
+
+  for (const [mint, pos] of positions.entries()) {
+    const lastEvent = lastWsEventAt.get(mint) ?? 0;
+    const silentMs = Date.now() - lastEvent;
+
+    // Skip if we got a WS event in the last 60s — WS is alive for this token
+    if (silentMs < 60_000 && lastEvent > 0) continue;
+
+    // WS silent >60s: poll DexScreener as fallback
+    const mcapSol = await getDSMcapSol(mint);
+    if (!mcapSol || mcapSol < 0.01) continue;
+
+    pos.currentMcapSol = mcapSol;
+    const mult = pos.entryMcapSol > 0 ? mcapSol / pos.entryMcapSol : 1;
+
+    console.info(`[bonding-scan] 🔍 POLL ${pos.symbol} ${mult.toFixed(2)}x (mcap:${mcapSol.toFixed(1)} SOL) silent:${(silentMs/1000).toFixed(0)}s`);
+
+    if (mult <= BONDING_STOP_MULT) {
+      console.info(`[bonding-scan] 🔴 POLL STOP ${pos.symbol} ${mult.toFixed(2)}x`);
+      positions.delete(mint);
+      await sellOnBondingCurve(mint, 100, keypair, connection);
+    } else if (!pos.tp1Hit && mult >= BONDING_TP1_MULT) {
+      pos.tp1Hit = true;
+      console.info(`[bonding-scan] 🟡 POLL TP1 ${pos.symbol} ${mult.toFixed(2)}x — selling 50%`);
+      await sellOnBondingCurve(mint, 50, keypair, connection);
+    } else if (pos.tp1Hit && mult >= BONDING_TP2_MULT) {
+      console.info(`[bonding-scan] 🟢 POLL TP2 ${pos.symbol} ${mult.toFixed(2)}x — selling 100%`);
+      positions.delete(mint);
+      await sellOnBondingCurve(mint, 100, keypair, connection);
+    }
+
+    // Re-subscribe WS for this token to restore events
+    if (wsInstance?.readyState === WebSocket.OPEN) {
+      wsInstance.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
+    }
+  }
+}
+
 // ─── Daily spend counter ──────────────────────────────────────────────────────
 
 let bondingDailySpent = 0;
@@ -404,6 +469,8 @@ async function onTradeEvent(
   const traderWallet = event.traderPublicKey ?? '';
   const pos        = positions.get(mint);
   if (!pos || !mcapSol) return;
+
+  lastWsEventAt.set(mint, Date.now());
 
   // ── Track unique buyers and volume ───────────────────────────────────────────
   if (txType === 'buy') {
@@ -644,6 +711,9 @@ export function startBondingScanner(): void {
 
   // Recover any positions that survived a container restart
   recoverOrphanedPositions(keypair, connectionInstance).catch(() => {});
+
+  // Polling watchdog: fires every 30s, sells via DexScreener if WS events are silent
+  setInterval(() => pollBondingPositions(keypair, connectionInstance!).catch(() => {}), DS_POLL_INTERVAL_MS);
 
   connectBondingWS();
 }
