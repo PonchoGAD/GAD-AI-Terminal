@@ -260,8 +260,10 @@ async function claimAndSell(
   reason: 'STOP_LOSS' | 'TIME_LIMIT_EXPIRED',
   connection: ReturnType<typeof getConnection>,
   keypair: ReturnType<typeof getKeypairFromEnv>,
-  isJupiterOnly = false   // true for Raydium-track tokens — never use PumpPortal fallback
+  isJupiterOnlyHint = false  // true for Raydium-track tokens — overridden if mint ends in 'pump'
 ): Promise<'success' | 'fail'> {
+  // pump.fun tokens (mint ends in 'pump') can NEVER be sold via Jupiter — always allow PumpPortal
+  const isJupiterOnly = isJupiterOnlyHint && !mint.endsWith('pump');
   if (!keypair) return 'fail';
 
   const { rows: claimed } = await query<{ id: string; tokens_at_stage: string }>(

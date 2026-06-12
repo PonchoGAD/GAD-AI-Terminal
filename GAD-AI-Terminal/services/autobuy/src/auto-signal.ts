@@ -33,7 +33,7 @@ const DAILY_MAX_SOL             = Number(process.env.DAILY_MAX_SOL         || '0
 // 80 = actual max score for NEW_HIGH_SCORE/AI_SCORE_INCREASE signals from the scanner.
 // Real quality filtering is done by the DexScreener gate (Raydium, $20k liq, age, momentum).
 const MIN_SIGNAL_SCORE          = Number(process.env.MIN_SIGNAL_SCORE      || '80');
-const SIGNAL_COOLDOWN_HOURS     = Number(process.env.SIGNAL_COOLDOWN_HOURS || '6');
+const SIGNAL_COOLDOWN_HOURS     = Number(process.env.SIGNAL_COOLDOWN_HOURS || '48');  // 2-day per-mint cooldown prevents re-buying rugs
 
 // Only act on top-quality signals
 const SIGNAL_TYPES = ['NEW_HIGH_SCORE', 'AI_SCORE_INCREASE'];
@@ -211,8 +211,8 @@ async function previouslyLost(mint: string): Promise<boolean> {
      WHERE mint_address = $1
        AND active = false
        AND amount_sol > 0
-       AND total_sold_sol < amount_sol * 0.80
-       AND created_at > now() - interval '7 days'`,
+       AND total_sold_sol < amount_sol * 0.90
+       AND created_at > now() - interval '14 days'`,
     [mint]
   );
   return Number(rows[0]?.cnt ?? 0) > 0;
