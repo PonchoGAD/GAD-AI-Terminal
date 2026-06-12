@@ -16,18 +16,17 @@
 
 import dotenv from 'dotenv';
 import axios from 'axios';
-import FormData from 'form-data';
-import fs from 'fs';
-import path from 'path';
 import bs58 from 'bs58';
 import { Keypair, Connection, VersionedTransaction, Transaction } from '@solana/web3.js';
 
 dotenv.config();
 
-const PUMPPORTAL_IPFS   = 'https://pump.fun/api/ipfs';
 const PUMPPORTAL_TRADE  = 'https://pumpportal.fun/api/trade-local';
 const SOLANA_RPC        = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.solana.com';
 const PUMPFUN_WALLET_PK = process.env.PUMPFUN_WALLET_PRIVATE_KEY ?? '';
+
+// Self-hosted metadata — avoids pump.fun/api/ipfs (deprecated) and unreliable ipfs.io URIs
+const METADATA_URI = 'https://gadai.shop/api/fte-metadata';
 
 // ─── Token metadata ────────────────────────────────────────────────────────────
 
@@ -42,10 +41,6 @@ We are building the meme.
 $FTE — the meme behind that race. The game has started.
 
 Ambition. Wealth. Legacy.`;
-
-const TOKEN_TWITTER  = 'https://x.com/search?q=%24FTE';  // Update with real Twitter
-const TOKEN_TELEGRAM = '';  // Add Telegram when ready
-const TOKEN_WEBSITE  = 'https://gadai.shop';
 
 // ─── Initial buy amount ────────────────────────────────────────────────────────
 // Small initial buy from dev wallet to signal confidence
@@ -87,44 +82,15 @@ async function launch() {
     process.exit(1);
   }
 
-  // Find image file
-  const imagePath = process.argv.includes('--image')
-    ? process.argv[process.argv.indexOf('--image') + 1]
-    : path.join(process.cwd(), 'fte_logo.png');
-
-  if (!fs.existsSync(imagePath)) {
-    console.error(`❌ Image file not found: ${imagePath}`);
-    console.log('   Save your logo as fte_logo.png in the project root, then run again.');
-    console.log('   Or specify: node scripts/launch-fte.ts --image /path/to/logo.png');
+  // ── Step 1: Verify self-hosted metadata is accessible ──
+  console.log(`\n🔍 Verifying metadata at ${METADATA_URI}...`);
+  const metaCheck = await axios.get(METADATA_URI, { timeout: 10_000 });
+  if (!metaCheck.data?.name) {
+    console.error('❌ Metadata endpoint unreachable or invalid:', JSON.stringify(metaCheck.data));
     process.exit(1);
   }
-
-  console.log(`🖼  Image: ${imagePath} (${(fs.statSync(imagePath).size / 1024).toFixed(1)} KB)`);
-
-  // ── Step 1: Upload metadata to IPFS via PumpPortal ──
-  console.log('\n📤 Uploading metadata to IPFS...');
-
-  const form = new FormData();
-  form.append('file', fs.createReadStream(imagePath));
-  form.append('name', TOKEN_NAME);
-  form.append('symbol', TOKEN_SYMBOL);
-  form.append('description', TOKEN_DESCRIPTION);
-  form.append('twitter', TOKEN_TWITTER);
-  form.append('telegram', TOKEN_TELEGRAM);
-  form.append('website', TOKEN_WEBSITE);
-  form.append('showName', 'true');
-
-  const ipfsResp = await axios.post(PUMPPORTAL_IPFS, form, {
-    headers: form.getHeaders(),
-    timeout: 30_000,
-  });
-
-  const metadataUri: string = ipfsResp.data?.metadataUri;
-  if (!metadataUri) {
-    console.error('❌ IPFS upload failed:', JSON.stringify(ipfsResp.data));
-    process.exit(1);
-  }
-  console.log(`✅ Metadata URI: ${metadataUri}`);
+  console.log(`✅ Metadata verified: ${metaCheck.data.name} ($${metaCheck.data.symbol})`);
+  const metadataUri = METADATA_URI;
 
   // ── Step 2: Create token transaction ──
   // Generate fresh mint keypair — send SECRET KEY (bs58) per PumpPortal docs
