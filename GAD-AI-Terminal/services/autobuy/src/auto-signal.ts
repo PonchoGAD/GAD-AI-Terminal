@@ -572,8 +572,62 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     console.debug(`[raydium-scan] boosts error: ${(e as any).message?.slice(0, 40)}`);
   }
 
+  // Source 3: DexScreener top-boosts (highest total boost amount — different from latest)
+  try {
+    const topR = await axios.get('https://api.dexscreener.com/token-boosts/top/v1', { timeout: 6_000 });
+    const tops: any[] = Array.isArray(topR.data) ? topR.data : (topR.data?.data ?? []);
+    const topMints = tops
+      .filter((b: any) => b.chainId === 'solana' && b.tokenAddress)
+      .map((b: any) => b.tokenAddress as string)
+      .filter((m: string) => !seen.has(m))
+      .slice(0, 20);
+    if (topMints.length > 0) {
+      const pairR = await axios.get(`${DEXSCREENER_BASE}/tokens/${topMints.join(',')}`, { timeout: 8_000 });
+      const pairs: any[] = pairR.data?.pairs ?? [];
+      let added = 0;
+      for (const p of pairs) {
+        if (p.chainId !== 'solana') continue;
+        if (!JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')) continue;
+        const mint = p.baseToken?.address;
+        if (!mint || seen.has(mint)) continue;
+        seen.add(mint);
+        results.push(p);
+        added++;
+      }
+      if (added > 0) console.debug(`[raydium-scan] DexScreener top-boosts: ${added} pairs`);
+    }
+  } catch (e: any) {
+    console.debug(`[raydium-scan] top-boosts error: ${(e as any).message?.slice(0, 40)}`);
+  }
+
+  // Source 4: DexScreener search queries — active Solana tokens right now
+  const SEARCH_QUERIES = ['sol gem', 'sol meme', 'sol ai', 'raydium sol'];
+  for (const q of SEARCH_QUERIES) {
+    try {
+      const sr = await axios.get(
+        `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`,
+        { timeout: 6_000 }
+      );
+      const pairs: any[] = sr.data?.pairs ?? [];
+      let added = 0;
+      for (const p of pairs) {
+        if (p.chainId !== 'solana') continue;
+        if (!JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')) continue;
+        const mint = p.baseToken?.address;
+        if (!mint || seen.has(mint)) continue;
+        seen.add(mint);
+        results.push(p);
+        added++;
+      }
+      if (added > 0) console.debug(`[raydium-scan] DexScreener search "${q}": ${added} pairs`);
+      await new Promise(r => setTimeout(r, 300));
+    } catch (e: any) {
+      console.debug(`[raydium-scan] search "${q}" error: ${(e as any).message?.slice(0, 30)}`);
+    }
+  }
+
   const dxCount = results.length - geckoCount;
-  console.debug(`[raydium-scan] total: ${results.length} unique candidates (${geckoCount} gecko + ${dxCount} boosts)`);
+  console.debug(`[raydium-scan] total: ${results.length} unique candidates (${geckoCount} gecko + ${dxCount} dx)`);
   return results;
 }
 
