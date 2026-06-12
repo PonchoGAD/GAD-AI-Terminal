@@ -25,8 +25,8 @@ const PUMPPORTAL_TRADE  = 'https://pumpportal.fun/api/trade-local';
 const SOLANA_RPC        = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.solana.com';
 const PUMPFUN_WALLET_PK = process.env.PUMPFUN_WALLET_PRIVATE_KEY ?? '';
 
-// Self-hosted metadata — avoids pump.fun/api/ipfs (deprecated) and unreliable ipfs.io URIs
-const METADATA_URI = 'https://gadai.shop/api/fte-metadata';
+// Self-hosted metadata via VPS API (port 4000 is public, no Vercel dependency)
+const METADATA_URI = process.env.FTE_METADATA_URI || 'http://65.21.159.255:4000/fte-metadata';
 
 // ─── Token metadata ────────────────────────────────────────────────────────────
 
