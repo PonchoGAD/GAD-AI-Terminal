@@ -127,10 +127,11 @@ async function launch() {
   console.log(`✅ Metadata URI: ${metadataUri}`);
 
   // ── Step 2: Create token transaction ──
-  // New mint keypair — must sign the create TX alongside the dev wallet
+  // Generate fresh mint keypair — send SECRET KEY (bs58) per PumpPortal docs
   const mintKeypair = Keypair.generate();
+  const mintSecretB58 = bs58.encode(mintKeypair.secretKey);
   console.log(`\n🪙  Creating $${TOKEN_SYMBOL} token with ${INITIAL_BUY_SOL} SOL initial buy...`);
-  console.log(`   Mint: ${mintKeypair.publicKey.toBase58()}`);
+  console.log(`   Mint address: ${mintKeypair.publicKey.toBase58()}`);
 
   const createResp = await axios.post(
     PUMPPORTAL_TRADE,
@@ -142,27 +143,22 @@ async function launch() {
         symbol: TOKEN_SYMBOL,
         uri: metadataUri,
       },
-      mint: mintKeypair.publicKey.toBase58(),
+      mint: mintSecretB58,        // ← private key in base58, NOT public key
       denominatedInSol: 'true',
       amount: INITIAL_BUY_SOL,
       slippage: 10,
-      priorityFee: 0.005,  // higher priority for launch
+      priorityFee: 0.005,
       pool: 'pump',
     },
     { responseType: 'arraybuffer', timeout: 30_000 }
   );
-
-  if (createResp.status !== 200) {
-    console.error('❌ Create TX failed with status', createResp.status);
-    process.exit(1);
-  }
 
   const txBytes = new Uint8Array(createResp.data);
   let txSignature: string;
 
   try {
     const tx = VersionedTransaction.deserialize(txBytes);
-    tx.sign([keypair, mintKeypair]);  // both dev wallet AND mint keypair must sign
+    tx.sign([keypair, mintKeypair]);
     txSignature = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 5 });
   } catch {
     const tx = Transaction.from(Buffer.from(txBytes));
@@ -174,15 +170,16 @@ async function launch() {
 
   console.log('\n🎉 TOKEN LAUNCHED SUCCESSFULLY!');
   console.log('='.repeat(50));
+  const mintAddr = mintKeypair.publicKey.toBase58();
   console.log(`🔗 Transaction: https://solscan.io/tx/${txSignature}`);
-  console.log(`🚀 pump.fun: https://pump.fun/coin/${keypair.publicKey.toBase58()}`);
+  console.log(`🚀 pump.fun: https://pump.fun/coin/${mintAddr}`);
   console.log(`💎 Token: $${TOKEN_SYMBOL} — ${TOKEN_NAME}`);
   console.log(`💰 Initial buy: ${INITIAL_BUY_SOL} SOL`);
   console.log('\n📢 Share this on Twitter/X:');
   console.log(`   Not everyone will be a trillionaire.`);
   console.log(`   But everyone will know who got there first.`);
   console.log(`   $FTE — First Trillionaire Ever 🚀`);
-  console.log(`   https://pump.fun/coin/${keypair.publicKey.toBase58()}`);
+  console.log(`   https://pump.fun/coin/${mintAddr}`);
 }
 
 launch().catch(err => {
