@@ -115,11 +115,16 @@ async function launch() {
   console.log('\n🚀 Creating $ELONWON on pump.fun...');
   console.log('   Mint:', mintKp.publicKey.toBase58());
 
+  // Read actual image bytes — pump.fun SDK uploads this to their IPFS
+  // Passing Blob([]) would create 0-byte placeholder (logo won't load)
+  const imageBytes = fs.readFileSync(LOGO_PATH);
+  const imageBlob = new Blob([imageBytes], { type: 'image/png' });
+
   const createResult = await sdk.createAndBuy(
     mainKeypair, mintKp,
     { name: TOKEN_NAME, symbol: TOKEN_SYMBOL, uri: metaUri,
       twitter: TOKEN_TWITTER, telegram: TOKEN_TELEGRAM, website: TOKEN_WEBSITE,
-      file: new Blob([]), description: TOKEN_DESC } as any,
+      file: imageBlob, description: TOKEN_DESC } as any,
     BigInt(0), 500n,
     { unitLimit: 250000, unitPrice: 250000 }
   );
