@@ -31,19 +31,19 @@ const BONDING_MAX_SOL_DAILY  = Number(process.env.BONDING_MAX_SOL_DAILY || '0.2'
 const BONDING_MAX_POSITIONS  = Number(process.env.BONDING_MAX_POSITIONS || '3');
 
 // Dev must have bought at least this much SOL at launch (skin in the game)
-const BONDING_MIN_DEV_BUY    = Number(process.env.BONDING_MIN_DEV_BUY   || '1.5');
+const BONDING_MIN_DEV_BUY    = Number(process.env.BONDING_MIN_DEV_BUY   || '0.3');
 
 // Min market cap in USD at the moment we enter
-const BONDING_MIN_MCAP_USD   = Number(process.env.BONDING_MIN_MCAP_USD  || '9000');
+const BONDING_MIN_MCAP_USD   = Number(process.env.BONDING_MIN_MCAP_USD  || '6000');
 
 // Max market cap in SOL at entry (don't buy tokens that already pumped too much)
 const BONDING_MAX_MCAP_SOL   = Number(process.env.BONDING_MAX_MCAP_SOL  || '600');
 
 // Min unique buyers in watchlist window before we enter
-const BONDING_MIN_BUYERS     = Number(process.env.BONDING_MIN_BUYERS    || '130');
+const BONDING_MIN_BUYERS     = Number(process.env.BONDING_MIN_BUYERS    || '50');
 
 // Watchlist window: drop candidate if buyers not reached within this time
-const BONDING_WATCH_TIMEOUT_MS = Number(process.env.BONDING_WATCH_TIMEOUT_SEC || '180') * 1000;
+const BONDING_WATCH_TIMEOUT_MS = Number(process.env.BONDING_WATCH_TIMEOUT_SEC || '480') * 1000;
 
 // Time limit before force-exit on bonding curve (seconds)
 const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '600');
