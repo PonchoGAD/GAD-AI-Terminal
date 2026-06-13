@@ -145,39 +145,35 @@ function loadPumpFunKeypair2(): Keypair | null {
 
 // ─── Buy/sell via PumpPortal ──────────────────────────────────────────────────
 
+async function sendPumpTx(
+  txBytes: Uint8Array, keypair: Keypair, connection: Connection, skipPreflight = true
+): Promise<string> {
+  const { VersionedTransaction, Transaction } = await import('@solana/web3.js');
+  // Version byte >= 0x80 = versioned tx; < 0x80 = legacy tx
+  if (txBytes[0] >= 0x80) {
+    const tx = VersionedTransaction.deserialize(txBytes);
+    tx.sign([keypair]);
+    return connection.sendTransaction(tx, { skipPreflight, maxRetries: 5 });
+  } else {
+    const tx = Transaction.from(Buffer.from(txBytes));
+    tx.partialSign(keypair);
+    return connection.sendRawTransaction(tx.serialize(), { skipPreflight });
+  }
+}
+
 async function buyOnBondingCurve(
   mint: string, amountSol: number, keypair: Keypair, connection: Connection,
   pool: string = 'pump'
 ): Promise<{ success: boolean; txSignature?: string; error?: string }> {
   try {
-    const { VersionedTransaction, Transaction } = await import('@solana/web3.js');
     const resp = await axios.post(
       PUMPPORTAL_BUY,
-      {
-        publicKey: keypair.publicKey.toBase58(),
-        action: 'buy',
-        mint,
-        amount: amountSol,
-        denominatedInSol: 'true',
-        slippage: 25,
-        priorityFee: 0.002,
-        pool,
-      },
+      { publicKey: keypair.publicKey.toBase58(), action: 'buy', mint,
+        amount: amountSol, denominatedInSol: 'true', slippage: 25, priorityFee: 0.002, pool },
       { responseType: 'arraybuffer', timeout: 15_000 }
     );
-
     const txBytes = new Uint8Array(resp.data as ArrayBuffer);
-    let txSignature: string;
-    try {
-      const tx = VersionedTransaction.deserialize(txBytes);
-      tx.sign([keypair]);
-      txSignature = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
-    } catch {
-      const tx = Transaction.from(Buffer.from(txBytes));
-      tx.partialSign(keypair);
-      txSignature = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
-    }
-
+    const txSignature = await sendPumpTx(txBytes, keypair, connection, true);
     await connection.confirmTransaction(txSignature, 'confirmed');
     console.info(`[bonding-scan] ✅ Bought ${mint.slice(0, 8)} for ${amountSol} SOL | tx:${txSignature.slice(0, 20)}`);
     return { success: true, txSignature };
@@ -195,35 +191,21 @@ async function sellOnBondingCurve(
   pool: string = 'pump'
 ): Promise<{ success: boolean; solReceived?: number }> {
   try {
-    const { VersionedTransaction, Transaction } = await import('@solana/web3.js');
     const balBefore = await connection.getBalance(keypair.publicKey).catch(() => 0);
     const resp = await axios.post(
       PUMPPORTAL_BUY,
-      {
-        publicKey: keypair.publicKey.toBase58(),
-        action: 'sell',
-        mint,
-        amount: `${pct}%`,
-        denominatedInSol: 'false',
-        slippage: 50,
-        priorityFee: 0.003,
-        pool,
-      },
+      { publicKey: keypair.publicKey.toBase58(), action: 'sell', mint,
+        amount: `${pct}%`, denominatedInSol: 'false', slippage: 50, priorityFee: 0.005, pool },
       { responseType: 'arraybuffer', timeout: 15_000 }
     );
-
     const txBytes = new Uint8Array(resp.data as ArrayBuffer);
-    let txSignature: string;
-    try {
-      const tx = VersionedTransaction.deserialize(txBytes);
-      tx.sign([keypair]);
-      txSignature = await connection.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
-    } catch {
-      const tx = Transaction.from(Buffer.from(txBytes));
-      tx.partialSign(keypair);
-      txSignature = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
+    // Log first bytes to detect error responses vs valid tx
+    if (txBytes.length < 50) {
+      const text = Buffer.from(txBytes).toString('utf8').slice(0, 200);
+      console.warn(`[bonding-scan] Sell response too short (${txBytes.length}b): ${text}`);
+      return { success: false };
     }
-
+    const txSignature = await sendPumpTx(txBytes, keypair, connection, true);
     await connection.confirmTransaction(txSignature, 'confirmed');
     const balAfter = await connection.getBalance(keypair.publicKey).catch(() => 0);
     const solReceived = Math.max(0, (balAfter - balBefore) / 1e9);
@@ -238,7 +220,7 @@ async function sellOnBondingCurve(
     }
     return { success: true, solReceived };
   } catch (err: any) {
-    console.warn(`[bonding-scan] Sell failed ${mint.slice(0, 8)}: ${err.message?.slice(0, 80)}`);
+    console.warn(`[bonding-scan] Sell failed ${mint.slice(0, 8)}: ${err.message?.slice(0, 120)}`);
     return { success: false };
   }
 }
@@ -689,13 +671,17 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
       last_trade_timestamp: (p.volume?.m5 ?? 0) > 0 ? Math.floor(Date.now() / 1000) : 0,
       created_timestamp:    p.pairCreatedAt ? Math.floor(Number(p.pairCreatedAt) / 1000) : 0,
       vol5m: p.volume?.m5 ?? 0,
+      vol1h: p.volume?.h1 ?? 0,
+      buys5m: p.txns?.m5?.buys ?? 0,
+      sells5m: p.txns?.m5?.sells ?? 0,
       complete: false,
       raydium_pool: null,
       pc5m: Number(p.priceChange?.m5 ?? 0),
+      pc1h: Number(p.priceChange?.h1 ?? 0),
       // 'pump' = bonding curve, 'pumpswap' = graduated PumpSwap
       dexPool: dex === 'pumpswap' ? 'pumpswap' : 'pump',
     };
-  }).filter(c => (c.vol5m ?? 0) > 0);  // must have recent 5m volume
+  }).filter(c => (c.vol5m ?? 0) > 200);  // must have at least $200 volume in last 5m
 
     for (const coin of coins) {
       const mint: string = coin.mint ?? '';
@@ -725,9 +711,27 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
       const mcapSol = mcapUsd / solPriceUsd;
       if (mcapSol > BONDING_MAX_MCAP_SOL) continue;
 
+      // Require real buying activity — not just dev pumping
+      const buys5m = Number(coin.buys5m ?? 0);
+      const vol5m  = Number(coin.vol5m ?? 0);
+      const pc5m   = Number(coin.pc5m ?? 0);
+      if (buys5m < 8) {
+        console.debug(`[bonding-scan] ✗hot ${symbol} buys5m:${buys5m} (min 8)`);
+        continue;
+      }
+      if (vol5m < 500) {
+        console.debug(`[bonding-scan] ✗hot ${symbol} vol5m:$${vol5m.toFixed(0)} (min $500)`);
+        continue;
+      }
+      if (pc5m < 0) {
+        console.debug(`[bonding-scan] ✗hot ${symbol} pc5m:${pc5m.toFixed(1)}% (must be positive)`);
+        continue;
+      }
+
       const dexPool = coin.dexPool ?? 'pump';
       console.info(
         `[bonding-scan] 🔥 HOT ${symbol} mcap:$${mcapUsd.toFixed(0)} ` +
+        `buys5m:${buys5m} vol5m:$${vol5m.toFixed(0)} pc5m:${pc5m.toFixed(1)}% ` +
         `age:${(tokenAgeSec / 60).toFixed(0)}min pool:${dexPool} — entering w2`
       );
 
