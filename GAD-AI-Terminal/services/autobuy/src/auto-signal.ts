@@ -375,45 +375,41 @@ export interface LiqTier {
 }
 
 export function getLiqTier(liqUsd: number): LiqTier {
-  // T1 ($8k-$80k): DISABLED — consistent losses due to high slippage and low stability.
-  // Use RAYDIUM_MIN_LIQUIDITY_USD=80000 env var to skip T1 entirely.
+  // T1 ($18k-$80k): sell 100% at +25%. One shot — no partial selling.
+  // Root cause of prior losses: 2x/5x staged targets were hit for a fraction of a second,
+  // TX executed at 1x due to reversion. Now: lower target, full exit, faster execution.
+  // Tight 5% stop = max loss 0.0025 SOL at 0.05 SOL position.
   if (liqUsd <= 80000) return {
     tier: 1, label: 't1',
-    timeLimitSec: 1800,
-    stopPct: 0.08,
-    trailPct: 0.12,
+    timeLimitSec: 1200,    // 20 min — cut losses early on dead tokens
+    stopPct: 0.05,         // 5% stop loss (was 8%)
+    trailPct: 0.10,        // 10% trailing from peak
     earlyTrailPct: 0.04,
     sellStages: [
-      { stage: 1, multiplier: 2.0,  sellPct: 40 },  // take 40% at 2x
-      { stage: 2, multiplier: 5.0,  sellPct: 100 }, // rest at 5x
+      { stage: 1, multiplier: 1.25, sellPct: 100 }, // sell ALL at +25% — one shot
     ],
   };
-  // T2 ($80k-$250k): primary target — proven profitable via FeMb (+10.1%).
-  // Keep large position for big moves — early trail exits most scenarios cleanly.
-  // Staged backup: 2x (30%) → 5x (50%) → 15x (100%)
+  // T2 ($80k-$250k): sell 100% at +35%. More stable pools, easier to execute.
+  // Prior 1.05x/1.12x staging returned <entry due to reversion — new single target is achievable.
   if (liqUsd <= 250000) return {
     tier: 2, label: 't2',
-    timeLimitSec: 2700,  // 45 min — give more time for the move to develop
-    stopPct: 0.08,
-    trailPct: 0.12,
-    earlyTrailPct: 0.04,  // exit when 4% below peak (was 5%, tighter = faster profit lock)
+    timeLimitSec: 1800,    // 30 min
+    stopPct: 0.05,
+    trailPct: 0.10,
+    earlyTrailPct: 0.04,
     sellStages: [
-      { stage: 1, multiplier: 2.0,  sellPct: 30 },  // 2x: take only 30% — keep position for moon
-      { stage: 2, multiplier: 5.0,  sellPct: 50 },  // 5x: take 50% of remaining (35% original)
-      { stage: 3, multiplier: 15.0, sellPct: 100 }, // 15x: sell everything — max capture
+      { stage: 1, multiplier: 1.35, sellPct: 100 }, // sell ALL at +35%
     ],
   };
-  // T3 ($250k-$500k): steadier runners, tighter trail.
+  // T3 ($250k-$300k): stable pools, target +45% — still single exit.
   return {
     tier: 3, label: 't3',
-    timeLimitSec: 3600,
-    stopPct: 0.07,
-    trailPct: 0.12,
+    timeLimitSec: 2400,    // 40 min
+    stopPct: 0.05,
+    trailPct: 0.10,
     earlyTrailPct: 0.05,
     sellStages: [
-      { stage: 1, multiplier: 1.5,  sellPct: 25 },
-      { stage: 2, multiplier: 3.0,  sellPct: 50 },
-      { stage: 3, multiplier: 8.0,  sellPct: 100 },
+      { stage: 1, multiplier: 1.45, sellPct: 100 }, // sell ALL at +45%
     ],
   };
 }

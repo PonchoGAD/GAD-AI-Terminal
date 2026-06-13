@@ -79,28 +79,45 @@ const MAX_TIME_LIMIT_FAILS = 3;
 // Previous price per mint for activity detection
 const prevPriceMap = new Map<string, number>();
 
-// DexScreener price cache — avoids hammering DS API every 5s per token
+// Price cache — shared between DexScreener and Jupiter sources
 const priceCache = new Map<string, { price: number; ts: number }>();
-const PRICE_CACHE_MS = 4000;
+// Fast cache: 1 second — price must be near-real-time for quick TP detection
+const PRICE_CACHE_MS = 1000;
 
 // Sell attempt cooldown after 429 — prevents rapid-fire rate-limit cascades
 const sellCooldownMap = new Map<string, number>(); // stageId → unixMs when cooldown expires
 const SELL_COOLDOWN_MS = 30_000; // 30s after any sell 429
 
-// ─── DexScreener price fetch ──────────────────────────────────────────────────
+// ─── Jupiter Lite price fetch (primary — fast, batch-friendly, no auth) ───────
+// Falls back to DexScreener if Jupiter returns 0.
 async function getPriceSolViaDS(mint: string): Promise<number> {
   const cached = priceCache.get(mint);
   if (cached && Date.now() - cached.ts < PRICE_CACHE_MS) return cached.price;
+
+  // Try Jupiter Lite first — typically <200ms, no rate-limit issues with single-mint calls
+  try {
+    const jupRes = await axios.get(
+      `https://lite.jup.ag/v1/prices?ids=${mint}&vsToken=So11111111111111111111111111111111111111112`,
+      { timeout: 2500 }
+    );
+    const jupPrice = Number(jupRes.data?.data?.[mint]?.price ?? 0);
+    if (jupPrice > 0) {
+      priceCache.set(mint, { price: jupPrice, ts: Date.now() });
+      return jupPrice;
+    }
+  } catch { /* fall through to DexScreener */ }
+
+  // Fallback: DexScreener (slower but reliable for established pairs)
   try {
     const r = await axios.get(
       `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
       { timeout: 4000 }
     );
     const pairs: any[] = r.data?.pairs ?? [];
-    if (!pairs.length) return 0;
+    if (!pairs.length) return priceCache.get(mint)?.price ?? 0;
     const best = pairs.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
     const price = Number(best.priceNative ?? 0);
-    priceCache.set(mint, { price, ts: Date.now() });
+    if (price > 0) priceCache.set(mint, { price, ts: Date.now() });
     return price;
   } catch {
     return priceCache.get(mint)?.price ?? 0;
@@ -857,6 +874,20 @@ export async function startAutobuyScheduler() {
   // Start bonding curve scanner — buys tokens BEFORE graduation using PUMPFUN_WALLET
   startBondingScanner();
 
+  // ─── Fast sell loop — checks every 1 second for TP/SL hits ───────────────
+  // The main poll loop runs every 5s (including raydium scan). Memecoins pump and
+  // dump in 2-4 seconds — by the time the main loop runs checkAndExecuteSells,
+  // the price has already reverted. This fast loop catches TP windows before they close.
+  let fastSellRunning = false;
+  const fastSellInterval = setInterval(async () => {
+    if (fastSellRunning || !walletAddress) return;
+    fastSellRunning = true;
+    try {
+      await checkAndExecuteSells(walletAddress);
+    } catch { /* logged inside checkAndExecuteSells */ }
+    finally { fastSellRunning = false; }
+  }, 1000);
+
   while (!shouldStop) {
     try { await deactivateStuckJobs(); } catch (err) {
       console.error('[autobuy] Stuck job cleanup error:', err);
@@ -886,5 +917,6 @@ export async function startAutobuyScheduler() {
     await new Promise(r => setTimeout(r, POLL_MS));
   }
 
+  clearInterval(fastSellInterval);
   console.info('[autobuy] Scheduler stopped.');
 }
