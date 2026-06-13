@@ -15,7 +15,11 @@ COPY libs ./libs
 # Copy service source
 COPY services/futures ./services/futures
 
-# Install all workspace deps (includes pg via @lib/db)
+# Install all workspace deps (creates node_modules/@lib/* symlinks via npm workspaces)
 RUN npm install --ignore-scripts
 
-CMD ["node", "-r", "ts-node/register", "-r", "tsconfig-paths/register", "services/futures/src/index.ts"]
+# Compile TypeScript
+RUN cd services/futures && npx tsc --project tsconfig.json --skipLibCheck || true
+
+# Runtime: compiled JS, node resolves @lib/db via root node_modules/@lib/db symlink
+CMD ["node", "services/futures/dist/index.js"]
