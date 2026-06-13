@@ -43,7 +43,7 @@ const BONDING_MAX_MCAP_SOL   = Number(process.env.BONDING_MAX_MCAP_SOL  || '600'
 const BONDING_MIN_BUYERS     = Number(process.env.BONDING_MIN_BUYERS    || '50');
 
 // Watchlist window: drop candidate if buyers not reached within this time
-const BONDING_WATCH_TIMEOUT_MS = Number(process.env.BONDING_WATCH_TIMEOUT_SEC || '480') * 1000;
+const BONDING_WATCH_TIMEOUT_MS = Number(process.env.BONDING_WATCH_TIMEOUT_SEC || '1020') * 1000;
 
 // Time limit before force-exit on bonding curve (seconds)
 const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '600');
