@@ -501,33 +501,9 @@ async function fetchRaydiumPairs(): Promise<any[]> {
   const seen = new Set<string>();
   const results: any[] = [];
 
-  // Source 0: GeckoTerminal Raydium DEX pools sorted by 24h transaction count.
-  // DIRECTLY targets Raydium pools only (no pump.fun) — sort by tx count = highest community engagement today.
-  // This catches fresh tokens (1-48h) that already have active buyers before a bigger pump.
-  // Sorted by h24_tx_count_desc means highest-activity tokens appear first across all ages.
-  // Single page only — the scanner service also calls GeckoTerminal, combined rate limit shared.
-  // 1 call per 120s from autobuy + 2 calls/min from scanner = ~2.5 req/min total (safe).
-  let raydiumDexCount = 0;
-  try {
-    const r = await axios.get(
-      `${GECKO_BASE}/networks/solana/dexes/raydium/pools?sort=h24_tx_count_desc&include=base_token,dex&page=1`,
-      { headers: GECKO_HEADERS, timeout: 8_000 }
-    );
-    const pools: any[] = r.data?.data ?? [];
-    for (const pool of pools) {
-      const pair = geckoPoolToPair(pool);
-      if (!pair) continue;
-      const mint = pair.baseToken?.address;
-      if (!mint || seen.has(mint)) continue;
-      seen.add(mint);
-      results.push(pair);
-      raydiumDexCount++;
-    }
-  } catch (e: any) {
-    const status = (e as any).response?.status ?? (e as any).code;
-    console.debug(`[raydium-scan] GeckoTerminal Raydium DEX: ${status ?? (e as any).message?.slice(0, 30)}`);
-  }
-  if (raydiumDexCount > 0) console.debug(`[raydium-scan] GeckoTerminal Raydium DEX (tx-sorted): ${raydiumDexCount} pairs`);
+  // Note: GeckoTerminal removed from autobuy — scanner service already uses it and
+  // the shared VPS IP hits 429 consistently. DexScreener sources below cover discovery.
+  const raydiumDexCount = 0;
 
   // Source 1: DexScreener token-profiles/latest — freshly launched tokens with community profiles.
   // These are brand-new tokens someone just added a profile for — high community engagement signal.
@@ -620,8 +596,9 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     console.debug(`[raydium-scan] top-boosts error: ${(e as any).message?.slice(0, 40)}`);
   }
 
-  // Source 4: DexScreener search queries — active Solana tokens right now
-  const SEARCH_QUERIES = ['sol gem', 'sol meme', 'sol ai', 'raydium sol'];
+  // Source 4: DexScreener search queries — fresh active Solana tokens right now
+  // Mix of narrative + freshness queries to catch new launches with momentum
+  const SEARCH_QUERIES = ['sol gem', 'sol meme', 'sol ai', 'raydium sol', 'new sol', 'sol dog', 'sol cat', 'sol pepe'];
   for (const q of SEARCH_QUERIES) {
     try {
       const sr = await axios.get(
