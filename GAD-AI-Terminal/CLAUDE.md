@@ -1,10 +1,35 @@
 # GAD AI Terminal — CLAUDE.md
+> Этот файл — главная память проекта. Claude читает его автоматически при каждом запуске.
+> Обновляй его после каждого важного изменения.
+
+---
 
 ## Что это за проект
 
 **GAD AI Terminal** — Solana memecoin-аналитика + торговая платформа с реальным временем.
-Монорепозиторий (npm workspaces), 8 микросервисов, 17 shared-либ, PostgreSQL + Redis, Docker Compose.
-Деплой: VPS Hetzner, Docker Compose, домен `gadai.shop`.
+Монорепозиторий (npm workspaces), 8 микросервисов, 18 shared-либ, PostgreSQL + Redis, Docker Compose.
+Деплой: VPS Hetzner (`root@65.21.159.255`), SSH key `~/.ssh/gad_deploy`, домен `gadai.shop`.
+
+---
+
+## SSH доступ к VPS
+
+```bash
+# Ключ находится локально:
+ssh -i ~/.ssh/gad_deploy root@65.21.159.255
+
+# Проект на сервере:
+cd /opt/gad-ai-terminal/GAD-AI-Terminal
+
+# Git remote на VPS (тянет отсюда):
+# origin → https://github.com/PonchoGAD/GAD-AI-Terminal.git
+```
+
+> **Локальный git remotes:**
+> - `gad` → `https://github.com/PonchoGAD/GAD-AI-Terminal.git` — **VPS тянет отсюда**
+> - `origin` → `https://github.com/PonchoGAD/SaaS-Landing-Demo.git` — лендинг, VPS не использует
+>
+> Всегда пушить через: `git push gad main` (не `git push origin main`)
 
 ---
 
@@ -39,11 +64,35 @@ libs/
   memory        — Сравнение нового токена с историческими 100x (cosine similarity)
   regime        — Детекция рыночного режима: BULL/BEAR/SIDEWAYS/EUPHORIA/PANIC
   reputation    — Классификация кошельков: LEGEND/SMART/AVERAGE/TOURIST/EXIT_LIQUIDITY
+  trend-engine  — GDELT + Google News → кластеризация → AI генерация meme coin идей
 ```
 
-**БД:** 10 миграций → ~20 таблиц:
+**БД:** 11 миграций → ~23 таблицы:
 `tokens`, `token_metrics`, `subscriptions`, `subscription_plans`, `telegram_users`,
-`autobuy_jobs`, `autosell_stages`, `whale_scores`, `score_history`, `alerts`
+`autobuy_jobs`, `autosell_stages`, `whale_scores`, `score_history`, `alerts`,
+`trend_items`, `trend_clusters`, `coin_ideas`
+
+---
+
+## Соглашения по коду
+
+```typescript
+// Все модули возвращают единообразно:
+{ ok: boolean; data?: T; error?: string }
+
+// Async/await везде — никаких callbacks
+// Логировать с префиксом сервиса:
+console.info('[autobuy] ...')
+console.debug('[raydium-scan] ...')
+console.warn('[sell] ...')
+
+// Env переменные: Number(process.env.X || 'default')
+// Никогда не хардкодить адреса кошельков или ключи
+
+// Entry price ВСЕГДА в SOL/readable-token (не SOL/base-unit)
+// DexScreener priceNative = SOL/readable-token → эта же единица
+// tokenAmount.uiAmount (из getParsedTokenAccountsByOwner) — human-readable
+```
 
 ---
 
@@ -55,8 +104,6 @@ libs/
 | `trial_3d` | **0.1 SOL** | 72 часа | Полный доступ + Alpha Engine |
 | `monthly` | **1.0 SOL** | 30 дней | Всё включено (без авто-покупки) |
 | `autobuy_pro` | **5.0 SOL** | 30 дней | Всё включено + авто-покупка (ПЛАНИРУЕТСЯ) |
-
-> Автопокупка планируется как отдельная премиум-функция: 5 SOL за 30 дней включает все функции + бот торгует автоматически.
 
 ---
 
@@ -73,208 +120,201 @@ libs/
 
 ## Что СДЕЛАНО (готово и в продакшне)
 
-- [x] Полная схема БД (10 SQL-миграций)
-- [x] Все 17 shared-либ (scoring, risk, rug, narrative, social, survival, dna, gad-score, lifecycle, opportunity, memory, regime, reputation)
+- [x] Полная схема БД (11 SQL-миграций)
+- [x] Все 18 shared-либ + trend-engine (GDELT + Google News + AI идеи)
 - [x] API сервер: токены, watchlist, alerts, portfolio, subscription, tg-user linking
 - [x] Subscription routes: 3 плана (0.05/0.1/1.0 SOL), on-chain верификация tx, FREE_WALLETS bypass
-- [x] Telegram-бот: все команды + Alpha Engine (/opportunity, /lifecycle, /regime, /reputation, /memory)
-- [x] Trade Journal: `/journal` (история сделок + P&L) + `/riskpassport` (персональный риск-профиль) + CSV экспорт → `GET /journal`, `GET /riskpassport`
-- [x] TokenScore: `/tokenscore <mint>` — прозрачность токена 0-100 (rug safety 40 + liquidity 25 + community 20 + transparency 15) → `GET /tokenscore/:mint`
-- [x] HonestLauncher: `/launch` в боте — информация + ссылка на Dashboard launcher
-- [x] Birdeye holder check: `checkHolderMomentum()` в `auto-signal.ts` перед покупкой — фильтр <50 holders (env: `BIRDEYE_MIN_HOLDERS`, `BIRDEYE_API_KEY`)
-- [x] Scanner: circuit breaker (403/429/530 → disable 10min), collectors: GeckoTerminal, DexScreener, Helius (primary) + pump.fun, GMGN, Axiom (optional)
-- [x] Autobuy: Jupiter swap + PumpPortal fallback, staged auto-sell (1.3x/2x/5x/10x/20x), error handling
-- [x] PumpPortal Local TX API: `services/autobuy/src/pumpportal.ts` — fallback для токенов где Jupiter не может продать (pump.fun, pumpswap, fluxbeam, meteoradbc)
-- [x] Two-track auto-signal: Jupiter ($20k liq, Raydium/Orca) + PumpPortal ($3k liq, pump.fun/pumpswap)
-- [x] Intelligence.ts Math.round() fix: все поля opportunities table — INTEGER, вещественные числа вызывали `invalid input syntax for type integer` → Math.round() на всех 8 полях (lines 385-390)
-- [x] Landing Helius RPC: NEXT_PUBLIC_SOLANA_RPC запекается через Docker ARG при сборке → платёж больше не даёт 403
-- [x] Whale tracker: Helius мониторинг, smart money классификация
-- [x] Dashboard: все страницы (trending, new, highscore, highrisk, smartmoney, portfolio…)
-- [x] Landing: мультилокаль (en/ru), pricing, payment form, API proxy (`/api/proxy`)
-- [x] Landing новые страницы (Sprint 14): `/trade-journal`, `/token-score`, `/launcher` + секция "NEW IN JUNE 2026" на главной
+- [x] Telegram-бот: все команды + Alpha Engine + Trend Engine (/trends, /ideas, /approve_idea)
+- [x] Trade Journal: `/journal` + `/riskpassport` + CSV экспорт
+- [x] TokenScore: `/tokenscore <mint>` — скор 0-100
+- [x] HonestLauncher: `/launch` в боте
+- [x] Birdeye holder check + trending (Source 5)
+- [x] Scanner: circuit breaker, collectors: GeckoTerminal, DexScreener, Helius
+- [x] Autobuy: Jupiter + PumpPortal fallback, single-shot sell (1.25x/1.35x/1.45x по тиру)
+- [x] Fast sell loop: setInterval(1000ms) независимо от 5-секундного poll
+- [x] Graduation scanner: WebSocket → PumpPortal — sub-second latency на pump.fun graduates
+- [x] **CRITICAL FIX (июнь 2026):** Entry price unit mismatch — был SOL/base-unit, стал SOL/readable-token
+- [x] Raydium DexScreener multi-source (5 источников: profiles, boosts, top-boosts, 8 queries, Birdeye)
+- [x] Filter calibration из 72h анализа pump.fun winners: min_liq 22k, max B/S ratio 3.5x, vol/liq 8%
+- [x] Trend-to-MemeCoin Engine: migration 011, libs/trend-engine, telegram /trends commands
+- [x] Landing: мультилокаль (en/ru), pricing, payment form, API proxy
 - [x] Docker Compose: все сервисы + postgres + redis + `restart: unless-stopped`
-- [x] `/pay` роут исправлен (middleware больше не редиректит на `/en/pay`)
-- [x] Proxy API route в лендинге (`app/api/proxy/[...path]/route.ts`) — браузер не ломится на localhost:4000
-- [x] `SITE_URL=https://gadai.shop` в боте и env
-- [x] Dashboard Dockerfile исправлен (context: services/dashboard → `COPY . .`)
-- [x] social-monitor Dockerfile исправлен (workspace name)
-- [x] Scanner tsconfig: пути для lifecycle/opportunity/memory/regime → `.ts` исходники
 
 ---
 
 ## Что НЕ СДЕЛАНО / требует доработки
 
 ### КРИТИЧНО
-- [ ] **Metadata enrichment** — tokens.symbol/name остаются NULL (нужен fallback на DexScreener/GeckoTerminal/Helius в enrichment layer)
-- [ ] **E2E тест payment flow** — нет автотеста on-chain верификации
+- [ ] **Metadata enrichment** — tokens.symbol/name остаются NULL
+- [ ] **ANTHROPIC_API_KEY** в VPS .env — нужен для trend-engine AI генерации идей
+- [ ] **Migration 011** применить на VPS: `docker compose exec -T postgres psql -U gad -d gad_ai < migrations/011_trend_engine.sql`
 - [ ] **Health checks** для scanner, telegram, autobuy, whale-tracker
-- [ ] **Деплой-скрипт / Makefile** — нет единой точки запуска
 
 ### ВАЖНО
 - [ ] **Unit-тесты** для rug, gad-score, narrative, survival, dna, social, lifecycle, regime
 - [ ] **Rate limit на API** (express-rate-limit)
-- [ ] **Zod-валидация** на POST endpoints
-- [ ] **Структурированные логи** (pino/winston)
 - [ ] **Redis кеширование** (trending/new на 30с, tg/status на 60с)
 - [ ] **Dashboard WebSocket** — нет real-time обновлений
-- [ ] **alpha.commands.ts SITE_URL** — ещё gadai.com в одном месте (нужен rebuild telegram)
+- [ ] **GMGN** недоступен с VPS (Cloudflare) — нужен residential proxy ($15/мес)
 
 ---
 
-## Как деплоить на сервер (VPS Hetzner)
+## Decisions Log (почему так сделано)
 
-> **ВАЖНО:** Локальный git имеет два remote:
-> - `gad` → `https://github.com/PonchoGAD/GAD-AI-Terminal.git` — **VPS тянет отсюда**
-> - `origin` → `https://github.com/PonchoGAD/SaaS-Landing-Demo.git` — лендинг, VPS не использует
->
-> Всегда пушить через: `git push gad main` (не `git push origin main`)
+### 2026-06 — Entry price: SOL/readable-token, не SOL/base-unit
+**Решение:** `entry_price_sol` хранится в SOL per human-readable token (совпадает с DexScreener `priceNative`).
+**Почему:** Jupiter возвращает `outAmount` в base units (BigInt). Делить SOL на base-units давало ~10^9× меньшее число чем `priceNative`. TP-цели срабатывали мгновенно (current >> target), бот продавал сразу после покупки, теряя на slippage+fees каждую сделку.
+**Фикс:** `tokenAmount.uiAmount` из `getParsedTokenAccountsByOwner` — уже в human-readable единицах.
+**Не менять:** entry_price_sol = `amountSol / uiAmount`.
+
+### 2026-06 — Sell targets: single-shot 100%
+**Решение:** Один TP target на всю позицию (не 50%+50%).
+**Почему:** Мемкоины делают быстрый памп и откатываются. Продавать 50% и удерживать остаток = часто держать пока не упадёт под stop-loss. Single-shot гарантирует фиксацию прибыли на пике.
+**Текущие цели:** T1 ($8-80k liq) = 1.25x, T2 ($80-250k) = 1.35x, T3 ($250k+) = 1.45x.
+
+### 2026-06 — processAutoSignals ОТКЛЮЧЁН
+**Решение:** Только `processRaydiumOpportunities()` активен. `processAutoSignals()` закомментирован.
+**Почему:** Score-80 pump.fun токены давали 100% rate потерь. Jupiter не может продавать pump.fun токены, PumpPortal тоже ненадёжен для этой стратегии.
+**Не включать** пока нет надёжного механизма продажи pump.fun токенов.
+
+### 2026-06 — GeckoTerminal убран из autobuy
+**Решение:** Autobuy не использует GeckoTerminal. Scanner использует.
+**Почему:** Оба сервиса на одном VPS IP → совместные запросы вызывают persistent 429. DexScreener + Birdeye закрывают потребность в discovery.
+
+### 2026-06 — Min liquidity 22k (было 8k)
+**Решение:** `RAYDIUM_MIN_LIQUIDITY_USD=22000` по умолчанию.
+**Почему:** Анализ 20 pump.fun токенов > $50k mcap за 72ч показал: liq < $20k = dev buy < 0.3 SOL = высокий rug риск. Liq $22k+ = dev вложил ≥ 0.8 SOL (реальный commitment).
+**Данные:** Победители (>200% за 24ч) имели avg liq $35.8k при листинге.
+
+### 2026-06 — Max B/S ratio 3.5x (новый фильтр)
+**Решение:** `RAYDIUM_MAX_BUY_SELL_RATIO=3.5` — отклонять токены с аномально высоким соотношением.
+**Почему:** Gaejuki: B/S 5.82x при цене -76% = pump&dump (накачка объёма, дамп дева). RESERVE: 5.7x (24ч) → 0.58x (1ч) = большой памп уже прошёл. Здоровое накопление = 1.2-1.8x.
+**Данные:** Все 10 победителей имели B/S 1.1-1.6x в здоровой фазе.
+
+### 2026-06 — isJupiterOnly флаг в claimAndSell
+**Решение:** Raydium токены (`auto:raydium_scan:*`) имеют `isJupiterOnly=true` → PumpPortal fallback заблокирован.
+**Почему:** При TIME_LIMIT_EXPIRED Raydium токены падали в PumpPortal → транзакция проходила но 0 SOL возвращалось (неправильный DEX).
+
+---
+
+## Как деплоить на сервер
 
 ```bash
-# На локальной машине — пушить в правильный remote:
+# Локально:
 git push gad main
 
-# На сервере (/opt/gad-ai-terminal)
+# На VPS:
+ssh -i ~/.ssh/gad_deploy root@65.21.159.255
+cd /opt/gad-ai-terminal/GAD-AI-Terminal
 git pull origin main
 
-# Применить новые миграции
-docker compose exec -T postgres psql -U gad -d gad_ai < migrations/009_metadata_enrich.sql
-docker compose exec -T postgres psql -U gad -d gad_ai < migrations/010_new_plans.sql
+# Применить новые миграции (если есть):
+docker compose exec -T postgres psql -U gad -d gad_ai < migrations/011_trend_engine.sql
 
-# Пересобрать и поднять
-docker compose build --no-cache
-docker compose up -d
+# Пересобрать нужные сервисы:
+docker compose build autobuy
+docker compose up -d autobuy
 
-# Проверить статус
+# Проверить:
 docker compose ps
-docker compose logs landing --tail=20
-docker compose logs telegram --tail=20
+docker logs gad-ai-autobuy --tail=20
 ```
+
+---
+
+## Текущие параметры бота (VPS .env — июнь 2026)
+
+```bash
+AUTO_BUY_ENABLED=true
+AUTO_BUY_SOL=0.02               # позиция 0.02 SOL
+MAX_AUTO_POSITIONS=10
+DAILY_MAX_SOL=1.0               # max 1 SOL в день
+
+# Фильтры Raydium scanner:
+RAYDIUM_MIN_LIQUIDITY_USD=22000  # min liq = dev buy ≥ 0.8 SOL
+RAYDIUM_MAX_LIQUIDITY_USD=300000
+RAYDIUM_MIN_PC1H=1              # 1% momentum за 1ч
+RAYDIUM_MAX_PC1H=80
+RAYDIUM_MIN_PC5M=1
+RAYDIUM_MIN_VOL_LIQ_RATIO=0.08  # 8% hourly vol/liq (код дефолт)
+RAYDIUM_MAX_BUY_SELL_RATIO=3.5  # wash trading filter
+
+# Sell параметры:
+STOP_LOSS_PCT=8                 # глобальный стоп (per-tier = 5%)
+TRAIL_PCT=12
+EARLY_TRAIL_PCT=4
+
+# Slippage:
+# AUTOSELL_SLIPPAGE_BPS=500
+# AUTOSELL_SLIPPAGE_RETRY_BPS=1000
+
+# Birdeye:
+BIRDEYE_MIN_HOLDERS=70
+BIRDEYE_API_KEY=b027655dffa446308f5073d48653c5d2
+
+# PumpPortal:
+PUMP_PORTAL_ENABLED=true
+PUMP_MIN_LIQUIDITY_USD=9000
+PUMP_MIN_TOKEN_AGE_SEC=1200
+```
+
+---
+
+## Профиль winning pump.fun токена (данные из 72ч анализа)
+
+| Метрика | Диапазон |
+|---|---|
+| Возраст при входе | 15-25ч после листинга |
+| Liq при листинге | $25-65k |
+| Buy/sell ratio 24ч | 1.2-1.8x |
+| Vol/mcap ratio | >2.0x за 24ч |
+| Ранняя активность | >60% объёма в первые 18ч |
+| Dev buy (оценка) | 0.8-5 SOL |
+
+**Жизненный цикл:**
+- 0-5 мин: Dev создаёт + покупает
+- 5-20 мин: Снайперы/боты
+- 20-30 мин: Листинг на Raydium/pumpswap — **НАШЕ ОКНО**
+- 30-120 мин: Основной памп (200-900% у победителей)
+- 2-6 ч: Дистрибуция
+- 6+ ч: Стабилизация или смерть
 
 ---
 
 ## Важные фиксы (история для памяти)
 
+### Entry price unit mismatch — КРИТИЧЕСКИЙ БАГ (исправлено — июнь 2026)
+**Причина:** `entry_price_sol` = `amountSol / baseUnitTokens` (SOL/base-unit).
+DexScreener `priceNative` = SOL/readable-token. Разница = 10^decimals (до 10^9).
+Все TP-цели срабатывали мгновенно → бот продавал сразу после покупки → потеря slippage+fees на каждой сделке.
+**Фикс:** `entry_price_sol` = `amountSol / uiAmount` где `uiAmount` = `tokenAmount.uiAmount` из `getParsedTokenAccountsByOwner` (human-readable).
+
 ### /pay → 404 (исправлено)
-**Причина:** `middleware.ts` редиректил `/pay` → `/en/pay`, но `app/[locale]/pay/page.tsx` не существует.
-**Фикс:** добавлено исключение `if (pathname.startsWith('/pay')) return;` в middleware.
+`middleware.ts` редиректил `/pay` → `/en/pay` но страница не существовала. Добавлено исключение.
 
 ### Dashboard Dockerfile (исправлено)
-**Причина:** `docker-compose.yml` использует `context: services/dashboard`, но Dockerfile содержал пути вида `COPY services/dashboard/pages` (root-context пути).
-**Фикс:** переписан на `COPY . .`, добавлен `.dockerignore`, добавлены `next`/`react`/`react-dom` в package.json.
+`docker-compose.yml` использует `context: services/dashboard` → Dockerfile переписан на `COPY . .`.
 
 ### API proxy в landing (исправлено)
-**Причина:** `pay/page.tsx` использовал `NEXT_PUBLIC_API_URL || 'http://localhost:4000'` — из браузера недоступно.
-**Фикс:** создан `app/api/proxy/[...path]/route.ts`, pay page теперь использует `/api/proxy`.
+`pay/page.tsx` обращался к `localhost:4000` из браузера. Создан `app/api/proxy/[...path]/route.ts`.
 
-### Scanner circuit breaker (добавлено)
-После 3 ошибок 403/429/530 источник выключается на 10 минут. GeckoTerminal/DexScreener/Helius — основные (всегда). pump.fun/axiom — опциональные. GMGN — только при наличии `GMGN_API_KEY`.
+### GeckoTerminal 429 (исправлено)
+Autobuy больше не использует GeckoTerminal — scanner и autobuy делят IP, оба вызывали 429. Autobuy переключён на DexScreener.
 
 ### Новые тарифы (изменено)
-Было: `trial_1d = 0.1 SOL`, `monthly = 1.0 SOL`.
-Стало: `trial_1d = 0.05 SOL`, `trial_3d = 0.1 SOL`, `monthly = 1.0 SOL`.
-Планируется: `autobuy_pro = 5.0 SOL` — авто-покупка как отдельная функция.
+`trial_1d = 0.05 SOL`, `trial_3d = 0.1 SOL` (было: `trial_1d = 0.1 SOL`).
 
-### Оплата 403 (исправлено — июнь 2026)
-**Причина:** `SOLANA_RPC=https://api.mainnet-beta.solana.com` — публичный RPC блокирует VPS/браузер.
-**Фикс:**
-1. В `.env`: `SOLANA_RPC=https://mainnet.helius-rpc.com/?api-key=...`
-2. В `docker-compose.yml`: `build.args.NEXT_PUBLIC_SOLANA_RPC` для landing service
-3. В `services/landing/Dockerfile`: добавлены `ARG NEXT_PUBLIC_SOLANA_RPC` + `ENV NEXT_PUBLIC_SOLANA_RPC=$NEXT_PUBLIC_SOLANA_RPC`
-4. Rebuild landing: URL запекается в статических чанках Next.js на этапе сборки
+### STOP_LOSS_UNSELLABLE / TIME_LIMIT_UNSELLABLE (исправлено)
+Jupiter не продаёт pump.fun/pumpswap/fluxbeam/meteoradbc. Добавлен PumpPortal fallback в `claimAndSell()`.
 
-### STOP_LOSS_UNSELLABLE / TIME_LIMIT_UNSELLABLE (исправлено — июнь 2026)
-**Причина:** Jupiter не может продавать pump.fun/pumpswap/fluxbeam/meteoradbc токены — нет маршрута.
-Бот пытался 3 раза → сдавался → позиция теряется (активная но с 0 sold).
-**Фикс:** PumpPortal Local TX API как fallback в `claimAndSell()`:
-```typescript
-// В scheduler.ts после провала Jupiter:
-const ppResult = await sellViaPumpPortal(mint, sellPct, keypair, connection);
-```
-PumpPortal с `pool:"auto"` находит маршрут для любого DEX автоматически.
-**Важно:** PumpPortal Local TX использует наш основной кошелёк (EL4m...) — отдельного фондирования не нужно.
+### BXUSDT — мёртвая позиция
+Fluxbeam не поддерживается ни Jupiter ни PumpPortal. Полная потеря 0.02 SOL. Fluxbeam токены теперь исключены из стратегии.
 
-### GMGN API (не работает с VPS)
-GMGN защищён Cloudflare и блокирует VPS IP. Нет обходного пути без браузера/cookies.
-API ключ `gmgn_78449f8f01b1775fdd1a0d149a91c406` с режимом "Trading Disabled" — сканирование тоже недоступно.
-Коллектор включён в сборку, но всегда получает Cloudflare challenge (HTML вместо JSON).
-**Решение для фиксаа:** Residential proxy (BrightData/Smartproxy ~$15/мес) или Puppeteer headless Chrome на VPS.
+### GMGN API — недоступен с VPS
+Cloudflare блокирует VPS IP. Нет обходного пути без браузера/cookies. Нужен residential proxy ($15/мес).
 
-### Автобай два трека (добавлено — июнь 2026)
-**Jupiter track:** Raydium/Orca/Meteora, $20k+ лик, 30+ мин, позиция 0.02 SOL
-**PumpPortal track:** pumpfun/pumpswap/meteoradbc/fluxbeam, $3k+ лик, 20+ мин, позиция 0.02 SOL
-Метка задания: `auto:new_high_score:score80:pumpportal` — шедулер видит суффикс и использует PumpPortal для покупки.
-
-### processAutoSignals ОТКЛЮЧЁН (июнь 2026)
-**Причина:** Score-80 pump.fun токены через `processAutoSignals()` давали 100% rate потерь.
-Все позиции по этой стратегии закончились с total_sold_sol=0 (STOP_LOSS_UNSELLABLE, TIME_LIMIT_UNSELLABLE, silent fail).
-Jupiter не может продавать pump.fun токены, PumpPortal иногда тоже.
-**Фикс:** `processAutoSignals()` закомментирован в `startAutobuyScheduler()`. Только `processRaydiumOpportunities()` активен.
-**НЕ ВКЛЮЧАТЬ** пока не будет надёжного механизма продажи pump.fun токенов.
-
-### isJupiterOnly флаг в claimAndSell (июнь 2026)
-**Причина:** Raydium токены при TIME_LIMIT_EXPIRED/STOP_LOSS падали в PumpPortal fallback → транзакция проходила но возвращала 0 SOL (неправильный DEX).
-**Фикс:** `claimAndSell()` принимает `isJupiterOnly = !label.includes(':pumpportal')`. Raydium токены (auto:raydium_scan:*) имеют `isJupiterOnly=true` → PumpPortal fallback заблокирован.
-
-### Raydium Scanner параметры (июнь 2026)
-Лучшая стратегия: покупать fresh токены ДО памп.
-- Для токенов < 6h: min 1h price change = 1%, max = 30%
-- Для токенов ≥ 6h: min 1h price change = 5%, max = 150%
-- Vol/liq ratio >= 15% (не застойный пул)
-- Vol1h >= 8% от Vol24h (ускорение торговли)
-- Max лик $300k (не large-cap, быстро двигается)
-- Max возраст пары 48h
-
-### Trading параметры (июнь 2026 — текущие)
-- STOP_LOSS: 8% (было 12-15%)
-- TRAIL_PCT: 15% (было 20%)
-- TIME_LIMIT_SECONDS: 1800 (30min — без изменений)
-- TIME_LIMIT_ACTIVITY_PCT: 3% (было 0.5% — слишком часто сбрасывал таймер)
-- AUTOSELL_SLIPPAGE_BPS: 500 (было 150)
-- AUTOSELL_SLIPPAGE_RETRY_BPS: 1000
-
-### BXUSDT (CXkZuuconEnzL56dVhXW66Qks9DrrunyACUQYFN9YRqo) — мёртвая позиция
-Бот купил 0.02 SOL на fluxbeam. Jupiter не мог продать → STOP_LOSS_UNSELLABLE.
-PumpPortal тоже вернул "Bad Request" — fluxbeam не поддерживается PumpPortal Local TX.
-DexScreener: $1077 ликвидности но Jupiter quote = 0.000004 SOL (price impact 99.99%).
-**Вывод:** невозможно восстановить. Полная потеря 0.02 SOL.
-
-### Env переменные добавлены
-```
-SOLANA_RPC=https://mainnet.helius-rpc.com/?api-key=39e37111-42e1-4e10-a5cd-001a5771cbfc
-NEXT_PUBLIC_SOLANA_RPC=https://mainnet.helius-rpc.com/?api-key=39e37111-42e1-4e10-a5cd-001a5771cbfc
-PUMP_PORTAL_ENABLED=true
-PUMP_MIN_LIQUIDITY_USD=3000
-PUMP_MIN_TOKEN_AGE_SEC=1200
-```
-
-### Sprint 14 — Trade Journal, RiskPassport, TokenScore, HonestLauncher, Birdeye (июнь 2026)
-
-**Trade Journal** (`GET /journal`, `GET /journal/export`, `/journal` в боте):
-- Берёт данные из `autobuy_jobs + autosell_stages` — без новых таблиц
-- Показывает P&L на сделку, ROI%, стадию продажи, причину выхода
-- CSV экспорт через `GET /journal/export`
-- `/riskpassport` — личный профиль: DISCIPLINED/LEARNING/HIGH_RISK, разбивка по тирам T1/T2/T3
-
-**TokenScore** (`GET /tokenscore/:mint`, `/tokenscore <mint>` в боте):
-- Скор 0-100: rug safety (40) + liquidity (25) + community (20) + transparency (15)
-- Метки: SAFE (85+) / MODERATE (70+) / RISKY (50+) / DANGEROUS (<50)
-- Источники: `rug_scores` + `tokens` + `token_metrics` — без внешних API
-
-**HonestLauncher** (`/launch` в боте):
-- Команда информирует о принципах честного запуска + ссылка на Dashboard
-- Принципы: бюджет = только ликвидность, без накрутки volume, без insider allocation
-- Управление через `/mycoins` и `/exitcoin`
-
-**Birdeye holder check** (`services/autobuy/src/auto-signal.ts`):
-- `checkHolderMomentum(mint)` — проверяет `holder` из Birdeye API
-- Пропускает токены с <50 holders (конфигурируется через `BIRDEYE_MIN_HOLDERS`)
-- Fail-open: если `BIRDEYE_API_KEY` не задан или API недоступен → не блокирует
-
-**Landing новые страницы:**
-- `/trade-journal` — описание журнала сделок
-- `/token-score` — описание TokenScore
-- `/launcher` — описание Honest Launcher
-- Главная: секция "NEW IN JUNE 2026" с карточками-ссылками на все три страницы
+### Оплата 403 (исправлено)
+Публичный RPC блокирует VPS. `SOLANA_RPC=https://mainnet.helius-rpc.com/?api-key=...`. `NEXT_PUBLIC_SOLANA_RPC` запекается при Docker build через ARG.
 
 ---
 
@@ -287,13 +327,11 @@ PUMP_MIN_TOKEN_AGE_SEC=1200
 | `TREASURY_WALLET_ADDRESS` | Кошелёк куда идут SOL-платежи |
 | `WALLET_PRIVATE_KEY` | Приватный ключ для autobuy (JSON array) |
 | `FREE_WALLETS` | Comma-separated список бесплатных кошельков (whitelist) |
-| `SITE_URL` | `https://gadai.shop` — URL сайта для ссылок в боте |
-| `SOLANA_RPC` | Платный RPC в prod (QuickNode/Alchemy/Helius) |
-| `BACKEND_API_URL` | `http://api:4000` — для proxy в landing (docker service name) |
-| `GMGN_API_KEY` | Опционально — без него GMGN коллектор отключён |
-| `NEXT_PUBLIC_TREASURY_WALLET` | Адрес treasury для фронта (fallback если API недоступен) |
-| `BIRDEYE_API_KEY` | Опционально — holder check перед покупкой (Birdeye public API) |
-| `BIRDEYE_MIN_HOLDERS` | Минимум holders перед покупкой (default: 50, fail-open если API недоступен) |
+| `SITE_URL` | `https://gadai.shop` |
+| `SOLANA_RPC` | Платный RPC в prod (Helius) |
+| `BACKEND_API_URL` | `http://api:4000` — для proxy в landing |
+| `BIRDEYE_API_KEY` | Holder check + trending source |
+| `ANTHROPIC_API_KEY` | Нужен для trend-engine AI генерации идей |
 
 ---
 
@@ -303,15 +341,17 @@ PUMP_MIN_TOKEN_AGE_SEC=1200
 # Запуск всего стека
 docker compose up -d
 
-# Только базовые сервисы (БД + Redis)
+# Только базовые сервисы
 docker compose up -d postgres redis
 
-# Запуск API в dev-режиме
+# Dev режим
 npm --workspace services/api run dev
-
-# Запуск бота
 npm --workspace services/telegram run dev
 
-# Все тесты
-npm test
+# Проверка типов
+npx tsc -p services/autobuy/tsconfig.json --noEmit
+npx tsc -p services/telegram/tsconfig.json --noEmit
+
+# Анализ pump.fun токенов (запускать на VPS):
+npx ts-node -p tsconfig.launch.json scripts/analyze-pumpfun-winners.ts
 ```
