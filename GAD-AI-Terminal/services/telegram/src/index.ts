@@ -2,6 +2,10 @@ import dotenv from 'dotenv';
 import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
 import { runTrendCycle, getTopClusters, getClusterById, getIdeasForCluster, generateCoinIdeas, saveCoinIdea, updateIdeaStatus } from '@lib/trend-engine';
+import { getMacroState, formatMacroReport } from '../../futures/src/macro-monitor';
+import { getSignal, formatSignalReport } from '../../futures/src/entry-strategy';
+import { getCapitalState, formatCapitalReport } from '../../futures/src/capital-manager';
+import { getOpenPositions, getRecentTrades, closePosition, LIVE_MODE } from '../../futures/src/drift-trader';
 
 dotenv.config();
 
@@ -852,6 +856,157 @@ setInterval(async () => {
     trendWorkerRunning = false;
   }
 }, TREND_INTERVAL_MS);
+
+// ─── Futures Commands ─────────────────────────────────────────────────────────
+
+// /macro — macro market status
+bot.onText(/^\/macro(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  const chatId = msg.chat.id;
+  await send(chatId, '🔄 Fetching macro data...');
+  try {
+    const macro = await getMacroState(true);
+    await send(chatId, formatMacroReport(macro));
+  } catch (e: any) {
+    await send(chatId, `❌ Macro error: ${e.message}`);
+  }
+}));
+
+// /signal — technical entry signal for SOL-PERP
+bot.onText(/^\/signal(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  const chatId = msg.chat.id;
+  await send(chatId, '📊 Analyzing SOL 15m chart...');
+  try {
+    const [signal, macro] = await Promise.all([getSignal(), getMacroState()]);
+    const combined =
+      formatSignalReport(signal) + '\n\n' +
+      (macro.ok ? '✅ Macro: FAVORABLE' : '⛔ Macro: CAUTION (score ' + macro.score + '/100)');
+    await send(chatId, combined);
+  } catch (e: any) {
+    await send(chatId, `❌ Signal error: ${e.message}`);
+  }
+}));
+
+// /position — show open futures position
+bot.onText(/^\/position(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  const chatId = msg.chat.id;
+  try {
+    const positions = await getOpenPositions();
+    if (!positions.length) {
+      await send(chatId, '📭 No open futures positions.\n\nUse /signal to check for entry.');
+      return;
+    }
+    const lines: string[] = [`📌 *Open Positions* (${LIVE_MODE === 'live' ? '🔴 LIVE' : '📝 PAPER'})\n`];
+    for (const p of positions) {
+      const age = Math.round((Date.now() - p.openedAt.getTime()) / 60000);
+      lines.push(
+        `${p.side === 'LONG' ? '🟢' : '🔴'} *${p.side}* SOL-PERP\n` +
+        `Entry: $${p.entryPrice.toFixed(3)}  Size: $${p.sizeUsdc.toFixed(2)} x${p.leverage}\n` +
+        `Notional: $${p.notionalUsdc.toFixed(2)}  |  Opened: ${age}m ago\n` +
+        `ID: \`${p.tradeId.slice(0, 20)}\``
+      );
+    }
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ Error: ${e.message}`);
+  }
+}));
+
+// /ftrades — recent trade history
+bot.onText(/^\/ftrades(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  const chatId = msg.chat.id;
+  try {
+    const trades = await getRecentTrades(10);
+    if (!trades.length) {
+      await send(chatId, '📭 No closed trades yet.');
+      return;
+    }
+    let wins = 0, losses = 0, totalPnl = 0;
+    const lines: string[] = [`📋 *Recent Futures Trades*\n`];
+    for (const t of trades.slice(0, 8)) {
+      const pnl     = parseFloat(t.pnl_usdc || '0');
+      const pnlPct  = parseFloat(t.pnl_pct  || '0');
+      const emoji   = pnl >= 0 ? '🟢' : '🔴';
+      const reason  = t.close_reason || '?';
+      totalPnl += pnl;
+      if (pnl >= 0) wins++; else losses++;
+      lines.push(
+        `${emoji} ${t.side} ${reason}  ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)`
+      );
+    }
+    const wr = trades.length ? Math.round(wins / trades.length * 100) : 0;
+    lines.push(`\nTotal P&L: ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)} | Win Rate: ${wr}% (${wins}W/${losses}L)`);
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ Error: ${e.message}`);
+  }
+}));
+
+// /capital — capital management status
+bot.onText(/^\/capital(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  const chatId = msg.chat.id;
+  try {
+    const capital = await getCapitalState();
+    await send(chatId, formatCapitalReport(capital));
+  } catch (e: any) {
+    await send(chatId, `❌ Error: ${e.message}`);
+  }
+}));
+
+// /fclose <tradeId> — manually close a position (admin only)
+bot.onText(/^\/fclose (@\w+)? ?(.+)?$/, (msg, match) => {
+  if (String(msg.chat.id) !== ADMIN_ID) return;
+  guard(msg.chat.id, async () => {
+    const chatId  = msg.chat.id;
+    const tradeId = (match?.[2] || '').trim();
+    if (!tradeId) { await send(chatId, 'Usage: /fclose <tradeId>'); return; }
+    try {
+      // Get current SOL price
+      const priceRes = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 3_000 });
+      const exitPrice = parseFloat(priceRes.data.price);
+      const pnl = await closePosition(tradeId, exitPrice, 'MANUAL');
+      await send(chatId, `✅ Position closed manually\nExit: $${exitPrice.toFixed(3)}\nP&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)}`);
+    } catch (e: any) {
+      await send(chatId, `❌ Close error: ${e.message}`);
+    }
+  });
+});
+
+// /futures — overview panel
+bot.onText(/^\/futures(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  const chatId = msg.chat.id;
+  await send(chatId, '🔄 Loading futures dashboard...');
+  try {
+    const [macro, signal, capital, openPos] = await Promise.all([
+      getMacroState(),
+      getSignal(),
+      getCapitalState(),
+      getOpenPositions(),
+    ]);
+    const modeStr = LIVE_MODE === 'live' ? '🔴 LIVE (Drift)' : '📝 PAPER';
+    const lines = [
+      `⚡ *FUTURES DASHBOARD* ${modeStr}`,
+      ``,
+      `*MACRO* ${macro.ok ? '✅' : '⛔'} Score: ${macro.score}/100`,
+      `BTC ${macro.btcChange1h >= 0 ? '+' : ''}${macro.btcChange1h.toFixed(2)}%/1h  F&G: ${macro.fearGreedIndex}`,
+      ``,
+      `*SIGNAL* ${signal.signal}  Strength: ${signal.strength}/100`,
+      `SOL $${signal.price.toFixed(2)}  RSI: ${signal.rsi14.toFixed(1)}`,
+      `EMA21: $${signal.ema21.toFixed(2)}  EMA50: $${signal.ema50.toFixed(2)}`,
+      ``,
+      `*CAPITAL*`,
+      `Total: $${capital.totalUsdc.toFixed(2)}  Avail: $${capital.availableUsdc.toFixed(2)}`,
+      `P&L today: ${capital.dailyPnlUsdc >= 0 ? '+' : ''}$${capital.dailyPnlUsdc.toFixed(2)}`,
+      ``,
+      `*POSITIONS* ${openPos.length ? openPos.length + ' open' : 'none'}`,
+      openPos.length ? openPos.map(p => `  ${p.side} entry=$${p.entryPrice.toFixed(2)}`).join('\n') : '  No open positions',
+      ``,
+      `Commands: /macro /signal /position /capital /ftrades`,
+    ];
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ Error: ${e.message}`);
+  }
+}));
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 bot.on('polling_error', (err) => log('error', 'polling:', err.message));

@@ -139,5 +139,60 @@ services:
         condition: service_started
       postgres:
         condition: service_healthy
+  auth:
+    build:
+      context: services/auth
+      dockerfile: Dockerfile
+    container_name: gad-ai-auth
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-gad}:${POSTGRES_PASSWORD:-gadpass}@postgres:5432/${POSTGRES_DB:-gad_ai}
+      PORT: "4001"
+    ports:
+      - "4001:4001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+  payments:
+    build:
+      context: services/payments
+      dockerfile: Dockerfile
+    container_name: gad-ai-payments
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-gad}:${POSTGRES_PASSWORD:-gadpass}@postgres:5432/${POSTGRES_DB:-gad_ai}
+      PORT: "4002"
+    ports:
+      - "4002:4002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+  futures:
+    build:
+      context: .
+      dockerfile: services/futures/Dockerfile
+    container_name: gad-ai-futures
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      FUTURES_ENABLED: "true"
+      FUTURES_LIVE_MODE: "false"
+      FUTURES_SIGNAL_INTERVAL_MS: "300000"
+      FUTURES_MIN_MACRO_SCORE: "45"
+      FUTURES_MIN_SIGNAL_STR: "55"
+      FUTURES_TP_PCT: "0.04"
+      FUTURES_SL_PCT: "0.02"
+      FUTURES_TRAIL_PCT: "0.015"
+      FUTURES_BE_TRIGGER: "0.03"
+      FUTURES_DAILY_STOP_PCT: "0.06"
+      FUTURES_MAX_TRADES_DAY: "6"
+      FUTURES_RISK_PCT: "0.02"
+    depends_on:
+      postgres:
+        condition: service_healthy
 volumes:
   postgres-data:
