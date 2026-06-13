@@ -18,6 +18,7 @@ import { getSignal } from './entry-strategy';
 import { getCapitalState, updateCapitalState, calcPositionSize } from './capital-manager';
 import { openPosition, LIVE_MODE, getOpenPositions } from './drift-trader';
 import { startRiskManager } from './risk-manager';
+import { startApi } from './api';
 import { query } from '@lib/db';
 
 const SIGNAL_INTERVAL_MS = parseInt(process.env.FUTURES_SIGNAL_INTERVAL_MS || '300000', 10); // 5 min
@@ -133,6 +134,9 @@ async function main(): Promise<void> {
     console.log('[futures] FUTURES_ENABLED=false — service idle');
     return;
   }
+
+  // Start HTTP API (for telegram bot + dashboard)
+  startApi();
 
   // Start fast risk manager (TP/SL/Trail)
   startRiskManager();

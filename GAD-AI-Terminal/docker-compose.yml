@@ -70,6 +70,7 @@ services:
     environment:
       POSTGRES_HOST: postgres
       REDIS_HOST: redis
+      FUTURES_API_URL: "http://futures:4003"
     depends_on:
       api:
         condition: service_started
@@ -191,6 +192,9 @@ services:
       FUTURES_DAILY_STOP_PCT: "0.06"
       FUTURES_MAX_TRADES_DAY: "6"
       FUTURES_RISK_PCT: "0.02"
+      FUTURES_API_PORT: "4003"
+    ports:
+      - "4003:4003"
     depends_on:
       postgres:
         condition: service_healthy

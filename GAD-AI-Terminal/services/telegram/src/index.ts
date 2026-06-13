@@ -2,10 +2,7 @@ import dotenv from 'dotenv';
 import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
 import { runTrendCycle, getTopClusters, getClusterById, getIdeasForCluster, generateCoinIdeas, saveCoinIdea, updateIdeaStatus } from '@lib/trend-engine';
-import { getMacroState, formatMacroReport } from '../../futures/src/macro-monitor';
-import { getSignal, formatSignalReport } from '../../futures/src/entry-strategy';
-import { getCapitalState, formatCapitalReport } from '../../futures/src/capital-manager';
-import { getOpenPositions, getRecentTrades, closePosition, LIVE_MODE } from '../../futures/src/drift-trader';
+const FUTURES_API = process.env.FUTURES_API_URL || 'http://futures:4003';
 
 dotenv.config();
 
@@ -857,17 +854,22 @@ setInterval(async () => {
   }
 }, TREND_INTERVAL_MS);
 
-// ─── Futures Commands ─────────────────────────────────────────────────────────
+// ─── Futures Commands (via HTTP to futures service on port 4003) ──────────────
+
+async function futuresApi<T = any>(path: string): Promise<T> {
+  const res = await axios.get<T>(`${FUTURES_API}${path}`, { timeout: 10_000 });
+  return res.data;
+}
 
 // /macro — macro market status
 bot.onText(/^\/macro(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
   const chatId = msg.chat.id;
   await send(chatId, '🔄 Fetching macro data...');
   try {
-    const macro = await getMacroState(true);
-    await send(chatId, formatMacroReport(macro));
+    const data = await futuresApi<any>('/macro');
+    await send(chatId, data.formatted);
   } catch (e: any) {
-    await send(chatId, `❌ Macro error: ${e.message}`);
+    await send(chatId, `❌ Macro error: ${e.message}\n(futures service may be starting)`);
   }
 }));
 
@@ -876,33 +878,36 @@ bot.onText(/^\/signal(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
   const chatId = msg.chat.id;
   await send(chatId, '📊 Analyzing SOL 15m chart...');
   try {
-    const [signal, macro] = await Promise.all([getSignal(), getMacroState()]);
+    const [signalData, macroData] = await Promise.all([
+      futuresApi<any>('/signal'),
+      futuresApi<any>('/macro'),
+    ]);
     const combined =
-      formatSignalReport(signal) + '\n\n' +
-      (macro.ok ? '✅ Macro: FAVORABLE' : '⛔ Macro: CAUTION (score ' + macro.score + '/100)');
+      signalData.formatted + '\n\n' +
+      (macroData.ok ? '✅ Macro: FAVORABLE' : '⛔ Macro: CAUTION (score ' + macroData.score + '/100)');
     await send(chatId, combined);
   } catch (e: any) {
     await send(chatId, `❌ Signal error: ${e.message}`);
   }
 }));
 
-// /position — show open futures position
+// /position — show open futures positions
 bot.onText(/^\/position(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
   const chatId = msg.chat.id;
   try {
-    const positions = await getOpenPositions();
+    const { positions, mode } = await futuresApi<any>('/positions');
     if (!positions.length) {
       await send(chatId, '📭 No open futures positions.\n\nUse /signal to check for entry.');
       return;
     }
-    const lines: string[] = [`📌 *Open Positions* (${LIVE_MODE === 'live' ? '🔴 LIVE' : '📝 PAPER'})\n`];
+    const modeStr = mode === 'live' ? '🔴 LIVE' : '📝 PAPER';
+    const lines: string[] = [`📌 *Open Positions* (${modeStr})\n`];
     for (const p of positions) {
-      const age = Math.round((Date.now() - p.openedAt.getTime()) / 60000);
+      const age = Math.round((Date.now() - new Date(p.openedAt).getTime()) / 60000);
       lines.push(
         `${p.side === 'LONG' ? '🟢' : '🔴'} *${p.side}* SOL-PERP\n` +
-        `Entry: $${p.entryPrice.toFixed(3)}  Size: $${p.sizeUsdc.toFixed(2)} x${p.leverage}\n` +
-        `Notional: $${p.notionalUsdc.toFixed(2)}  |  Opened: ${age}m ago\n` +
-        `ID: \`${p.tradeId.slice(0, 20)}\``
+        `Entry: $${Number(p.entryPrice).toFixed(3)}  Size: $${Number(p.sizeUsdc).toFixed(2)} x${p.leverage}\n` +
+        `Opened: ${age}m ago  |  ID: \`${p.tradeId.slice(0, 16)}\``
       );
     }
     await send(chatId, lines.join('\n'));
@@ -915,7 +920,7 @@ bot.onText(/^\/position(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
 bot.onText(/^\/ftrades(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
   const chatId = msg.chat.id;
   try {
-    const trades = await getRecentTrades(10);
+    const { trades } = await futuresApi<any>('/trades?limit=10');
     if (!trades.length) {
       await send(chatId, '📭 No closed trades yet.');
       return;
@@ -923,18 +928,15 @@ bot.onText(/^\/ftrades(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
     let wins = 0, losses = 0, totalPnl = 0;
     const lines: string[] = [`📋 *Recent Futures Trades*\n`];
     for (const t of trades.slice(0, 8)) {
-      const pnl     = parseFloat(t.pnl_usdc || '0');
-      const pnlPct  = parseFloat(t.pnl_pct  || '0');
-      const emoji   = pnl >= 0 ? '🟢' : '🔴';
-      const reason  = t.close_reason || '?';
+      const pnl    = parseFloat(t.pnl_usdc || '0');
+      const pnlPct = parseFloat(t.pnl_pct  || '0');
+      const emoji  = pnl >= 0 ? '🟢' : '🔴';
       totalPnl += pnl;
       if (pnl >= 0) wins++; else losses++;
-      lines.push(
-        `${emoji} ${t.side} ${reason}  ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)`
-      );
+      lines.push(`${emoji} ${t.side} ${t.close_reason}  ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(3)} (${pnlPct.toFixed(2)}%)`);
     }
     const wr = trades.length ? Math.round(wins / trades.length * 100) : 0;
-    lines.push(`\nTotal P&L: ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)} | Win Rate: ${wr}% (${wins}W/${losses}L)`);
+    lines.push(`\nTotal P&L: ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)} | WR: ${wr}% (${wins}W/${losses}L)`);
     await send(chatId, lines.join('\n'));
   } catch (e: any) {
     await send(chatId, `❌ Error: ${e.message}`);
@@ -945,26 +947,24 @@ bot.onText(/^\/ftrades(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
 bot.onText(/^\/capital(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
   const chatId = msg.chat.id;
   try {
-    const capital = await getCapitalState();
-    await send(chatId, formatCapitalReport(capital));
+    const data = await futuresApi<any>('/capital');
+    await send(chatId, data.formatted);
   } catch (e: any) {
     await send(chatId, `❌ Error: ${e.message}`);
   }
 }));
 
 // /fclose <tradeId> — manually close a position (admin only)
-bot.onText(/^\/fclose (@\w+)? ?(.+)?$/, (msg, match) => {
+bot.onText(/^\/fclose(?:\s+(.+))?$/, (msg, match) => {
   if (String(msg.chat.id) !== ADMIN_ID) return;
   guard(msg.chat.id, async () => {
     const chatId  = msg.chat.id;
-    const tradeId = (match?.[2] || '').trim();
+    const tradeId = (match?.[1] || '').trim();
     if (!tradeId) { await send(chatId, 'Usage: /fclose <tradeId>'); return; }
     try {
-      // Get current SOL price
-      const priceRes = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 3_000 });
-      const exitPrice = parseFloat(priceRes.data.price);
-      const pnl = await closePosition(tradeId, exitPrice, 'MANUAL');
-      await send(chatId, `✅ Position closed manually\nExit: $${exitPrice.toFixed(3)}\nP&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)}`);
+      const res = await axios.post(`${FUTURES_API}/close`, { tradeId }, { timeout: 10_000 });
+      const { pnl, exitPrice } = res.data;
+      await send(chatId, `✅ Position closed manually\nExit: $${Number(exitPrice).toFixed(3)}\nP&L: ${pnl >= 0 ? '+' : ''}$${Number(pnl).toFixed(4)}`);
     } catch (e: any) {
       await send(chatId, `❌ Close error: ${e.message}`);
     }
@@ -976,35 +976,30 @@ bot.onText(/^\/futures(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
   const chatId = msg.chat.id;
   await send(chatId, '🔄 Loading futures dashboard...');
   try {
-    const [macro, signal, capital, openPos] = await Promise.all([
-      getMacroState(),
-      getSignal(),
-      getCapitalState(),
-      getOpenPositions(),
-    ]);
-    const modeStr = LIVE_MODE === 'live' ? '🔴 LIVE (Drift)' : '📝 PAPER';
+    const { macro, signal, capital, positions, mode } = await futuresApi<any>('/dashboard');
+    const modeStr = mode === 'live' ? '🔴 LIVE (Drift)' : '📝 PAPER';
     const lines = [
       `⚡ *FUTURES DASHBOARD* ${modeStr}`,
       ``,
       `*MACRO* ${macro.ok ? '✅' : '⛔'} Score: ${macro.score}/100`,
-      `BTC ${macro.btcChange1h >= 0 ? '+' : ''}${macro.btcChange1h.toFixed(2)}%/1h  F&G: ${macro.fearGreedIndex}`,
+      `BTC $${macro.btcPrice?.toFixed(0)}  ${macro.btcChange1h >= 0 ? '+' : ''}${macro.btcChange1h?.toFixed(2)}%/1h  F&G: ${macro.fearGreedIndex}`,
       ``,
       `*SIGNAL* ${signal.signal}  Strength: ${signal.strength}/100`,
-      `SOL $${signal.price.toFixed(2)}  RSI: ${signal.rsi14.toFixed(1)}`,
-      `EMA21: $${signal.ema21.toFixed(2)}  EMA50: $${signal.ema50.toFixed(2)}`,
+      `SOL $${Number(signal.price).toFixed(2)}  RSI: ${Number(signal.rsi14).toFixed(1)}`,
+      `EMA21: $${Number(signal.ema21).toFixed(2)}  EMA50: $${Number(signal.ema50).toFixed(2)}`,
       ``,
       `*CAPITAL*`,
-      `Total: $${capital.totalUsdc.toFixed(2)}  Avail: $${capital.availableUsdc.toFixed(2)}`,
-      `P&L today: ${capital.dailyPnlUsdc >= 0 ? '+' : ''}$${capital.dailyPnlUsdc.toFixed(2)}`,
+      `Total: $${Number(capital.totalUsdc).toFixed(2)}  Avail: $${Number(capital.availableUsdc).toFixed(2)}`,
+      `P&L today: ${capital.dailyPnlUsdc >= 0 ? '+' : ''}$${Number(capital.dailyPnlUsdc).toFixed(2)}`,
       ``,
-      `*POSITIONS* ${openPos.length ? openPos.length + ' open' : 'none'}`,
-      openPos.length ? openPos.map(p => `  ${p.side} entry=$${p.entryPrice.toFixed(2)}`).join('\n') : '  No open positions',
+      `*POSITIONS* ${positions.length ? positions.length + ' open' : 'none'}`,
+      positions.length ? positions.map((p: any) => `  ${p.side} @$${Number(p.entry_price).toFixed(2)}`).join('\n') : '  No open positions',
       ``,
       `Commands: /macro /signal /position /capital /ftrades`,
     ];
     await send(chatId, lines.join('\n'));
   } catch (e: any) {
-    await send(chatId, `❌ Error: ${e.message}`);
+    await send(chatId, `❌ Futures dashboard error: ${e.message}\nIs futures service running?`);
   }
 }));
 
