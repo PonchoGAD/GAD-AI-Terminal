@@ -28,7 +28,7 @@ const TRAIL_PCT = Number(process.env.TRAIL_PCT || '12') / 100;           // was 
 
 // Time limit: sell 95% if token shows no price activity for this many seconds
 const TIME_LIMIT_SECONDS      = Number(process.env.TIME_LIMIT_SECONDS      || '1200');  // was 1800 (30min) → 20min
-const TIME_LIMIT_ACTIVITY_PCT = Number(process.env.TIME_LIMIT_ACTIVITY_PCT || '3') / 100;
+const TIME_LIMIT_ACTIVITY_PCT = Number(process.env.TIME_LIMIT_ACTIVITY_PCT || '1') / 100;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -461,14 +461,21 @@ async function checkAndExecuteSells(walletAddress: string) {
       const totalElapsedSec = (Date.now() - new Date(refStage.bought_at).getTime()) / 1000;
       if (totalElapsedSec > MAX_HOLD_SECONDS) {
         const elapsedMin = Math.floor(totalElapsedSec / 60);
-        console.warn(
-          `[time-limit] 🔴 HARD CAP ${mint.slice(0,8)} — held ${elapsedMin}min (max ${MAX_HOLD_SECONDS / 60}min) — force sell`
-        );
-        const result = await claimAndSell(mint, refStage.autobuy_job_id, 95, 'TIME_LIMIT_EXPIRED', connection, keypair, !refStage.label?.includes(':pumpportal'));
-        if (result === 'success') {
-          console.info(`[time-limit] ✅ Hard cap sell EXECUTED for ${mint.slice(0,8)}`);
+        // If above entry — skip hard cap, position is profitable (just slow) — let it reach TP
+        if (refEntry > 0 && currentPriceSol > refEntry) {
+          console.info(
+            `[time-limit] ⏸️ HARD CAP ${mint.slice(0,8)} — above entry (+${((currentPriceSol / refEntry - 1) * 100).toFixed(1)}%) after ${elapsedMin}min — skipping, waiting for TP`
+          );
+        } else {
+          console.warn(
+            `[time-limit] 🔴 HARD CAP ${mint.slice(0,8)} — held ${elapsedMin}min (max ${MAX_HOLD_SECONDS / 60}min) — force sell`
+          );
+          const result = await claimAndSell(mint, refStage.autobuy_job_id, 95, 'TIME_LIMIT_EXPIRED', connection, keypair, !refStage.label?.includes(':pumpportal'));
+          if (result === 'success') {
+            console.info(`[time-limit] ✅ Hard cap sell EXECUTED for ${mint.slice(0,8)}`);
+          }
+          continue;
         }
-        continue;
       }
     }
 
@@ -595,29 +602,38 @@ async function checkAndExecuteSells(walletAddress: string) {
         const elapsedSec = (Date.now() - new Date(anchor).getTime()) / 1000;
         if (elapsedSec > refStage.time_limit_seconds) {
           const elapsedMin = Math.floor(elapsedSec / 60);
-          console.warn(
-            `[time-limit] ⏰ TIME_LIMIT_EXPIRED for ${mint.slice(0,8)} — ` +
-            `${elapsedMin}min of inactivity (limit: ${refStage.time_limit_seconds / 60}min) — selling 95%`
-          );
-          const result = await claimAndSell(mint, refStage.autobuy_job_id, 95, 'TIME_LIMIT_EXPIRED', connection, keypair, !refStage.label?.includes(':pumpportal'));
-          if (result === 'success') {
-            timeLimitFailCount.delete(mint);
-            console.info(`[time-limit] ✅ TIME_LIMIT_EXPIRED sell EXECUTED for ${mint.slice(0,8)}`);
+          // Above entry = profitable slow mover — reset timer, wait for TP instead of selling at a loss
+          if (refEntry > 0 && currentPriceSol > refEntry) {
+            await query(`UPDATE autobuy_jobs SET last_activity_at = now() WHERE id = $1`, [refStage.autobuy_job_id]);
+            console.info(
+              `[time-limit] ⏸️ ${mint.slice(0,8)} — above entry (+${((currentPriceSol / refEntry - 1) * 100).toFixed(1)}%) after ${elapsedMin}min — timer reset, waiting for TP`
+            );
           } else {
-            const fails = (timeLimitFailCount.get(mint) ?? 0) + 1;
-            timeLimitFailCount.set(mint, fails);
-            console.error(`[time-limit] ❌ TIME_LIMIT sell FAILED (${fails}/${MAX_TIME_LIMIT_FAILS}) for ${mint.slice(0,8)}`);
-            if (fails >= MAX_TIME_LIMIT_FAILS) {
-              await query(
-                `UPDATE autosell_stages SET status = 'failed', sell_reason = 'TIME_LIMIT_UNSELLABLE'
-                 WHERE autobuy_job_id = $1 AND status = 'pending'`,
-                [refStage.autobuy_job_id]
-              );
-              await query(`UPDATE autobuy_jobs SET active = false WHERE id = $1`, [refStage.autobuy_job_id]);
+            // Below entry and inactive — cut losses
+            console.warn(
+              `[time-limit] ⏰ TIME_LIMIT_EXPIRED for ${mint.slice(0,8)} — ` +
+              `${elapsedMin}min of inactivity (limit: ${refStage.time_limit_seconds / 60}min) — selling 95%`
+            );
+            const result = await claimAndSell(mint, refStage.autobuy_job_id, 95, 'TIME_LIMIT_EXPIRED', connection, keypair, !refStage.label?.includes(':pumpportal'));
+            if (result === 'success') {
               timeLimitFailCount.delete(mint);
+              console.info(`[time-limit] ✅ TIME_LIMIT_EXPIRED sell EXECUTED for ${mint.slice(0,8)}`);
+            } else {
+              const fails = (timeLimitFailCount.get(mint) ?? 0) + 1;
+              timeLimitFailCount.set(mint, fails);
+              console.error(`[time-limit] ❌ TIME_LIMIT sell FAILED (${fails}/${MAX_TIME_LIMIT_FAILS}) for ${mint.slice(0,8)}`);
+              if (fails >= MAX_TIME_LIMIT_FAILS) {
+                await query(
+                  `UPDATE autosell_stages SET status = 'failed', sell_reason = 'TIME_LIMIT_UNSELLABLE'
+                   WHERE autobuy_job_id = $1 AND status = 'pending'`,
+                  [refStage.autobuy_job_id]
+                );
+                await query(`UPDATE autobuy_jobs SET active = false WHERE id = $1`, [refStage.autobuy_job_id]);
+                timeLimitFailCount.delete(mint);
+              }
             }
+            continue;
           }
-          continue;
         } else if (elapsedSec > refStage.time_limit_seconds * 0.75) {
           // Warn at 75% of time limit
           const remainMin = Math.ceil((refStage.time_limit_seconds - elapsedSec) / 60);
