@@ -139,6 +139,13 @@ console.warn('[sell] ...')
 - [x] Trend-to-MemeCoin Engine: migration 011, libs/trend-engine, telegram /trends commands
 - [x] Landing: мультилокаль (en/ru), pricing, payment form, API proxy
 - [x] Docker Compose: все сервисы + postgres + redis + `restart: unless-stopped`
+- [x] **Futures Trading Module (июнь 2026):** migration 012, services/futures, port 4003
+  - MacroMonitor: BTC/Fear&Greed/SP500/CryptoPanic → composite score 0-100
+  - EntryStrategy: EMA21/EMA50/RSI14/Volume on Binance 15m candles
+  - DriftTrader: paper mode (default) + live Drift Protocol (FUTURES_LIVE_MODE=true, uses Phantom keypair)
+  - CapitalManager: 2% risk/trade, x2 leverage ($5-20), 6% daily stop
+  - RiskManager: 3s TP/SL/Trail poll, BE trigger at +3%
+  - Telegram: /futures /macro /signal /position /capital /ftrades /fclose
 
 ---
 
@@ -148,7 +155,9 @@ console.warn('[sell] ...')
 - [ ] **Metadata enrichment** — tokens.symbol/name остаются NULL
 - [ ] **ANTHROPIC_API_KEY** в VPS .env — нужен для trend-engine AI генерации идей
 - [ ] **Migration 011** применить на VPS: `docker compose exec -T postgres psql -U gad -d gad_ai < migrations/011_trend_engine.sql`
+- [ ] **Migration 012** применить на VPS (futures): `docker compose exec -T postgres psql -U gad -d gad_ai < migrations/012_futures.sql` ← уже применена!
 - [ ] **Health checks** для scanner, telegram, autobuy, whale-tracker
+- [ ] **Futures LIVE MODE:** отключён по умолчанию (FUTURES_LIVE_MODE=false → paper trading). Для real Drift Protocol включить через .env + депозит USDC на Drift аккаунт
 
 ### ВАЖНО
 - [ ] **Unit-тесты** для rug, gad-score, narrative, survival, dna, social, lifecycle, regime
