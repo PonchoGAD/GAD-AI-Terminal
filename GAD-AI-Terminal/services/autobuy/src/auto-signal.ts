@@ -505,29 +505,27 @@ async function fetchRaydiumPairs(): Promise<any[]> {
   // DIRECTLY targets Raydium pools only (no pump.fun) — sort by tx count = highest community engagement today.
   // This catches fresh tokens (1-48h) that already have active buyers before a bigger pump.
   // Sorted by h24_tx_count_desc means highest-activity tokens appear first across all ages.
+  // Single page only — the scanner service also calls GeckoTerminal, combined rate limit shared.
+  // 1 call per 120s from autobuy + 2 calls/min from scanner = ~2.5 req/min total (safe).
   let raydiumDexCount = 0;
-  for (let page = 1; page <= 2; page++) {
-    try {
-      const r = await axios.get(
-        `${GECKO_BASE}/networks/solana/dexes/raydium/pools?sort=h24_tx_count_desc&include=base_token,dex&page=${page}`,
-        { headers: GECKO_HEADERS, timeout: 8_000 }
-      );
-      const pools: any[] = r.data?.data ?? [];
-      for (const pool of pools) {
-        const pair = geckoPoolToPair(pool);
-        if (!pair) continue;
-        const mint = pair.baseToken?.address;
-        if (!mint || seen.has(mint)) continue;
-        seen.add(mint);
-        results.push(pair);
-        raydiumDexCount++;
-      }
-      await new Promise(r => setTimeout(r, 600));
-    } catch (e: any) {
-      const status = (e as any).response?.status ?? (e as any).code;
-      console.debug(`[raydium-scan] GeckoTerminal Raydium DEX page ${page}: ${status ?? (e as any).message?.slice(0, 30)}`);
-      break;
+  try {
+    const r = await axios.get(
+      `${GECKO_BASE}/networks/solana/dexes/raydium/pools?sort=h24_tx_count_desc&include=base_token,dex&page=1`,
+      { headers: GECKO_HEADERS, timeout: 8_000 }
+    );
+    const pools: any[] = r.data?.data ?? [];
+    for (const pool of pools) {
+      const pair = geckoPoolToPair(pool);
+      if (!pair) continue;
+      const mint = pair.baseToken?.address;
+      if (!mint || seen.has(mint)) continue;
+      seen.add(mint);
+      results.push(pair);
+      raydiumDexCount++;
     }
+  } catch (e: any) {
+    const status = (e as any).response?.status ?? (e as any).code;
+    console.debug(`[raydium-scan] GeckoTerminal Raydium DEX: ${status ?? (e as any).message?.slice(0, 30)}`);
   }
   if (raydiumDexCount > 0) console.debug(`[raydium-scan] GeckoTerminal Raydium DEX (tx-sorted): ${raydiumDexCount} pairs`);
 
@@ -558,39 +556,6 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     }
   } catch (e: any) {
     console.debug(`[raydium-scan] token-profiles error: ${(e as any).message?.slice(0, 40)}`);
-  }
-
-  // Source 2: GeckoTerminal trending pools pages 2-4.
-  // Page 1 is already consumed by the scanner service — we use pages 2-4 to avoid collision.
-  // trending_pools = sorted by vol/liq momentum score = high-signal actionable entries.
-  // geckoPoolToPair() filters to Raydium/Orca/Meteora/Lifinity only; skips pump.fun etc.
-  let geckoCount = 0;
-  for (let page = 2; page <= 4; page++) {
-    try {
-      const r = await axios.get(
-        `${GECKO_BASE}/networks/solana/trending_pools?page=${page}&include=base_token,dex`,
-        { headers: GECKO_HEADERS, timeout: 8_000 }
-      );
-      const pools: any[] = r.data?.data ?? [];
-      for (const pool of pools) {
-        const pair = geckoPoolToPair(pool);
-        if (!pair) continue;
-        const mint = pair.baseToken?.address;
-        if (!mint || seen.has(mint)) continue;
-        seen.add(mint);
-        results.push(pair);
-        geckoCount++;
-      }
-      // 400ms between pages to avoid burst rate limit with scanner service
-      await new Promise(r => setTimeout(r, 400));
-    } catch (e: any) {
-      const status = (e as any).response?.status ?? (e as any).code;
-      console.debug(`[raydium-scan] GeckoTerminal trending page ${page}: ${status ?? (e as any).message?.slice(0, 30)}`);
-      break;
-    }
-  }
-  if (geckoCount > 0) {
-    console.debug(`[raydium-scan] GeckoTerminal trending p2-4: ${geckoCount} Raydium/Orca pairs`);
   }
 
   // Source 2: DexScreener token-boosts endpoint — recently promoted Solana tokens.
@@ -681,8 +646,8 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     }
   }
 
-  const dxCount = results.length - geckoCount - raydiumDexCount;
-  console.debug(`[raydium-scan] total: ${results.length} unique candidates (${raydiumDexCount} raydium-dex + ${geckoCount} trending + ${dxCount} dx)`);
+  const dxCount = results.length - raydiumDexCount;
+  console.debug(`[raydium-scan] total: ${results.length} unique candidates (${raydiumDexCount} raydium-dex + ${dxCount} dx)`);
   return results;
 }
 
