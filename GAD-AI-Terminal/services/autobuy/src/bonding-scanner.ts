@@ -148,17 +148,13 @@ function loadPumpFunKeypair2(): Keypair | null {
 async function sendPumpTx(
   txBytes: Uint8Array, keypair: Keypair, connection: Connection, skipPreflight = true
 ): Promise<string> {
-  const { VersionedTransaction, Transaction } = await import('@solana/web3.js');
-  // Version byte >= 0x80 = versioned tx; < 0x80 = legacy tx
-  if (txBytes[0] >= 0x80) {
-    const tx = VersionedTransaction.deserialize(txBytes);
-    tx.sign([keypair]);
-    return connection.sendTransaction(tx, { skipPreflight, maxRetries: 5 });
-  } else {
-    const tx = Transaction.from(Buffer.from(txBytes));
-    tx.partialSign(keypair);
-    return connection.sendRawTransaction(tx.serialize(), { skipPreflight });
-  }
+  const { VersionedTransaction } = await import('@solana/web3.js');
+  // VersionedTransaction.deserialize handles both versioned (v0) and legacy messages.
+  // Do NOT check txBytes[0] — byte 0 is the compact-u16 signature count (0x01), not the
+  // message version prefix. The version prefix lives at byte 65 (after 1-sig placeholder).
+  const tx = VersionedTransaction.deserialize(txBytes);
+  tx.sign([keypair]);
+  return connection.sendTransaction(tx, { skipPreflight, maxRetries: 5 });
 }
 
 async function buyOnBondingCurve(
