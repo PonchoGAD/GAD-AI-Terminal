@@ -383,37 +383,39 @@ export function getLiqTier(liqUsd: number): LiqTier {
   // Root cause of prior losses: 2x/5x staged targets were hit for a fraction of a second,
   // TX executed at 1x due to reversion. Now: lower target, full exit, faster execution.
   // Tight 5% stop = max loss 0.0025 SOL at 0.05 SOL position.
+  // Tier targets adapt to market regime via env var MARKET_REGIME (BULL/BEAR/SIDEWAYS).
+  // SIDEWAYS/BEAR: lower TP for higher hit rate. BULL: restore aggressive targets.
+  const regime = (process.env.MARKET_REGIME ?? 'SIDEWAYS').toUpperCase();
+  const isBull = regime === 'BULL' || regime === 'EUPHORIA';
+
   if (liqUsd <= 80000) return {
     tier: 1, label: 't1',
     timeLimitSec: 1200,    // 20 min — cut losses early on dead tokens
-    stopPct: 0.05,         // 5% stop loss (was 8%)
-    trailPct: 0.10,        // 10% trailing from peak
-    earlyTrailPct: 0.04,
+    stopPct: 0.05,         // 5% stop loss
+    trailPct: 0.08,
+    earlyTrailPct: 0.03,
     sellStages: [
-      { stage: 1, multiplier: 1.25, sellPct: 100 }, // sell ALL at +25% — one shot
+      { stage: 1, multiplier: isBull ? 1.25 : 1.15, sellPct: 100 },
     ],
   };
-  // T2 ($80k-$250k): sell 100% at +35%. More stable pools, easier to execute.
-  // Prior 1.05x/1.12x staging returned <entry due to reversion — new single target is achievable.
   if (liqUsd <= 250000) return {
     tier: 2, label: 't2',
     timeLimitSec: 1800,    // 30 min
     stopPct: 0.05,
-    trailPct: 0.10,
-    earlyTrailPct: 0.04,
+    trailPct: 0.08,
+    earlyTrailPct: 0.03,
     sellStages: [
-      { stage: 1, multiplier: 1.35, sellPct: 100 }, // sell ALL at +35%
+      { stage: 1, multiplier: isBull ? 1.35 : 1.18, sellPct: 100 },
     ],
   };
-  // T3 ($250k-$300k): stable pools, target +45% — still single exit.
   return {
     tier: 3, label: 't3',
     timeLimitSec: 2400,    // 40 min
     stopPct: 0.05,
     trailPct: 0.10,
-    earlyTrailPct: 0.05,
+    earlyTrailPct: 0.04,
     sellStages: [
-      { stage: 1, multiplier: 1.45, sellPct: 100 }, // sell ALL at +45%
+      { stage: 1, multiplier: isBull ? 1.45 : 1.25, sellPct: 100 },
     ],
   };
 }
