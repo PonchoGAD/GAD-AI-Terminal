@@ -1,159 +1,211 @@
 /**
- * GAD AI Terminal — Twitter/X Auto-Poster
+ * GAD AI Terminal — Twitter/X Auto-Poster (OAuth 2.0)
  *
- * Posts token alerts, launch announcements, and daily stats to @gadaisol.
+ * Uses OAuth 2.0 Access Token + Refresh Token for posting.
+ * Auto-refreshes token when expired and saves new tokens back to .env on VPS.
  *
  * Required env vars:
- *   TWITTER_API_KEY, TWITTER_API_SECRET   — Consumer Key/Secret
- *   TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET — User Access Token/Secret
+ *   TWITTER_CLIENT_ID, TWITTER_CLIENT_SECRET
+ *   TWITTER_ACCESS_TOKEN, TWITTER_REFRESH_TOKEN
  *
  * Usage:
- *   npx ts-node -p tsconfig.launch.json scripts/twitter-post.ts launch <mint>
- *   npx ts-node -p tsconfig.launch.json scripts/twitter-post.ts alert <text>
- *   npx ts-node -p tsconfig.launch.json scripts/twitter-post.ts stats
+ *   npx ts-node -p tsconfig.launch.json scripts/twitter-post.ts test
+ *   npx ts-node -p tsconfig.launch.json scripts/twitter-post.ts gadai <mint>
+ *   npx ts-node -p tsconfig.launch.json scripts/twitter-post.ts launch <mint> <ticker> <name>
+ *   npx ts-node -p tsconfig.launch.json scripts/twitter-post.ts alert <ticker> <score> <liq> <mint>
+ *   npx ts-node -p tsconfig.launch.json scripts/twitter-post.ts custom "text"
  */
 
 import dotenv from 'dotenv';
-import crypto from 'crypto';
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 
-const API_KEY    = process.env.TWITTER_API_KEY    ?? '';
-const API_SECRET = process.env.TWITTER_API_SECRET ?? '';
-const ACC_TOKEN  = process.env.TWITTER_ACCESS_TOKEN  ?? '';
-const ACC_SECRET = process.env.TWITTER_ACCESS_SECRET ?? '';
+const CLIENT_ID     = process.env.TWITTER_CLIENT_ID     ?? '';
+const CLIENT_SECRET = process.env.TWITTER_CLIENT_SECRET ?? '';
+let   ACCESS_TOKEN  = process.env.TWITTER_ACCESS_TOKEN  ?? '';
+let   REFRESH_TOKEN = process.env.TWITTER_REFRESH_TOKEN ?? '';
 
-// ── OAuth 1.0a signature ───────────────────────────────────────────────────
-function oauthSign(method: string, url: string, params: Record<string, string>): string {
-  const nonce = crypto.randomBytes(16).toString('hex');
-  const ts    = Math.floor(Date.now() / 1000).toString();
+const ENV_PATH = path.resolve(__dirname, '../.env');
 
-  const oauthParams: Record<string, string> = {
-    oauth_consumer_key:     API_KEY,
-    oauth_nonce:            nonce,
-    oauth_signature_method: 'HMAC-SHA1',
-    oauth_timestamp:        ts,
-    oauth_token:            ACC_TOKEN,
-    oauth_version:          '1.0',
-  };
+// ── Token refresh ──────────────────────────────────────────────────────────
+async function refreshAccessToken(): Promise<void> {
+  if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) {
+    throw new Error('Missing TWITTER_CLIENT_ID / CLIENT_SECRET / REFRESH_TOKEN');
+  }
 
-  const all = { ...params, ...oauthParams };
-  const base = Object.keys(all).sort()
-    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(all[k])}`)
-    .join('&');
+  console.log('[twitter] Access token expired — refreshing...');
 
-  const sigBase = `${method}&${encodeURIComponent(url)}&${encodeURIComponent(base)}`;
-  const sigKey  = `${encodeURIComponent(API_SECRET)}&${encodeURIComponent(ACC_SECRET)}`;
-  const sig     = crypto.createHmac('sha1', sigKey).update(sigBase).digest('base64');
+  const creds = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
+  const resp = await axios.post(
+    'https://api.twitter.com/2/oauth2/token',
+    new URLSearchParams({
+      grant_type:    'refresh_token',
+      refresh_token: REFRESH_TOKEN,
+      client_id:     CLIENT_ID,
+    }).toString(),
+    {
+      headers: {
+        'Authorization': `Basic ${creds}`,
+        'Content-Type':  'application/x-www-form-urlencoded',
+      },
+    }
+  );
 
-  oauthParams.oauth_signature = sig;
+  ACCESS_TOKEN  = resp.data.access_token;
+  REFRESH_TOKEN = resp.data.refresh_token ?? REFRESH_TOKEN;
 
-  const header = 'OAuth ' + Object.keys(oauthParams).sort()
-    .map(k => `${encodeURIComponent(k)}="${encodeURIComponent(oauthParams[k])}"`)
-    .join(', ');
-
-  return header;
+  // Write new tokens back to .env so they persist
+  if (fs.existsSync(ENV_PATH)) {
+    let env = fs.readFileSync(ENV_PATH, 'utf8');
+    env = env.replace(/^TWITTER_ACCESS_TOKEN=.*/m,  `TWITTER_ACCESS_TOKEN=${ACCESS_TOKEN}`);
+    env = env.replace(/^TWITTER_REFRESH_TOKEN=.*/m, `TWITTER_REFRESH_TOKEN=${REFRESH_TOKEN}`);
+    fs.writeFileSync(ENV_PATH, env, 'utf8');
+    console.log('[twitter] ✅ Tokens refreshed and saved to .env');
+  }
 }
 
+// ── Post tweet ─────────────────────────────────────────────────────────────
 async function tweet(text: string): Promise<void> {
-  if (!API_KEY || !ACC_TOKEN || !ACC_SECRET) {
-    console.error('❌ Twitter credentials not configured. Need TWITTER_ACCESS_TOKEN + TWITTER_ACCESS_SECRET.');
-    console.log('📋 Tweet that would be posted:\n');
+  if (!ACCESS_TOKEN) {
+    console.log('⚠️  No TWITTER_ACCESS_TOKEN — preview mode:\n');
+    console.log('─'.repeat(60));
     console.log(text);
+    console.log('─'.repeat(60));
     return;
   }
 
-  const url = 'https://api.twitter.com/2/tweets';
-  const auth = oauthSign('POST', url, {});
+  async function doPost(token: string): Promise<any> {
+    return axios.post(
+      'https://api.twitter.com/2/tweets',
+      { text },
+      { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
+    );
+  }
 
-  const resp = await axios.post(url, { text }, {
-    headers: {
-      'Authorization': auth,
-      'Content-Type': 'application/json',
-    },
-  });
-
-  console.log(`✅ Posted: https://x.com/gadaisol/status/${resp.data.data.id}`);
+  try {
+    const resp = await doPost(ACCESS_TOKEN);
+    const id = resp.data?.data?.id;
+    console.log(`✅ Tweet posted: https://x.com/gadaisol/status/${id}`);
+  } catch (err: any) {
+    const status = (err as AxiosError)?.response?.status;
+    if (status === 401) {
+      // Token expired — refresh and retry once
+      await refreshAccessToken();
+      const resp = await doPost(ACCESS_TOKEN);
+      const id = resp.data?.data?.id;
+      console.log(`✅ Tweet posted (after refresh): https://x.com/gadaisol/status/${id}`);
+    } else {
+      const body = JSON.stringify((err as AxiosError)?.response?.data ?? err.message);
+      throw new Error(`Twitter API error ${status}: ${body}`);
+    }
+  }
 }
 
-// ── Post templates ─────────────────────────────────────────────────────────
-
-function launchTweet(mint: string, name: string, ticker: string): string {
-  return `🚀 $${ticker} — ${name} is LIVE on pump.fun!
-
-🤖 Scanned & verified by GAD AI Terminal
-📊 AI Score: tracking...
-🔗 Trade: https://pump.fun/coin/${mint}
-
-Bot: @gadai_sol_bot | Site: gadai.shop
-$SOL #Solana #memecoins #${ticker}`;
-}
-
-function alertTweet(ticker: string, score: number, stage: string, liq: number, mint: string): string {
-  const emoji = score >= 70 ? '🔥' : score >= 50 ? '📈' : '👀';
-  return `${emoji} $${ticker} — GAD Score ${score}/100
-
-Stage: ${stage}
-Liquidity: $${(liq/1000).toFixed(0)}k
-
-🤖 GAD AI Terminal alpha alert
-🔗 https://pump.fun/coin/${mint}
-
-@gadai_sol_bot | gadai.shop
-$SOL #Solana`;
-}
-
-function gadaiAnnounceTweet(mint: string): string {
-  return `🤖 $GADAI — GAD AI Terminal is live!
+// ── Tweet templates ────────────────────────────────────────────────────────
+function tmplGadai(mint: string): string {
+  return `🤖 $GADAI — GAD AI Terminal is LIVE on pump.fun!
 
 Real-time Solana memecoin scanner
-• AI scoring 0-100
-• Auto-buy with smart TP/SL
-• Whale tracker
-• Futures signals
+📊 AI scoring 0-100 per token
+⚡️ Auto-buy with TP/SL
+🐋 Whale tracker
+📈 Futures signals
 
-Your edge in the memecoin casino 📈
+Your edge in the memecoin casino.
 
 🔗 https://pump.fun/coin/${mint}
-Bot: @gadai_sol_bot
-Site: gadai.shop
+🤖 Bot: @gadai_sol_bot
+🌐 gadai.shop
 
-$SOL #Solana #AI #memecoins`;
+$SOL $GADAI #Solana #AI #memecoins`;
+}
+
+function tmplLaunch(mint: string, ticker: string, name: string): string {
+  return `🚀 $${ticker} — ${name} just launched on pump.fun!
+
+Scanned & tracked by GAD AI Terminal 🤖
+📊 AI Score: updating...
+
+🔗 https://pump.fun/coin/${mint}
+Bot: @gadai_sol_bot | gadai.shop
+
+$SOL #Solana #${ticker} #memecoins`;
+}
+
+function tmplAlert(ticker: string, score: number, liq: number, mint: string): string {
+  const emoji = score >= 70 ? '🔥🔥' : score >= 55 ? '🔥' : '📈';
+  return `${emoji} $${ticker} — GAD Score ${score}/100
+
+💧 Liquidity: $${(liq / 1000).toFixed(0)}k
+🤖 GAD AI Terminal alpha alert
+
+🔗 https://pump.fun/coin/${mint}
+Bot: @gadai_sol_bot | gadai.shop
+
+$SOL #Solana #memecoins`;
+}
+
+function tmplTest(): string {
+  return `🤖 GAD AI Terminal Twitter integration test
+
+If you see this — posting works! 🎉
+Bot: @gadai_sol_bot | gadai.shop
+
+$SOL #Solana`;
 }
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 async function main() {
   const [,, cmd, ...args] = process.argv;
 
-  if (cmd === 'launch') {
-    const [mint, name = 'GAD AI Terminal', ticker = 'GADAI'] = args;
-    if (!mint) { console.error('Usage: twitter-post.ts launch <mint> [name] [ticker]'); process.exit(1); }
-    await tweet(launchTweet(mint, name, ticker));
+  switch (cmd) {
+    case 'test':
+      await tweet(tmplTest());
+      break;
 
-  } else if (cmd === 'gadai') {
-    const [mint] = args;
-    if (!mint) { console.error('Usage: twitter-post.ts gadai <mint>'); process.exit(1); }
-    await tweet(gadaiAnnounceTweet(mint));
+    case 'gadai': {
+      const [mint] = args;
+      if (!mint) { console.error('Usage: twitter-post.ts gadai <mint_address>'); process.exit(1); }
+      await tweet(tmplGadai(mint));
+      break;
+    }
 
-  } else if (cmd === 'alert') {
-    const [ticker, scoreStr, stage, liqStr, mint] = args;
-    if (!ticker || !mint) { console.error('Usage: twitter-post.ts alert <ticker> <score> <stage> <liq> <mint>'); process.exit(1); }
-    await tweet(alertTweet(ticker, Number(scoreStr), stage, Number(liqStr), mint));
+    case 'launch': {
+      const [mint, ticker = 'TOKEN', name = ticker] = args;
+      if (!mint) { console.error('Usage: twitter-post.ts launch <mint> <ticker> [name]'); process.exit(1); }
+      await tweet(tmplLaunch(mint, ticker, name));
+      break;
+    }
 
-  } else if (cmd === 'custom') {
-    const text = args.join(' ');
-    if (!text) { console.error('Usage: twitter-post.ts custom "Your tweet text"'); process.exit(1); }
-    await tweet(text);
+    case 'alert': {
+      const [ticker, scoreStr, liqStr, mint] = args;
+      if (!ticker || !mint) { console.error('Usage: twitter-post.ts alert <ticker> <score> <liq_usd> <mint>'); process.exit(1); }
+      await tweet(tmplAlert(ticker, Number(scoreStr), Number(liqStr), mint));
+      break;
+    }
 
-  } else {
-    console.log('GAD AI Terminal Twitter Poster');
-    console.log('Commands:');
-    console.log('  launch <mint> [name] [ticker]        — post token launch tweet');
-    console.log('  gadai <mint>                         — post $GADAI announcement');
-    console.log('  alert <ticker> <score> <stage> <liq> <mint> — post scanner alert');
-    console.log('  custom "text"                        — post any tweet');
+    case 'custom': {
+      const text = args.join(' ');
+      if (!text) { console.error('Usage: twitter-post.ts custom "Your tweet text"'); process.exit(1); }
+      await tweet(text);
+      break;
+    }
+
+    default:
+      console.log(`GAD AI Terminal — Twitter Poster (OAuth 2.0)
+Commands:
+  test                              — post test tweet
+  gadai <mint>                      — $GADAI launch announcement
+  launch <mint> <ticker> [name]     — any token launch
+  alert <ticker> <score> <liq> <mint> — scanner alert
+  custom "text"                     — any text`);
   }
 }
 
-main().catch(err => { console.error('❌', err.message); process.exit(1); });
+main().catch(err => {
+  console.error('❌', err.message);
+  process.exit(1);
+});
