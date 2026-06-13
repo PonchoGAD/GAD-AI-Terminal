@@ -627,12 +627,62 @@ async function onTradeEvent(
 
 async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): Promise<void> {
   if (!BONDING_HOT_ENABLED) return;
+  // pump.fun API is Cloudflare-protected from VPS IPs (530 error).
+  // Use DexScreener search filtered to pumpfun/pumpswap DEX instead.
+  const DEXSCREENER = 'https://api.dexscreener.com/latest/dex';
+  const queries = ['sol new', 'sol meme', 'sol pump'];
+  const seenDs = new Set<string>();
+  const pairCandidates: any[] = [];
+
+  for (const q of queries) {
+    try {
+      const r = await axios.get(`${DEXSCREENER}/search?q=${encodeURIComponent(q)}`, { timeout: 6_000 });
+      for (const p of (r.data?.pairs ?? []) as any[]) {
+        if (p.chainId !== 'solana') continue;
+        const dex = (p.dexId ?? '').toLowerCase();
+        if (!['pumpfun', 'pumpswap'].includes(dex)) continue;
+        const m = p.baseToken?.address;
+        if (!m || seenDs.has(m)) continue;
+        seenDs.add(m);
+        pairCandidates.push(p);
+      }
+      await new Promise(res => setTimeout(res, 500));
+    } catch { /* skip failed query */ }
+  }
+
   try {
-    const r = await axios.get(`${PUMPFUN_API}/coins`, {
-      params: { offset: 0, limit: 50, sort: 'last_trade_timestamp', order: 'DESC', includeNsfw: false },
-      timeout: 8_000,
-    });
-    const coins: any[] = Array.isArray(r.data) ? r.data : [];
+    // Supplement with DexScreener latest token profiles (fresh listings)
+    const profR = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
+    const mints: string[] = ((Array.isArray(profR.data) ? profR.data : []) as any[])
+      .filter((p: any) => p.chainId === 'solana' && p.tokenAddress && !seenDs.has(p.tokenAddress))
+      .map((p: any) => { seenDs.add(p.tokenAddress); return p.tokenAddress; })
+      .slice(0, 20);
+    if (mints.length > 0) {
+      const pr = await axios.get(`${DEXSCREENER}/tokens/${mints.join(',')}`, { timeout: 6_000 });
+      for (const p of (pr.data?.pairs ?? []) as any[]) {
+        if (p.chainId !== 'solana') continue;
+        const dex = (p.dexId ?? '').toLowerCase();
+        if (!['pumpfun', 'pumpswap'].includes(dex)) continue;
+        const m = p.baseToken?.address;
+        if (!m || seenDs.has(m)) continue;
+        seenDs.add(m);
+        pairCandidates.push(p);
+      }
+    }
+  } catch { /* fail-open */ }
+
+  const coins: any[] = pairCandidates.map(p => ({
+    mint: p.baseToken?.address,
+    symbol: p.baseToken?.symbol,
+    name: p.baseToken?.name ?? p.baseToken?.symbol,
+    usd_market_cap: Number(p.fdv ?? p.marketCap ?? 0),
+    last_trade_timestamp: (p.volume?.m5 ?? 0) > 0 ? Math.floor(Date.now() / 1000) : 0,
+    created_timestamp:    p.pairCreatedAt ? Math.floor(Number(p.pairCreatedAt) / 1000) : 0,
+    vol5m: p.volume?.m5 ?? 0,
+    complete: false,  // pumpfun/pumpswap DEX means still on bonding curve
+    raydium_pool: null,
+    pc5m: Number(p.priceChange?.m5 ?? 0),
+  })).filter(c => (c.vol5m ?? 0) > 0);  // must have recent 5m volume
 
     for (const coin of coins) {
       const mint: string = coin.mint ?? '';
