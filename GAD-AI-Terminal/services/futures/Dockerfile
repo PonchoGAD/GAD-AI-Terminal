@@ -23,5 +23,7 @@ COPY services/futures ./services/futures
 RUN cp tsconfig.base.json tsconfig.json
 
 ENV TS_NODE_PROJECT=/app/services/futures/tsconfig.json
+# Skip type-checking at runtime (Drift/Solana types not installed — optional deps only)
+ENV TS_NODE_TRANSPILE_ONLY=true
 
 CMD ["node", "-r", "ts-node/register", "-r", "tsconfig-paths/register", "services/futures/src/index.ts"]
