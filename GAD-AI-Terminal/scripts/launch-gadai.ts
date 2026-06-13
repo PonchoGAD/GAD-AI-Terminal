@@ -5,11 +5,21 @@
  * Each wallet creates a buy transaction after the token is created by wallet 1.
  *
  * Required env vars:
- *   WALLET_PRIVATE_KEY         — main wallet (creates the token + buys)
- *   PUMPFUN_WALLET_PRIVATE_KEY — pump.fun wallet 2 (buys on launch)
- *   LAUNCH_WALLET_3_KEY        — 3rd wallet (buys on launch)
- *   SOLANA_RPC                 — Helius or QuickNode RPC
- *   GADAI_LOGO_PATH            — path to logo PNG
+ *   WALLET_PRIVATE_KEY           — main wallet EL4mS7Xg (creates token + dev buy)
+ *   PUMPFUN_WALLET_PRIVATE_KEY   — pump wallet CFmHWpmQ (organic buy +12min)
+ *   PUMPFUN_WALLET_PRIVATE_KEY_2 — HOT wallet DJ8Tq8vi (organic buy +28min)
+ *   SOLANA_RPC                   — Helius RPC
+ *   GADAI_LOGO_PATH              — path to logo PNG
+ *
+ * Staggered timing (looks organic, NOT coordinated):
+ *   T+0min  W1 creates + dev buy 0.15 SOL
+ *   T+12min W2 organic buy 0.08 SOL
+ *   T+28min W3 organic buy 0.04 SOL
+ *
+ * Sell plan:
+ *   W3 exits at 3-4x (first signal)
+ *   W2 exits at 5-6x
+ *   W1 HOLDS 2-4h, exits at peak / 8-10x (dev sells last = trust)
  *
  * Run: npx ts-node -p tsconfig.launch.json scripts/launch-gadai.ts
  */
@@ -44,10 +54,14 @@ const TOKEN_WEBSITE  = 'https://www.gadai.shop';
 const TOKEN_TWITTER  = 'https://x.com/gadaisol';
 const TOKEN_TELEGRAM = 'https://t.me/gadfamilytg';
 
-// Buy amounts per wallet (SOL)
-const BUY_WALLET1 = 0.15;  // creator wallet — largest buy to set price
-const BUY_WALLET2 = 0.08;
-const BUY_WALLET3 = 0.08;
+// Buy amounts per wallet (SOL) — different amounts, NOT round identical numbers
+const BUY_WALLET1 = 0.15;  // dev buy — sets price floor + signals commitment
+const BUY_WALLET2 = 0.08;  // organic buyer 1 (W2 has 0.27 SOL, leaves 0.18 for bot)
+const BUY_WALLET3 = 0.04;  // organic buyer 2 (W3 has 0.14 SOL, leaves 0.09 for HOT trades)
+
+// Delay between wallet buys (ms) — stagger looks organic
+const W2_DELAY_MS = 12 * 60 * 1000; // +12 minutes after launch
+const W3_DELAY_MS = 16 * 60 * 1000; // +16 minutes after W2 (= T+28min total)
 
 function loadKeypair(envKey: string): Keypair | null {
   const pk = process.env[envKey];
@@ -113,7 +127,7 @@ async function launch() {
 
   const wallet1 = loadKeypair('WALLET_PRIVATE_KEY');
   const wallet2 = loadKeypair('PUMPFUN_WALLET_PRIVATE_KEY');
-  const wallet3 = loadKeypair('LAUNCH_WALLET_3_KEY');
+  const wallet3 = loadKeypair('PUMPFUN_WALLET_PRIVATE_KEY_2');
 
   if (!wallet1) { console.error('❌ WALLET_PRIVATE_KEY required (creator)'); process.exit(1); }
 
@@ -170,20 +184,22 @@ async function launch() {
   const sig1 = await buyToken(connection, wallet1, mintSecretB58, metadataUri, BUY_WALLET1, 'create', 'Wallet 1 create');
   if (!sig1) { console.error('❌ Token creation failed — aborting'); process.exit(1); }
 
-  // ── Step 4: Parallel buys from wallets 2 & 3 ──────────────────────────────
-  const buyPromises: Promise<string | null>[] = [];
-
+  // ── Step 4: Staggered buys — each wallet waits separately (looks organic) ─
   if (wallet2) {
+    const t2 = new Date(Date.now() + W2_DELAY_MS);
+    console.log(`\n⏳ W2 buy in ${W2_DELAY_MS / 60000} min (at ${t2.toISOString()})...`);
+    await new Promise(r => setTimeout(r, W2_DELAY_MS));
     console.log(`[2/3] Buying ${BUY_WALLET2} SOL from Wallet 2...`);
-    buyPromises.push(buyToken(connection, wallet2, mintAddr, '', BUY_WALLET2, 'buy', 'Wallet 2 buy'));
+    await buyToken(connection, wallet2, mintAddr, '', BUY_WALLET2, 'buy', 'Wallet 2 buy');
   }
 
   if (wallet3) {
+    const t3 = new Date(Date.now() + W3_DELAY_MS);
+    console.log(`\n⏳ W3 buy in ${W3_DELAY_MS / 60000} min (at ${t3.toISOString()})...`);
+    await new Promise(r => setTimeout(r, W3_DELAY_MS));
     console.log(`[3/3] Buying ${BUY_WALLET3} SOL from Wallet 3...`);
-    buyPromises.push(buyToken(connection, wallet3, mintAddr, '', BUY_WALLET3, 'buy', 'Wallet 3 buy'));
+    await buyToken(connection, wallet3, mintAddr, '', BUY_WALLET3, 'buy', 'Wallet 3 buy');
   }
-
-  await Promise.allSettled(buyPromises);
 
   // ── Result ─────────────────────────────────────────────────────────────────
   console.log('\n🎉 $GADAI LAUNCHED!');

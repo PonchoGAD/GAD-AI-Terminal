@@ -75,8 +75,10 @@ const SOLANA_RPC      = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.sola
 // Use case: tokens that launched before the scanner started, or are in the HOT section.
 const BONDING_HOT_ENABLED     = process.env.BONDING_HOT_ENABLED === 'true';
 const BONDING_HOT_INTERVAL_MS = Number(process.env.BONDING_HOT_INTERVAL_SEC || '60') * 1000;
-const BONDING_HOT_MIN_MCAP    = Number(process.env.BONDING_HOT_MIN_MCAP_USD || '8000');
-const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '60000');
+// Max mcap $12k keeps tokens on bonding curve (graduation threshold ≈ $12-13k at ~$150/SOL)
+// Tokens above $12k have graduated to PumpSwap and need different buy/sell mechanism
+const BONDING_HOT_MIN_MCAP    = Number(process.env.BONDING_HOT_MIN_MCAP_USD || '3000');
+const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '12000');
 const BONDING_HOT_MIN_AGE_SEC = Number(process.env.BONDING_HOT_MIN_AGE_SEC || '900');  // 15 min
 const BONDING_HOT_MAX_AGE_SEC = Number(process.env.BONDING_HOT_MAX_AGE_SEC || String(4 * 3600)); // 4h
 
@@ -144,7 +146,8 @@ function loadPumpFunKeypair2(): Keypair | null {
 // ─── Buy/sell via PumpPortal ──────────────────────────────────────────────────
 
 async function buyOnBondingCurve(
-  mint: string, amountSol: number, keypair: Keypair, connection: Connection
+  mint: string, amountSol: number, keypair: Keypair, connection: Connection,
+  pool: string = 'pump'
 ): Promise<{ success: boolean; txSignature?: string; error?: string }> {
   try {
     const { VersionedTransaction, Transaction } = await import('@solana/web3.js');
@@ -158,7 +161,7 @@ async function buyOnBondingCurve(
         denominatedInSol: 'true',
         slippage: 25,
         priorityFee: 0.002,
-        pool: 'pump',
+        pool,
       },
       { responseType: 'arraybuffer', timeout: 15_000 }
     );
@@ -188,7 +191,8 @@ async function buyOnBondingCurve(
 }
 
 async function sellOnBondingCurve(
-  mint: string, pct: number, keypair: Keypair, connection: Connection
+  mint: string, pct: number, keypair: Keypair, connection: Connection,
+  pool: string = 'pump'
 ): Promise<{ success: boolean; solReceived?: number }> {
   try {
     const { VersionedTransaction, Transaction } = await import('@solana/web3.js');
@@ -201,9 +205,9 @@ async function sellOnBondingCurve(
         mint,
         amount: `${pct}%`,
         denominatedInSol: 'false',
-        slippage: 30,
-        priorityFee: 0.002,
-        pool: 'auto',
+        slippage: 50,
+        priorityFee: 0.003,
+        pool,
       },
       { responseType: 'arraybuffer', timeout: 15_000 }
     );
@@ -271,6 +275,7 @@ interface BondingPosition {
   recentBuySol: number;
   recentSellSol: number;
   windowResetAt: number;
+  dexPool?: string;      // 'pump' = bonding curve | 'pumpswap' = graduated PumpSwap
 }
 
 const positions = new Map<string, BondingPosition>();
@@ -334,11 +339,13 @@ async function checkPositionExits(
   keypair: Keypair, connection: Connection, source: string,
   posMap: Map<string, BondingPosition> = positions
 ): Promise<void> {
+  const pool = pos.dexPool ?? 'pump';
+
   // Stop-loss: 17% from entry
   if (mult <= 1 - BONDING_STOP_PCT) {
     console.info(`[bonding-scan] 🔴 STOP ${pos.symbol} ${mult.toFixed(2)}x [${source}] — selling 100%`);
     posMap.delete(mint);
-    await sellOnBondingCurve(mint, 100, keypair, connection);
+    await sellOnBondingCurve(mint, 100, keypair, connection, pool);
     return;
   }
 
@@ -348,7 +355,7 @@ async function checkPositionExits(
     if (currentFromPeak <= 1 - MOON_BAG_TRAIL_PCT) {
       console.info(`[bonding-scan] 🌙 TRAIL ${pos.symbol} peak:${pos.peakMcapSol.toFixed(0)} now:${mcapSol.toFixed(0)} — selling moon bag`);
       posMap.delete(mint);
-      await sellOnBondingCurve(mint, 100, keypair, connection);
+      await sellOnBondingCurve(mint, 100, keypair, connection, pool);
     }
     return;
   }
@@ -358,7 +365,7 @@ async function checkPositionExits(
     const tp = BONDING_TPS[pos.tpIndex];
     if (mult >= tp.mult) {
       console.info(`[bonding-scan] 🎯 TP${pos.tpIndex + 1} ${pos.symbol} ${mult.toFixed(2)}x — selling ${tp.sellPct}% [${source}]`);
-      await sellOnBondingCurve(mint, tp.sellPct, keypair, connection);
+      await sellOnBondingCurve(mint, tp.sellPct, keypair, connection, pool);
       pos.tpIndex++;
       if (pos.tpIndex >= BONDING_TPS.length) {
         pos.allTpsDone = true;
@@ -611,7 +618,7 @@ async function onTradeEvent(
     if (!pos2.allTpsDone && pos2.recentSellSol > pos2.recentBuySol * BONDING_DUMP_RATIO && pos2.recentSellSol > 1.0) {
       console.warn(`[bonding-scan] 🚨 DUMP HOT ${pos2.symbol} — exiting w2`);
       positions2.delete(mint);
-      await sellOnBondingCurve(mint, 100, keypairInstance2, connectionInstance);
+      await sellOnBondingCurve(mint, 100, keypairInstance2, connectionInstance, pos2.dexPool ?? 'pump');
       return;
     }
     await checkPositionExits(mint, pos2, mcapSol, mult2, keypairInstance2, connectionInstance, 'ws', positions2);
@@ -672,18 +679,23 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
     }
   } catch { /* fail-open */ }
 
-  const coins: any[] = pairCandidates.map(p => ({
-    mint: p.baseToken?.address,
-    symbol: p.baseToken?.symbol,
-    name: p.baseToken?.name ?? p.baseToken?.symbol,
-    usd_market_cap: Number(p.fdv ?? p.marketCap ?? 0),
-    last_trade_timestamp: (p.volume?.m5 ?? 0) > 0 ? Math.floor(Date.now() / 1000) : 0,
-    created_timestamp:    p.pairCreatedAt ? Math.floor(Number(p.pairCreatedAt) / 1000) : 0,
-    vol5m: p.volume?.m5 ?? 0,
-    complete: false,  // pumpfun/pumpswap DEX means still on bonding curve
-    raydium_pool: null,
-    pc5m: Number(p.priceChange?.m5 ?? 0),
-  })).filter(c => (c.vol5m ?? 0) > 0);  // must have recent 5m volume
+  const coins: any[] = pairCandidates.map(p => {
+    const dex = (p.dexId ?? '').toLowerCase();
+    return {
+      mint: p.baseToken?.address,
+      symbol: p.baseToken?.symbol,
+      name: p.baseToken?.name ?? p.baseToken?.symbol,
+      usd_market_cap: Number(p.fdv ?? p.marketCap ?? 0),
+      last_trade_timestamp: (p.volume?.m5 ?? 0) > 0 ? Math.floor(Date.now() / 1000) : 0,
+      created_timestamp:    p.pairCreatedAt ? Math.floor(Number(p.pairCreatedAt) / 1000) : 0,
+      vol5m: p.volume?.m5 ?? 0,
+      complete: false,
+      raydium_pool: null,
+      pc5m: Number(p.priceChange?.m5 ?? 0),
+      // 'pump' = bonding curve, 'pumpswap' = graduated PumpSwap
+      dexPool: dex === 'pumpswap' ? 'pumpswap' : 'pump',
+    };
+  }).filter(c => (c.vol5m ?? 0) > 0);  // must have recent 5m volume
 
     for (const coin of coins) {
       const mint: string = coin.mint ?? '';
@@ -713,13 +725,14 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
       const mcapSol = mcapUsd / solPriceUsd;
       if (mcapSol > BONDING_MAX_MCAP_SOL) continue;
 
+      const dexPool = coin.dexPool ?? 'pump';
       console.info(
         `[bonding-scan] 🔥 HOT ${symbol} mcap:$${mcapUsd.toFixed(0)} ` +
-        `age:${(tokenAgeSec / 60).toFixed(0)}min — entering w2`
+        `age:${(tokenAgeSec / 60).toFixed(0)}min pool:${dexPool} — entering w2`
       );
 
       recentMints.add(mint);
-      const buyResult = await buyOnBondingCurve(mint, BONDING_BUY_SOL, keypair, connection);
+      const buyResult = await buyOnBondingCurve(mint, BONDING_BUY_SOL, keypair, connection, dexPool);
       if (!buyResult.success) { recentMints.delete(mint); continue; }
 
       bonding2DailySpent += BONDING_BUY_SOL;
@@ -734,7 +747,7 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
            ON CONFLICT DO NOTHING`,
           [
             mint,
-            `auto:bonding:hot:${symbol}:mcap${Math.round(mcapSol)}sol`,
+            `auto:bonding:hot:${symbol}:${dexPool}:mcap${Math.round(mcapSol)}sol`,
             BONDING_BUY_SOL, buyResult.txSignature ?? '',
             BONDING_TIME_LIMIT_SEC,
           ]
@@ -753,6 +766,7 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
         uniqueBuyers: new Set(),
         recentBuySol: 0, recentSellSol: 0,
         windowResetAt: Date.now() + 90_000,
+        dexPool,
       });
 
       if (wsInstance?.readyState === WebSocket.OPEN) {
@@ -764,7 +778,7 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
         if (!p) return;
         console.info(`[bonding-scan] ⏱ TIME_LIMIT HOT ${p.symbol} w2 — selling 100%`);
         positions2.delete(mint);
-        await sellOnBondingCurve(mint, 100, keypair, connection);
+        await sellOnBondingCurve(mint, 100, keypair, connection, p.dexPool ?? 'pump');
       }, BONDING_TIME_LIMIT_SEC * 1000);
 
       await new Promise(res => setTimeout(res, 2000)); // rate-limit between HOT entries
