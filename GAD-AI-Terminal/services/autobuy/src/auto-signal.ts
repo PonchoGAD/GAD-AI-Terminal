@@ -338,26 +338,30 @@ const DEXSCREENER_BASE = 'https://api.dexscreener.com/latest/dex';
 const GECKO_BASE = 'https://api.geckoterminal.com/api/v2';
 const GECKO_HEADERS = { 'Accept': 'application/json;version=20230302' };
 
-// Min liquidity for Raydium scan — $8k captures pump.fun graduates (~85 SOL pool ~$12k)
-const RAYDIUM_MIN_LIQUIDITY_USD = Number(process.env.RAYDIUM_MIN_LIQUIDITY_USD || '8000');
+// Min liquidity — calibrated from 72h analysis of real pump.fun graduates that hit >$50k mcap.
+// Liq $20-25k at listing = dev buy ~0.3-0.8 SOL (lowest quality tier, high rug risk).
+// Liq $25k+ = dev buy ~0.8+ SOL (real skin in the game). 22k default filters cheapest rugs.
+const RAYDIUM_MIN_LIQUIDITY_USD = Number(process.env.RAYDIUM_MIN_LIQUIDITY_USD || '22000');
 // Max liquidity — avoid large-cap tokens (slow movers)
 const RAYDIUM_MAX_LIQUIDITY_USD = Number(process.env.RAYDIUM_MAX_LIQUIDITY_USD || '500000');
 // No separate vol1h floor — Gate 4 vol/liq ratio check is the real stale-pool filter
 const RAYDIUM_MIN_VOLUME_H1_USD = Number(process.env.RAYDIUM_MIN_VOLUME_H1_USD || '0');
-// Min 1h price change — require positive momentum (5% = significant, filters noise)
-const RAYDIUM_MIN_PC1H = Number(process.env.RAYDIUM_MIN_PC1H || '5');
-// Max 1h price change — allow strong pumps (pump.fun graduates often 50-100% in first hour)
+// Min 1h price change — real pump.fun winners show 0.5-20% in 1h at optimal entry
+const RAYDIUM_MIN_PC1H = Number(process.env.RAYDIUM_MIN_PC1H || '1');
+// Max 1h price change — blow-off tops filtered by MAYHEM MODE (>50% pc5m), not pc1h
 const RAYDIUM_MAX_PC1H = Number(process.env.RAYDIUM_MAX_PC1H || '100');
 // Min 5m price change — require active momentum RIGHT NOW (key entry signal)
 const RAYDIUM_MIN_PC5M = Number(process.env.RAYDIUM_MIN_PC5M || '0.5');
-// Max token age — 14 days covers "rediscovered" pumpers (tokens sitting flat then getting KOL pump).
-// 7 days was still too restrictive: SATX example was 9.4 days old and pumping +28% in 1h.
+// Max token age — 14 days covers "rediscovered" pumpers
 const RAYDIUM_MAX_AGE_SEC = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(14 * 24 * 3600));
 // Min token age — 30min prevents buying in the first minutes of Raydium launch
-// Uses own env var, NOT MIN_TOKEN_AGE_SEC (which is 2h for auto-signal strategy)
 const RAYDIUM_MIN_AGE_SEC = Number(process.env.RAYDIUM_MIN_AGE_SEC || '1800');
-// Min vol/liq ratio — 5% hourly turnover is the stale-pool gate; 10% was too strict in quiet hours
-const RAYDIUM_MIN_VOL_LIQ_RATIO = Number(process.env.RAYDIUM_MIN_VOL_LIQ_RATIO || '0.05');
+// Min vol/liq ratio — 8% hourly turnover (from analysis: winners avg vol/mcap=6.5x in 24h)
+const RAYDIUM_MIN_VOL_LIQ_RATIO = Number(process.env.RAYDIUM_MIN_VOL_LIQ_RATIO || '0.08');
+// Max buy/sell ratio — >3.5x = likely wash trading or pump already completed.
+// From analysis: Gaejuki 5.82x B/S + price -76% = pump&dump. RESERVE 5.7x → distribution next hour.
+// Healthy accumulation: 1.2-1.8x (Merlin 1.26x +899%, trelon 1.23x +871%, Trilly 1.49x +559%).
+const RAYDIUM_MAX_BUY_SELL_RATIO = Number(process.env.RAYDIUM_MAX_BUY_SELL_RATIO || '3.5');
 
 // ─── Adaptive Tier System ─────────────────────────────────────────────────────
 // Different liquidity tiers need different strategies:
@@ -768,13 +772,18 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       skipped.hype++; continue;
     }
 
-    // ── Gate 3b: Buy/sell ratio — require net buying pressure ──
+    // ── Gate 3b: Buy/sell ratio — require net buying pressure, reject wash trading ──
     // If 20%+ more sellers than buyers in the last hour: distribution phase, skip.
-    // Only apply when we have real txn data (buys > 0). GeckoTerminal always has this.
+    // If ratio >3.5x: wash trading OR pump already peaked (Gaejuki 5.82x then -76%).
+    // Only apply min-ratio when we have real txn data (buys > 0).
     const buys1h = (pair.txns?.h1?.buys ?? 0) as number;
     const sells1h = (pair.txns?.h1?.sells ?? 0) as number;
     if (buys1h > 0 && sells1h > buys1h * 1.2) {
-      console.debug(`[raydium-scan] ✗sell ${sym.padEnd(10)} buys:${buys1h} sells:${sells1h} (distribution)`);
+      console.debug(`[raydium-scan] ✗dist ${sym.padEnd(10)} buys:${buys1h} sells:${sells1h} (distribution in 1h)`);
+      skipped.momentum++; continue;
+    }
+    if (buys1h > 50 && sells1h > 0 && buys1h / sells1h > RAYDIUM_MAX_BUY_SELL_RATIO) {
+      console.debug(`[raydium-scan] ✗wash ${sym.padEnd(10)} B/S=${(buys1h/sells1h).toFixed(1)}x (>${RAYDIUM_MAX_BUY_SELL_RATIO}x = wash or late)`);
       skipped.momentum++; continue;
     }
 
