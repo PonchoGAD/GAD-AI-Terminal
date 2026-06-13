@@ -501,14 +501,15 @@ async function fetchRaydiumPairs(): Promise<any[]> {
   const seen = new Set<string>();
   const results: any[] = [];
 
-  // Source 0: GeckoTerminal new_pools — freshest Solana Raydium pools (pump.fun graduates + new launches).
-  // PRIMARY discovery channel: tokens 0-6h old, actively building price history.
-  // geckoPoolToPair() already filters to Raydium/Orca/Meteora only — no pump.fun.
-  let newPoolCount = 0;
-  for (let page = 1; page <= 3; page++) {
+  // Source 0: GeckoTerminal Raydium DEX pools sorted by 24h transaction count.
+  // DIRECTLY targets Raydium pools only (no pump.fun) — sort by tx count = highest community engagement today.
+  // This catches fresh tokens (1-48h) that already have active buyers before a bigger pump.
+  // Sorted by h24_tx_count_desc means highest-activity tokens appear first across all ages.
+  let raydiumDexCount = 0;
+  for (let page = 1; page <= 2; page++) {
     try {
       const r = await axios.get(
-        `${GECKO_BASE}/networks/solana/new_pools?page=${page}&include=base_token,dex`,
+        `${GECKO_BASE}/networks/solana/dexes/raydium/pools?sort=h24_tx_count_desc&include=base_token,dex&page=${page}`,
         { headers: GECKO_HEADERS, timeout: 8_000 }
       );
       const pools: any[] = r.data?.data ?? [];
@@ -519,16 +520,16 @@ async function fetchRaydiumPairs(): Promise<any[]> {
         if (!mint || seen.has(mint)) continue;
         seen.add(mint);
         results.push(pair);
-        newPoolCount++;
+        raydiumDexCount++;
       }
-      await new Promise(r => setTimeout(r, 400));
+      await new Promise(r => setTimeout(r, 600));
     } catch (e: any) {
       const status = (e as any).response?.status ?? (e as any).code;
-      console.debug(`[raydium-scan] GeckoTerminal new_pools page ${page}: ${status ?? (e as any).message?.slice(0, 30)}`);
+      console.debug(`[raydium-scan] GeckoTerminal Raydium DEX page ${page}: ${status ?? (e as any).message?.slice(0, 30)}`);
       break;
     }
   }
-  if (newPoolCount > 0) console.debug(`[raydium-scan] GeckoTerminal new_pools p1-3: ${newPoolCount} Raydium/Orca pairs`);
+  if (raydiumDexCount > 0) console.debug(`[raydium-scan] GeckoTerminal Raydium DEX (tx-sorted): ${raydiumDexCount} pairs`);
 
   // Source 1: DexScreener token-profiles/latest — freshly launched tokens with community profiles.
   // These are brand-new tokens someone just added a profile for — high community engagement signal.
@@ -680,8 +681,8 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     }
   }
 
-  const dxCount = results.length - geckoCount - newPoolCount;
-  console.debug(`[raydium-scan] total: ${results.length} unique candidates (${newPoolCount} new_pools + ${geckoCount} trending + ${dxCount} dx)`);
+  const dxCount = results.length - geckoCount - raydiumDexCount;
+  console.debug(`[raydium-scan] total: ${results.length} unique candidates (${raydiumDexCount} raydium-dex + ${geckoCount} trending + ${dxCount} dx)`);
   return results;
 }
 
