@@ -18,8 +18,8 @@ COPY services/futures ./services/futures
 # Install all workspace deps (creates node_modules/@lib/* symlinks via npm workspaces)
 RUN npm install --ignore-scripts
 
-# Compile TypeScript
-RUN cd services/futures && npx tsc --project tsconfig.json --skipLibCheck || true
+# TS_NODE_PROJECT tells ts-node + tsconfig-paths which config to use
+ENV TS_NODE_PROJECT=/usr/src/app/services/futures/tsconfig.json
 
-# Runtime: compiled JS, node resolves @lib/db via root node_modules/@lib/db symlink
-CMD ["node", "services/futures/dist/index.js"]
+# Run directly via ts-node (development-grade but avoids slow compile step)
+CMD ["node", "-r", "ts-node/register", "-r", "tsconfig-paths/register", "services/futures/src/index.ts"]
