@@ -27,6 +27,8 @@ import axios from 'axios';
 import { Keypair, Connection, VersionedTransaction, Transaction } from '@solana/web3.js';
 dotenv.config();
 
+async function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+
 const PUMPPORTAL_TRADE = 'https://pumpportal.fun/api/trade-local';
 const SOLANA_RPC       = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.solana.com';
 const PINATA_JWT       = process.env.PINATA_JWT!;
@@ -46,8 +48,6 @@ const BUY_W2 = 0.08;
 const BUY_W3 = 0.04;
 const W2_DELAY_MS = 12 * 60 * 1000;
 const W3_DELAY_MS = 16 * 60 * 1000; // after W2 = T+28min total
-
-async function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
 async function pinataUploadFile(filePath: string, filename: string): Promise<string> {
   const form = new FormData();
@@ -159,42 +159,42 @@ async function launch() {
   const metaCheck = await axios.get(metaUri, { timeout: 10000 });
   console.log('✅ Metadata OK:', metaCheck.data.name, '| image:', metaCheck.data.image?.slice(0, 60));
 
-  // ── Step 3: Generate mint keypair ──────────────────────────────────────────
-  const mintKp = Keypair.generate();
-  const mintSecretB58 = bs58.encode(mintKp.secretKey);
-  const mintAddr = mintKp.publicKey.toBase58();
-  console.log(`\n🪙  Mint: ${mintAddr}`);
+  // ── Step 3: Create token via pumpdotfun-sdk ───────────────────────────────
+  const { PumpFunSDK } = await import('pumpdotfun-sdk');
+  const { AnchorProvider } = await import('@coral-xyz/anchor');
+  const NodeWallet = (await import('@coral-xyz/anchor/dist/cjs/nodewallet')).default;
 
-  // ── Step 4: Create token via PumpPortal trade-local ────────────────────────
-  console.log(`\n[1/3] Creating $GADAI + dev buy ${BUY_W1} SOL from W1...`);
-  let createSig: string;
-  try {
-    const r = await axios.post(
-      PUMPPORTAL_TRADE,
-      { publicKey: w1.publicKey.toBase58(), action: 'create',
-        tokenMetadata: { name: TOKEN_NAME, symbol: TOKEN_SYMBOL, uri: metaUri },
-        mint: mintSecretB58, denominatedInSol: 'true', amount: BUY_W1,
-        slippage: 15, priorityFee: 0.005, pool: 'pump' },
-      { responseType: 'arraybuffer', timeout: 30000 }
-    );
-    const bytes = new Uint8Array(r.data as ArrayBuffer);
-    try {
-      const tx = VersionedTransaction.deserialize(bytes);
-      tx.sign([w1, mintKp]);
-      createSig = await conn.sendTransaction(tx, { skipPreflight: false, maxRetries: 5 });
-    } catch {
-      const tx = Transaction.from(Buffer.from(bytes));
-      tx.partialSign(w1, mintKp);
-      createSig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false });
-    }
-    await conn.confirmTransaction(createSig, 'confirmed');
-    console.log(`✅ Created! TX: https://solscan.io/tx/${createSig}`);
-    console.log(`   pump.fun: https://pump.fun/coin/${mintAddr}`);
-  } catch (err: any) {
-    const body = err.response?.data ? Buffer.from(err.response.data as ArrayBuffer).toString() : err.message;
-    console.error(`❌ Create failed (${err.response?.status ?? '?'}): ${body.slice(0, 300)}`);
+  const provider = new AnchorProvider(conn, new NodeWallet(w1), { commitment: 'confirmed' });
+  const sdk = new PumpFunSDK(provider);
+  const mintKp = Keypair.generate();
+  const mintAddr = mintKp.publicKey.toBase58();
+
+  console.log(`\n🪙  Mint: ${mintAddr}`);
+  console.log(`\n[1/3] Creating $GADAI on pump.fun via SDK...`);
+
+  const imageBytes = fs.readFileSync(LOGO_PATH);
+  const imageBlob = new Blob([imageBytes], { type: 'image/png' });
+
+  const createResult = await sdk.createAndBuy(
+    w1, mintKp,
+    { name: TOKEN_NAME, symbol: TOKEN_SYMBOL, uri: metaUri,
+      twitter: TOKEN_TWITTER, telegram: TOKEN_TELEGRAM, website: TOKEN_WEBSITE,
+      file: imageBlob, description: TOKEN_DESC } as any,
+    BigInt(0), 500n,
+    { unitLimit: 250000, unitPrice: 250000 }
+  );
+
+  if (!createResult?.success) {
+    console.error('❌ Create failed:', JSON.stringify(createResult).slice(0, 200));
     process.exit(1);
   }
+  console.log(`✅ Created! pump.fun: https://pump.fun/coin/${mintAddr}`);
+  console.log(`   Waiting 6s before dev buy...`);
+  await sleep(6000);
+
+  // ── Step 4: Dev buy from W1 ────────────────────────────────────────────────
+  console.log(`\n[1/3] W1 dev buy: ${BUY_W1} SOL...`);
+  await pumpBuy(conn, w1, mintAddr, BUY_W1, 'W1 dev buy');
 
   // ── Step 5: Staggered buys ─────────────────────────────────────────────────
   if (w2) {
