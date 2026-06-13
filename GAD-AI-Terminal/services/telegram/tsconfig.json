@@ -19,7 +19,8 @@
       "@lib/scoring":   ["../../libs/scoring/src/index.d.ts"],
       "@lib/social":    ["../../libs/social/src/index.d.ts"],
       "@lib/solana":    ["../../libs/solana/src/index.d.ts"],
-      "@lib/survival":  ["../../libs/survival/src/index.d.ts"]
+      "@lib/survival":     ["../../libs/survival/src/index.d.ts"],
+      "@lib/trend-engine": ["../../libs/trend-engine/src/index.ts"]
     }
   },
   "include": ["src/**/*"]

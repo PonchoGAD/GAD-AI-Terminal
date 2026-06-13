@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
+import { runTrendCycle, getTopClusters, getClusterById, getIdeasForCluster, generateCoinIdeas, saveCoinIdea, updateIdeaStatus } from '@lib/trend-engine';
 
 dotenv.config();
 
@@ -685,6 +686,172 @@ bot.onText(/\/exitcoin (.+)/, (msg, match) => guard(msg.chat.id, async () => {
     }
   );
 }));
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TREND-TO-MEMECOIN ENGINE COMMANDS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function fmtTrend(c: any, idx: number): string {
+  const age = Math.round((Date.now() - new Date(c.last_seen_at).getTime()) / 60000);
+  return `*${idx + 1}. ${c.main_title.slice(0, 60)}*\n` +
+    `Score: ${Number(c.final_score).toFixed(0)} | Trend: ${Number(c.trend_score).toFixed(0)} | Meme: ${Number(c.meme_score).toFixed(0)}\n` +
+    `Mentions: ${c.total_mentions} | Updated: ${age < 60 ? `${age}m ago` : `${Math.round(age/60)}h ago`}\n` +
+    `ID: \`${c.id}\``;
+}
+
+function fmtIdea(idea: any): string {
+  const posts = (idea.twitter_posts ?? []).slice(0, 2).join('\n\n') || '(no posts)';
+  return `*$${idea.ticker}* — ${idea.name}\n` +
+    `Score: ${Number(idea.score).toFixed(0)}/100\n\n` +
+    `*Meme angle:* ${idea.meme_angle}\n\n` +
+    `*Description:*\n${idea.description}\n\n` +
+    `*Twitter drafts:*\n${posts}\n\n` +
+    `*Logo prompt:* ${(idea.logo_prompt ?? '').slice(0, 100)}\n` +
+    (idea.risk_notes ? `*Risk:* ${idea.risk_notes}\n` : '') +
+    `ID: \`${idea.id}\``;
+}
+
+// /trends — show top trending events
+bot.onText(/^\/trends(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  const chatId = msg.chat.id;
+  await send(chatId, '_Fetching latest trends..._');
+  const clusters = await getTopClusters(10);
+  if (!clusters.length) {
+    await send(chatId, 'No trends found yet. Run /trends again in a few minutes.');
+    return;
+  }
+  const text = `*🔥 Top Trending Events*\n\n` + clusters.map(fmtTrend).join('\n\n');
+  await send(chatId, text.slice(0, 4000));
+}));
+
+// /trend <id> — show cluster details
+bot.onText(/^\/trend(?:@\w+)?\s+(.+)$/, (msg, match) => guard(msg.chat.id, async () => {
+  const chatId = msg.chat.id;
+  const id = match![1].trim();
+  const cluster = await getClusterById(id);
+  if (!cluster) { await send(chatId, '❌ Trend not found.'); return; }
+  const text = `*${cluster.main_title}*\n\n` +
+    `Trend: ${cluster.trend_score.toFixed(0)}/100 | Meme: ${cluster.meme_score.toFixed(0)}/100 | Risk: ${cluster.risk_score.toFixed(0)}/100\n` +
+    `Final score: *${cluster.final_score.toFixed(0)}/100*\n\n` +
+    `Mentions: ${cluster.total_mentions} | Sources: ${(cluster.sources ?? []).join(', ')}\n` +
+    `Entities: ${(cluster.entities ?? []).join(', ')}\n\n` +
+    `_To generate coin ideas: /idea ${id}_`;
+  await send(chatId, text);
+}));
+
+// /ideas — generate ideas for top trends NOW
+bot.onText(/^\/ideas(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  const chatId = msg.chat.id;
+  await send(chatId, '_Generating coin ideas from top trends..._');
+  const clusters = await getTopClusters(3);
+  if (!clusters.length) { await send(chatId, 'No trends available. Try /trends first.'); return; }
+  for (const c of clusters.slice(0, 2)) {
+    const ideas = await generateCoinIdeas(c, 2);
+    for (const idea of ideas) {
+      idea.trend_cluster_id = c.id;
+      await saveCoinIdea(idea);
+    }
+    if (ideas.length) {
+      const text = `*🧠 Ideas for: ${c.main_title.slice(0, 50)}*\n\n` + ideas.map(fmtIdea).join('\n\n---\n\n');
+      await send(chatId, text.slice(0, 4000));
+      await new Promise(r => setTimeout(r, 500));
+    }
+  }
+}));
+
+// /idea <cluster_id> — generate ideas for specific trend
+bot.onText(/^\/idea(?:@\w+)?\s+(.+)$/, (msg, match) => guard(msg.chat.id, async () => {
+  const chatId = msg.chat.id;
+  const id = match![1].trim();
+  const cluster = await getClusterById(id);
+  if (!cluster) { await send(chatId, '❌ Trend not found.'); return; }
+  await send(chatId, `_Generating ideas for: ${cluster.main_title.slice(0, 60)}_`);
+  const ideas = await generateCoinIdeas(cluster, 3);
+  for (const idea of ideas) {
+    idea.trend_cluster_id = id;
+    await saveCoinIdea(idea);
+  }
+  if (!ideas.length) { await send(chatId, '❌ Could not generate ideas (may be blocked by risk filter).'); return; }
+  const text = `*🧠 Coin Ideas*\n\n` + ideas.map(fmtIdea).join('\n\n---\n\n');
+  await send(chatId, text.slice(0, 4000), {
+    reply_markup: {
+      inline_keyboard: ideas.map(idea => [
+        { text: `✅ Approve $${idea.ticker}`, callback_data: `approve_idea:${idea.id}` },
+        { text: `❌ Reject`, callback_data: `reject_idea:${idea.id}` },
+      ]),
+    },
+  });
+}));
+
+// /approve_idea <id> or /reject_idea <id>
+bot.onText(/^\/approve_idea(?:@\w+)?\s+(.+)$/, (msg, match) => guard(msg.chat.id, async () => {
+  await updateIdeaStatus(match![1].trim(), 'approved');
+  await send(msg.chat.id, '✅ Idea approved! Ready for launch.');
+}));
+bot.onText(/^\/reject_idea(?:@\w+)?\s+(.+)$/, (msg, match) => guard(msg.chat.id, async () => {
+  await updateIdeaStatus(match![1].trim(), 'rejected');
+  await send(msg.chat.id, '🗑️ Idea rejected.');
+}));
+
+// Callback buttons for approve/reject
+bot.on('callback_query', async (q) => {
+  if (!q.data) return;
+  if (q.data.startsWith('approve_idea:')) {
+    const id = q.data.split(':')[1];
+    await updateIdeaStatus(id, 'approved');
+    bot.answerCallbackQuery(q.id, { text: '✅ Approved!' });
+    bot.sendMessage(q.message!.chat.id, `✅ Idea approved! Use /ideas to see all.`).catch(() => {});
+  }
+  if (q.data.startsWith('reject_idea:')) {
+    const id = q.data.split(':')[1];
+    await updateIdeaStatus(id, 'rejected');
+    bot.answerCallbackQuery(q.id, { text: '❌ Rejected' });
+  }
+});
+
+// /alerts — show recent high-score trends as alerts
+bot.onText(/^\/alerts(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  const chatId = msg.chat.id;
+  const clusters = await getTopClusters(5);
+  const hot = clusters.filter((c: any) => Number(c.final_score) >= 65);
+  if (!hot.length) { await send(chatId, 'No high-score trends right now. Try again later.'); return; }
+  const text = `*🚨 Hot Trends (score ≥ 65)*\n\n` + hot.map(fmtTrend).join('\n\n');
+  await send(chatId, text.slice(0, 4000));
+}));
+
+// Trend engine background worker (every 15 min)
+let trendWorkerRunning = false;
+const TREND_INTERVAL_MS = 15 * 60 * 1000;
+setInterval(async () => {
+  if (trendWorkerRunning) return;
+  trendWorkerRunning = true;
+  try {
+    const clusters = await runTrendCycle(false); // don't auto-generate ideas
+    // Send alert to admin if top cluster score > 75
+    if (ADMIN_ID && clusters.length && clusters[0].final_score >= 75) {
+      const c = clusters[0];
+      const text =
+        `🔥 *New Meme Opportunity*\n\n` +
+        `*Trend:* ${c.main_title}\n\n` +
+        `*Score:* Trend: ${c.trend_score.toFixed(0)}/100 | Meme: ${c.meme_score.toFixed(0)}/100 | Risk: ${c.risk_score.toFixed(0)}/100\n\n` +
+        `*Sources:* ${(c.sources ?? []).join(', ')}\n` +
+        `*Mentions:* ${c.total_mentions}\n\n` +
+        `_Use /idea ${c.id} to generate coin ideas_`;
+      bot.sendMessage(Number(ADMIN_ID), text, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '🧠 Generate Ideas', callback_data: `gen_ideas:${c.id}` },
+          ]],
+        },
+      }).catch(() => {});
+    }
+  } catch (e: any) {
+    log('error', '[trend-worker]', e.message);
+  } finally {
+    trendWorkerRunning = false;
+  }
+}, TREND_INTERVAL_MS);
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 bot.on('polling_error', (err) => log('error', 'polling:', err.message));
