@@ -489,8 +489,8 @@ async function checkAndExecuteSells(walletAddress: string) {
       const newEarlyPeak = Math.max(prevEarlyPeak, currentPriceSol);
       earlyPeakMap.set(mint, newEarlyPeak);
       const earlyStop = newEarlyPeak * (1 - EARLY_TRAIL_PCT);
-      // Only fire if selling above entry+1% — we must be locking a profit, not a loss
-      if (currentPriceSol < earlyStop && earlyStop > refEntry * 1.003) {
+      // Only fire if earlyStop is at least +10% above entry — covers fees and ensures real profit
+      if (currentPriceSol < earlyStop && earlyStop > refEntry * 1.10) {
         const gainPct = ((currentPriceSol / refEntry - 1) * 100).toFixed(1);
         const peakPct = ((newEarlyPeak / refEntry - 1) * 100).toFixed(1);
         console.warn(

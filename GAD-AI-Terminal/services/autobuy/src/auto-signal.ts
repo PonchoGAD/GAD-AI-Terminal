@@ -352,8 +352,8 @@ const RAYDIUM_MIN_PC1H = Number(process.env.RAYDIUM_MIN_PC1H || '1');
 const RAYDIUM_MAX_PC1H = Number(process.env.RAYDIUM_MAX_PC1H || '100');
 // Min 5m price change — require active momentum RIGHT NOW (key entry signal)
 const RAYDIUM_MIN_PC5M = Number(process.env.RAYDIUM_MIN_PC5M || '0.5');
-// Max token age — 14 days covers "rediscovered" pumpers
-const RAYDIUM_MAX_AGE_SEC = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(14 * 24 * 3600));
+// Max token age — 48h: memecoins that haven't pumped in 2 days are usually dead
+const RAYDIUM_MAX_AGE_SEC = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(2 * 24 * 3600));
 // Min token age — 30min prevents buying in the first minutes of Raydium launch
 const RAYDIUM_MIN_AGE_SEC = Number(process.env.RAYDIUM_MIN_AGE_SEC || '1800');
 // Min vol/liq ratio — 8% hourly turnover (from analysis: winners avg vol/mcap=6.5x in 24h)
@@ -379,43 +379,49 @@ export interface LiqTier {
 }
 
 export function getLiqTier(liqUsd: number): LiqTier {
-  // T1 ($18k-$80k): sell 100% at +25%. One shot — no partial selling.
-  // Root cause of prior losses: 2x/5x staged targets were hit for a fraction of a second,
-  // TX executed at 1x due to reversion. Now: lower target, full exit, faster execution.
-  // Tight 5% stop = max loss 0.0025 SOL at 0.05 SOL position.
-  // Tier targets adapt to market regime via env var MARKET_REGIME (BULL/BEAR/SIDEWAYS).
-  // SIDEWAYS/BEAR: lower TP for higher hit rate. BULL: restore aggressive targets.
+  // TP targets must account for the "TP lag" problem: memecoins peak, the sell TX
+  // is submitted, but 5-10 seconds pass before on-chain confirmation. By then the
+  // price can revert 10-20% on thin pools. Setting TP at 1.15x means we trigger at
+  // the peak but execute below entry — confirmed loss pattern from June 2026 data.
+  //
+  // Fix: set TP high enough that even after 10-15% execution slippage + priority fees,
+  // the net received is still above entry.
+  //  0.05 SOL position: fees ~0.003 SOL (6%), sell slippage ~5%, need TP ≥ 1.12× breakeven.
+  //  Target 1.40× → captures at ~1.20-1.25× after reversal → net +15-20%.
+  //
+  // SIDEWAYS (default): conservative targets, higher hit-rate expected on quiet market.
+  // BULL: aggressive targets — memecoins make bigger moves, let winners run.
   const regime = (process.env.MARKET_REGIME ?? 'SIDEWAYS').toUpperCase();
   const isBull = regime === 'BULL' || regime === 'EUPHORIA';
 
   if (liqUsd <= 80000) return {
     tier: 1, label: 't1',
-    timeLimitSec: 1200,    // 20 min — cut losses early on dead tokens
-    stopPct: 0.05,         // 5% stop loss
-    trailPct: 0.08,
-    earlyTrailPct: 0.03,
+    timeLimitSec: 1800,    // 30 min inactivity timer
+    stopPct: 0.08,         // 8% stop — wider to survive early volatility on thin pools
+    trailPct: 0.12,
+    earlyTrailPct: 0.06,   // early trail: lock profits when peak drops 6% (fires ≥ entry+10%)
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.25 : 1.15, sellPct: 100 },
+      { stage: 1, multiplier: isBull ? 1.60 : 1.40, sellPct: 100 },
     ],
   };
   if (liqUsd <= 250000) return {
     tier: 2, label: 't2',
-    timeLimitSec: 1800,    // 30 min
-    stopPct: 0.05,
-    trailPct: 0.08,
-    earlyTrailPct: 0.03,
+    timeLimitSec: 2700,    // 45 min
+    stopPct: 0.07,
+    trailPct: 0.10,
+    earlyTrailPct: 0.05,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.35 : 1.18, sellPct: 100 },
+      { stage: 1, multiplier: isBull ? 1.50 : 1.35, sellPct: 100 },
     ],
   };
   return {
     tier: 3, label: 't3',
-    timeLimitSec: 2400,    // 40 min
-    stopPct: 0.05,
+    timeLimitSec: 3600,    // 60 min — mid-caps need more time
+    stopPct: 0.06,
     trailPct: 0.10,
     earlyTrailPct: 0.04,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.45 : 1.25, sellPct: 100 },
+      { stage: 1, multiplier: isBull ? 1.40 : 1.30, sellPct: 100 },
     ],
   };
 }
@@ -734,7 +740,8 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     const pc5m   = Number(pair.priceChange?.m5  ?? 0);
     const pc6h   = Number(pair.priceChange?.h6  ?? 0);
     const createdAt = pair.pairCreatedAt ? Number(pair.pairCreatedAt) : 0;
-    const ageSec = createdAt > 0 ? (now - createdAt) / 1000 : 999999;
+    // -1 = unknown creation date (DexScreener omits pairCreatedAt for old tokens)
+    const ageSec = createdAt > 0 ? (now - createdAt) / 1000 : -1;
     const mint   = pair.baseToken?.address ?? '';
 
     if (!mint || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) continue;
@@ -748,9 +755,9 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       skipped.liq++; continue;
     }
 
-    // ── Gate 2: Age ──
-    if (ageSec > 0 && (ageSec < RAYDIUM_MIN_AGE_SEC || ageSec > RAYDIUM_MAX_AGE_SEC)) {
-      console.debug(`[raydium-scan] ✗age  ${sym.padEnd(10)} age:${(ageSec/3600).toFixed(1)}h liq:$${liq.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
+    // ── Gate 2: Age — reject unknown-age tokens (too risky, could be ancient) ──
+    if (ageSec < 0 || ageSec < RAYDIUM_MIN_AGE_SEC || ageSec > RAYDIUM_MAX_AGE_SEC) {
+      console.debug(`[raydium-scan] ✗age  ${sym.padEnd(10)} age:${ageSec < 0 ? 'unknown' : (ageSec/3600).toFixed(1)+'h'} liq:$${liq.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
       skipped.age++; continue;
     }
 

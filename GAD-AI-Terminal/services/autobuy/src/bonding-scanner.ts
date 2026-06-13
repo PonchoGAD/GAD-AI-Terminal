@@ -23,6 +23,7 @@ import { query } from '@lib/db';
 const PUMPPORTAL_WS  = 'wss://pumpportal.fun/api/data';
 const PUMPPORTAL_BUY = 'https://pumpportal.fun/api/trade-local';
 const BIRDEYE_BASE   = 'https://public-api.birdeye.so';
+const PUMPFUN_API    = 'https://frontend-api.pump.fun';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -68,6 +69,16 @@ const BONDING_DUMP_RATIO = Number(process.env.BONDING_DUMP_RATIO || '2.5');
 
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY ?? '';
 const SOLANA_RPC      = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.solana.com';
+
+// ─── HOT token poller config (wallet 2) ──────────────────────────────────────
+// Polls pump.fun for recently-traded bonding curve tokens not yet caught by WebSocket.
+// Use case: tokens that launched before the scanner started, or are in the HOT section.
+const BONDING_HOT_ENABLED     = process.env.BONDING_HOT_ENABLED === 'true';
+const BONDING_HOT_INTERVAL_MS = Number(process.env.BONDING_HOT_INTERVAL_SEC || '60') * 1000;
+const BONDING_HOT_MIN_MCAP    = Number(process.env.BONDING_HOT_MIN_MCAP_USD || '8000');
+const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '60000');
+const BONDING_HOT_MIN_AGE_SEC = Number(process.env.BONDING_HOT_MIN_AGE_SEC || '900');  // 15 min
+const BONDING_HOT_MAX_AGE_SEC = Number(process.env.BONDING_HOT_MAX_AGE_SEC || String(4 * 3600)); // 4h
 
 // Live SOL price (updated every 5 min)
 let solPriceUsd = 150;
@@ -121,6 +132,13 @@ function loadPumpFunKeypair(): Keypair | null {
   if (!pk) { console.warn('[bonding-scan] PUMPFUN_WALLET_PRIVATE_KEY not set'); return null; }
   try { return Keypair.fromSecretKey(bs58.decode(pk)); }
   catch { console.error('[bonding-scan] Invalid PUMPFUN_WALLET_PRIVATE_KEY'); return null; }
+}
+
+function loadPumpFunKeypair2(): Keypair | null {
+  const pk = process.env.PUMPFUN_WALLET_PRIVATE_KEY_2;
+  if (!pk) return null;
+  try { return Keypair.fromSecretKey(bs58.decode(pk)); }
+  catch { console.error('[bonding-scan] Invalid PUMPFUN_WALLET_PRIVATE_KEY_2'); return null; }
 }
 
 // ─── Buy/sell via PumpPortal ──────────────────────────────────────────────────
@@ -256,6 +274,8 @@ interface BondingPosition {
 }
 
 const positions = new Map<string, BondingPosition>();
+// Wallet 2 positions (HOT token trades)
+const positions2 = new Map<string, BondingPosition>();
 
 // ─── DexScreener polling watchdog ────────────────────────────────────────────
 
@@ -278,10 +298,10 @@ async function getDSMcapSol(mint: string): Promise<number> {
   }
 }
 
-async function pollBondingPositions(keypair: Keypair, connection: Connection): Promise<void> {
-  if (positions.size === 0) return;
-
-  for (const [mint, pos] of positions.entries()) {
+async function pollBondingPositionsMap(
+  posMap: Map<string, BondingPosition>, keypair: Keypair, connection: Connection
+): Promise<void> {
+  for (const [mint, pos] of posMap.entries()) {
     const lastEvent = lastWsEventAt.get(mint) ?? 0;
     if (Date.now() - lastEvent < 60_000 && lastEvent > 0) continue;
 
@@ -293,10 +313,17 @@ async function pollBondingPositions(keypair: Keypair, connection: Connection): P
     const mult = pos.entryMcapSol > 0 ? mcapSol / pos.entryMcapSol : 1;
 
     console.info(`[bonding-scan] 🔍 POLL ${pos.symbol} ${mult.toFixed(2)}x`);
-    await checkPositionExits(mint, pos, mcapSol, mult, keypair, connection, 'poll');
+    await checkPositionExits(mint, pos, mcapSol, mult, keypair, connection, 'poll', posMap);
     if (wsInstance?.readyState === WebSocket.OPEN) {
       wsInstance.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
     }
+  }
+}
+
+async function pollBondingPositions(keypair: Keypair, connection: Connection): Promise<void> {
+  if (positions.size > 0) await pollBondingPositionsMap(positions, keypair, connection);
+  if (positions2.size > 0 && keypairInstance2 && connectionInstance) {
+    await pollBondingPositionsMap(positions2, keypairInstance2, connectionInstance);
   }
 }
 
@@ -304,12 +331,13 @@ async function pollBondingPositions(keypair: Keypair, connection: Connection): P
 
 async function checkPositionExits(
   mint: string, pos: BondingPosition, mcapSol: number, mult: number,
-  keypair: Keypair, connection: Connection, source: string
+  keypair: Keypair, connection: Connection, source: string,
+  posMap: Map<string, BondingPosition> = positions
 ): Promise<void> {
   // Stop-loss: 17% from entry
   if (mult <= 1 - BONDING_STOP_PCT) {
     console.info(`[bonding-scan] 🔴 STOP ${pos.symbol} ${mult.toFixed(2)}x [${source}] — selling 100%`);
-    positions.delete(mint);
+    posMap.delete(mint);
     await sellOnBondingCurve(mint, 100, keypair, connection);
     return;
   }
@@ -319,7 +347,7 @@ async function checkPositionExits(
     const currentFromPeak = pos.peakMcapSol > 0 ? mcapSol / pos.peakMcapSol : 1;
     if (currentFromPeak <= 1 - MOON_BAG_TRAIL_PCT) {
       console.info(`[bonding-scan] 🌙 TRAIL ${pos.symbol} peak:${pos.peakMcapSol.toFixed(0)} now:${mcapSol.toFixed(0)} — selling moon bag`);
-      positions.delete(mint);
+      posMap.delete(mint);
       await sellOnBondingCurve(mint, 100, keypair, connection);
     }
     return;
@@ -353,6 +381,17 @@ function checkDailyBudget(amount: number): boolean {
     bondingDailyResetAt = Date.now() + 86400_000;
   }
   return bondingDailySpent + amount <= BONDING_MAX_SOL_DAILY;
+}
+
+let bonding2DailySpent = 0;
+let bonding2DailyResetAt = Date.now() + 86400_000;
+
+function checkDailyBudget2(amount: number): boolean {
+  if (Date.now() > bonding2DailyResetAt) {
+    bonding2DailySpent = 0;
+    bonding2DailyResetAt = Date.now() + 86400_000;
+  }
+  return bonding2DailySpent + amount <= BONDING_MAX_SOL_DAILY;
 }
 
 const recentMints = new Set<string>();
@@ -525,45 +564,163 @@ async function onTradeEvent(
     return;
   }
 
-  // ── Update active position ────────────────────────────────────────────────
+  // ── Update active position (wallet 1) ────────────────────────────────────
   const pos = positions.get(mint);
-  if (!pos) return;
-
-  if (txType === 'buy') {
-    if (traderWallet) pos.uniqueBuyers.add(traderWallet);
-    pos.recentBuySol += solAmount;
-  } else if (txType === 'sell') {
-    pos.recentSellSol += solAmount;
+  if (pos) {
+    if (txType === 'buy') {
+      if (traderWallet) pos.uniqueBuyers.add(traderWallet);
+      pos.recentBuySol += solAmount;
+    } else if (txType === 'sell') {
+      pos.recentSellSol += solAmount;
+    }
+    if (Date.now() > pos.windowResetAt) {
+      pos.recentBuySol = 0; pos.recentSellSol = 0;
+      pos.windowResetAt = Date.now() + 90_000;
+    }
+    pos.currentMcapSol = mcapSol;
+    pos.peakMcapSol = Math.max(pos.peakMcapSol, mcapSol);
+    const mult = pos.entryMcapSol > 0 ? mcapSol / pos.entryMcapSol : 1;
+    if (!pos.allTpsDone && pos.recentSellSol > pos.recentBuySol * BONDING_DUMP_RATIO && pos.recentSellSol > 1.0) {
+      console.warn(`[bonding-scan] 🚨 DUMP ${pos.symbol} — exiting`);
+      positions.delete(mint);
+      await sellOnBondingCurve(mint, 100, keypair, connection);
+      return;
+    }
+    const heldSec = (Date.now() - pos.buyTime) / 1000;
+    if (heldSec > 60 && pos.uniqueBuyers.size < 5 && heldSec < 300) {
+      console.warn(`[bonding-scan] 🤖 BOT ${pos.symbol} ${pos.uniqueBuyers.size} buyers — exiting`);
+      positions.delete(mint);
+      await sellOnBondingCurve(mint, 100, keypair, connection);
+      return;
+    }
+    await checkPositionExits(mint, pos, mcapSol, mult, keypair, connection, 'ws', positions);
   }
 
-  if (Date.now() > pos.windowResetAt) {
-    pos.recentBuySol = 0;
-    pos.recentSellSol = 0;
-    pos.windowResetAt = Date.now() + 90_000;
+  // ── Update active position (wallet 2 — HOT tokens) ────────────────────────
+  const pos2 = positions2.get(mint);
+  if (pos2 && keypairInstance2 && connectionInstance) {
+    if (txType === 'buy') { if (traderWallet) pos2.uniqueBuyers.add(traderWallet); pos2.recentBuySol += solAmount; }
+    else if (txType === 'sell') { pos2.recentSellSol += solAmount; }
+    if (Date.now() > pos2.windowResetAt) {
+      pos2.recentBuySol = 0; pos2.recentSellSol = 0;
+      pos2.windowResetAt = Date.now() + 90_000;
+    }
+    pos2.currentMcapSol = mcapSol;
+    pos2.peakMcapSol = Math.max(pos2.peakMcapSol, mcapSol);
+    const mult2 = pos2.entryMcapSol > 0 ? mcapSol / pos2.entryMcapSol : 1;
+    if (!pos2.allTpsDone && pos2.recentSellSol > pos2.recentBuySol * BONDING_DUMP_RATIO && pos2.recentSellSol > 1.0) {
+      console.warn(`[bonding-scan] 🚨 DUMP HOT ${pos2.symbol} — exiting w2`);
+      positions2.delete(mint);
+      await sellOnBondingCurve(mint, 100, keypairInstance2, connectionInstance);
+      return;
+    }
+    await checkPositionExits(mint, pos2, mcapSol, mult2, keypairInstance2, connectionInstance, 'ws', positions2);
   }
 
-  pos.currentMcapSol = mcapSol;
-  pos.peakMcapSol = Math.max(pos.peakMcapSol, mcapSol);
-  const mult = pos.entryMcapSol > 0 ? mcapSol / pos.entryMcapSol : 1;
+  if (!pos && !pos2) return;
+}
 
-  // Dump detection
-  if (!pos.allTpsDone && pos.recentSellSol > pos.recentBuySol * BONDING_DUMP_RATIO && pos.recentSellSol > 1.0) {
-    console.warn(`[bonding-scan] 🚨 DUMP ${pos.symbol} — exiting`);
-    positions.delete(mint);
-    await sellOnBondingCurve(mint, 100, keypair, connection);
-    return;
+// ─── HOT token poller (wallet 2) ─────────────────────────────────────────────
+// Polls pump.fun /coins endpoint every 60s for tokens already in HOT section.
+// These are 15min-4h old tokens with recent trading activity — past initial rug risk.
+// Wallet 1 handles brand-new launches via WebSocket. Wallet 2 handles HOT entries.
+
+async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): Promise<void> {
+  if (!BONDING_HOT_ENABLED) return;
+  try {
+    const r = await axios.get(`${PUMPFUN_API}/coins`, {
+      params: { offset: 0, limit: 50, sort: 'last_trade_timestamp', order: 'DESC', includeNsfw: false },
+      timeout: 8_000,
+    });
+    const coins: any[] = Array.isArray(r.data) ? r.data : [];
+
+    for (const coin of coins) {
+      const mint: string = coin.mint ?? '';
+      if (!mint) continue;
+      if (coin.complete || coin.raydium_pool) continue; // already graduated to Raydium
+      if (recentMints.has(mint) || candidateTokens.has(mint)) continue;
+      if (positions.has(mint) || positions2.has(mint)) continue;
+      if (!checkDailyBudget2(BONDING_BUY_SOL)) break;
+      if (positions2.size >= BONDING_MAX_POSITIONS) break;
+
+      const mcapUsd = Number(coin.usd_market_cap ?? 0);
+      if (mcapUsd < BONDING_HOT_MIN_MCAP || mcapUsd > BONDING_HOT_MAX_MCAP) continue;
+
+      // Must have traded very recently (< 90 seconds ago)
+      const lastTradeTs = Number(coin.last_trade_timestamp ?? 0) * 1000;
+      if (Date.now() - lastTradeTs > 90_000) continue;
+
+      // Token must be in the "safe" age window — past initial bot/sniper phase
+      const createdTs = Number(coin.created_timestamp ?? 0) * 1000;
+      const tokenAgeSec = createdTs > 0 ? (Date.now() - createdTs) / 1000 : 0;
+      if (tokenAgeSec < BONDING_HOT_MIN_AGE_SEC || tokenAgeSec > BONDING_HOT_MAX_AGE_SEC) continue;
+
+      const symbol = (coin.symbol ?? mint.slice(0, 4)).toUpperCase();
+      const name   = coin.name ?? symbol;
+      if (isRugPattern(name, symbol)) continue;
+
+      const mcapSol = mcapUsd / solPriceUsd;
+      if (mcapSol > BONDING_MAX_MCAP_SOL) continue;
+
+      console.info(
+        `[bonding-scan] 🔥 HOT ${symbol} mcap:$${mcapUsd.toFixed(0)} ` +
+        `age:${(tokenAgeSec / 60).toFixed(0)}min — entering w2`
+      );
+
+      recentMints.add(mint);
+      const buyResult = await buyOnBondingCurve(mint, BONDING_BUY_SOL, keypair, connection);
+      if (!buyResult.success) { recentMints.delete(mint); continue; }
+
+      bonding2DailySpent += BONDING_BUY_SOL;
+
+      try {
+        await query(
+          `INSERT INTO autobuy_jobs
+             (mint_address, label, amount_sol, slippage_bps, interval_seconds,
+              autosell_enabled, active, last_tx_signature, bought_at, last_activity_at,
+              total_spent_sol, time_limit_seconds, time_limit_enabled)
+           VALUES ($1,$2,$3,250,60,false,true,$4,now(),now(),$3,$5,true)
+           ON CONFLICT DO NOTHING`,
+          [
+            mint,
+            `auto:bonding:hot:${symbol}:mcap${Math.round(mcapSol)}sol`,
+            BONDING_BUY_SOL, buyResult.txSignature ?? '',
+            BONDING_TIME_LIMIT_SEC,
+          ]
+        );
+      } catch (dbErr: any) {
+        console.warn(`[bonding-scan] HOT DB error ${mint.slice(0, 8)}: ${dbErr.message?.slice(0, 60)}`);
+      }
+
+      positions2.set(mint, {
+        mint, symbol, name,
+        buyTx: buyResult.txSignature ?? '',
+        buyTime: Date.now(),
+        buySol: BONDING_BUY_SOL,
+        entryMcapSol: mcapSol, currentMcapSol: mcapSol, peakMcapSol: mcapSol,
+        tpIndex: 0, allTpsDone: false,
+        uniqueBuyers: new Set(),
+        recentBuySol: 0, recentSellSol: 0,
+        windowResetAt: Date.now() + 90_000,
+      });
+
+      if (wsInstance?.readyState === WebSocket.OPEN) {
+        wsInstance.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
+      }
+
+      setTimeout(async () => {
+        const p = positions2.get(mint);
+        if (!p) return;
+        console.info(`[bonding-scan] ⏱ TIME_LIMIT HOT ${p.symbol} w2 — selling 100%`);
+        positions2.delete(mint);
+        await sellOnBondingCurve(mint, 100, keypair, connection);
+      }, BONDING_TIME_LIMIT_SEC * 1000);
+
+      await new Promise(res => setTimeout(res, 2000)); // rate-limit between HOT entries
+    }
+  } catch (err: any) {
+    console.debug(`[bonding-scan] HOT poll error: ${err.message?.slice(0, 60)}`);
   }
-
-  // Bot pattern: <5 unique buyers after 60s
-  const heldSec = (Date.now() - pos.buyTime) / 1000;
-  if (heldSec > 60 && pos.uniqueBuyers.size < 5 && heldSec < 300) {
-    console.warn(`[bonding-scan] 🤖 BOT ${pos.symbol} ${pos.uniqueBuyers.size} buyers — exiting`);
-    positions.delete(mint);
-    await sellOnBondingCurve(mint, 100, keypair, connection);
-    return;
-  }
-
-  await checkPositionExits(mint, pos, mcapSol, mult, keypair, connection, 'ws');
 }
 
 // ─── WebSocket connection ──────────────────────────────────────────────────────
@@ -572,6 +729,7 @@ let wsInstance: WebSocket | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let running = false;
 let keypairInstance: Keypair | null = null;
+let keypairInstance2: Keypair | null = null;
 let connectionInstance: Connection | null = null;
 
 function connectBondingWS(): void {
@@ -588,7 +746,7 @@ function connectBondingWS(): void {
     console.info('[bonding-scan] ✅ Connected — subscribing new tokens');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
     // Re-subscribe to trades for active positions after reconnect
-    const activeMints = [...positions.keys(), ...candidateTokens.keys()];
+    const activeMints = [...positions.keys(), ...positions2.keys(), ...candidateTokens.keys()];
     if (activeMints.length > 0) {
       setTimeout(() => {
         if (ws.readyState === WebSocket.OPEN) {
@@ -726,11 +884,19 @@ export function startBondingScanner(): void {
   connectionInstance = new Connection(SOLANA_RPC, 'confirmed');
   running = true;
 
+  // Load wallet 2 for HOT token trading
+  const keypair2 = loadPumpFunKeypair2();
+  if (keypair2) {
+    keypairInstance2 = keypair2;
+    console.info(`[bonding-scan] Wallet 2 loaded: ${keypair2.publicKey.toBase58().slice(0, 8)} (HOT tokens)`);
+  }
+
   console.info(
-    `[bonding-scan] Starting — wallet:${keypair.publicKey.toBase58().slice(0, 8)} ` +
+    `[bonding-scan] Starting — wallet1:${keypair.publicKey.toBase58().slice(0, 8)} ` +
     `buy:${BONDING_BUY_SOL} SOL daily:${BONDING_MAX_SOL_DAILY} SOL ` +
     `entry:${BONDING_MIN_BUYERS}+ buyers $${BONDING_MIN_MCAP_USD}+ mcap ` +
-    `stop:${BONDING_STOP_PCT * 100}% TPs:1.5/2/3/5/8x trail:${MOON_BAG_TRAIL_PCT * 100}%`
+    `stop:${BONDING_STOP_PCT * 100}% TPs:1.5/2/3/5/8x trail:${MOON_BAG_TRAIL_PCT * 100}% ` +
+    `HOT:${BONDING_HOT_ENABLED ? `enabled w${keypair2 ? '2' : '1'} every ${BONDING_HOT_INTERVAL_MS / 1000}s` : 'disabled'}`
   );
 
   refreshSolPrice().catch(() => {});
@@ -738,6 +904,13 @@ export function startBondingScanner(): void {
 
   recoverOrphanedPositions(keypair, connectionInstance).catch(() => {});
   setInterval(() => pollBondingPositions(keypair, connectionInstance!).catch(() => {}), DS_POLL_INTERVAL_MS);
+
+  // HOT token poll — use wallet 2 if available, otherwise wallet 1
+  if (BONDING_HOT_ENABLED) {
+    const hotKeypair = keypairInstance2 ?? keypair;
+    setInterval(() => pollHotPumpfunTokens(hotKeypair, connectionInstance!).catch(() => {}), BONDING_HOT_INTERVAL_MS);
+    console.info(`[bonding-scan] HOT poller scheduled every ${BONDING_HOT_INTERVAL_MS / 1000}s`);
+  }
 
   connectBondingWS();
 }
@@ -753,5 +926,5 @@ export function stopBondingScanner(): void {
 }
 
 export function getBondingPositions(): BondingPosition[] {
-  return [...positions.values()];
+  return [...positions.values(), ...positions2.values()];
 }
