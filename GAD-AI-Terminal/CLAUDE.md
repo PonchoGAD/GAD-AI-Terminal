@@ -146,6 +146,28 @@ console.warn('[sell] ...')
   - CapitalManager: 2% risk/trade, x2 leverage ($5-20), 6% daily stop
   - RiskManager: 3s TP/SL/Trail poll, BE trigger at +3%
   - Telegram: /futures /macro /signal /position /capital /ftrades /fclose
+- [x] **Bonding Scanner HOT poller (июнь 2026):** DexScreener-based (pump.fun API недоступен с VPS)
+  - Wallet 1 (CFmHWpmQ): новые токены через WebSocket, buy/sell через PumpPortal `pool: 'pump'`
+  - Wallet 2 (DJ8Tq8vi): HOT токены через DexScreener polling каждые 60с
+  - dexPool routing: `pumpfun` → pool:'pump', `pumpswap` → pool:'pumpswap'
+  - HOT mcap range: $3k-$12k (выше $12k = уже graduated = PumpSwap, другой механизм)
+  - BONDING_BUY_SOL=0.02 SOL везде
+- [x] **3-wallet $GADAI launch script:** `scripts/launch-gadai.ts`
+  - W1 (WALLET_PRIVATE_KEY = EL4mS7Xg): создаёт токен + dev buy 0.15 SOL
+  - W2 (PUMPFUN_WALLET_PRIVATE_KEY = CFmHWpmQ): organic buy 0.08 SOL через +12 мин
+  - W3 (PUMPFUN_WALLET_PRIVATE_KEY_2 = DJ8Tq8vi): organic buy 0.04 SOL через +28 мин
+  - Логотип: `scripts/gadai_logo.png` (Pepe в GAD Terminal худи — нужно сохранить вручную)
+  - Запуск: `npx ts-node -p tsconfig.launch.json scripts/launch-gadai.ts`
+
+---
+
+## Кошельки (июнь 2026)
+
+| Кошелёк | Адрес | Роль | Баланс (13.06.26) |
+|---|---|---|---|
+| W1 WALLET_PRIVATE_KEY | EL4mS7Xg | Главный/казна/dev launch | 0.2973 SOL |
+| W2 PUMPFUN_WALLET_PRIVATE_KEY | CFmHWpmQ | Bonding WebSocket + organic buy 2 | 0.2671 SOL |
+| W3 PUMPFUN_WALLET_PRIVATE_KEY_2 | DJ8Tq8vi | HOT poller (wallet 2) + organic buy 3 | 0.1354 SOL |
 
 ---
 
@@ -155,9 +177,9 @@ console.warn('[sell] ...')
 - [ ] **Metadata enrichment** — tokens.symbol/name остаются NULL
 - [ ] **ANTHROPIC_API_KEY** в VPS .env — нужен для trend-engine AI генерации идей
 - [ ] **Migration 011** применить на VPS: `docker compose exec -T postgres psql -U gad -d gad_ai < migrations/011_trend_engine.sql`
-- [ ] **Migration 012** применить на VPS (futures): `docker compose exec -T postgres psql -U gad -d gad_ai < migrations/012_futures.sql` ← уже применена!
 - [ ] **Health checks** для scanner, telegram, autobuy, whale-tracker
 - [ ] **Futures LIVE MODE:** отключён по умолчанию (FUTURES_LIVE_MODE=false → paper trading). Для real Drift Protocol включить через .env + депозит USDC на Drift аккаунт
+- [ ] **PumpSwap graduated token sells** — HOT токены > $12k mcap нужно продавать через Jupiter, не PumpPortal. Сейчас ограничено max $12k в HOT poller.
 
 ### ВАЖНО
 - [ ] **Unit-тесты** для rug, gad-score, narrative, survival, dna, social, lifecycle, regime
@@ -199,6 +221,16 @@ console.warn('[sell] ...')
 **Решение:** `RAYDIUM_MAX_BUY_SELL_RATIO=3.5` — отклонять токены с аномально высоким соотношением.
 **Почему:** Gaejuki: B/S 5.82x при цене -76% = pump&dump (накачка объёма, дамп дева). RESERVE: 5.7x (24ч) → 0.58x (1ч) = большой памп уже прошёл. Здоровое накопление = 1.2-1.8x.
 **Данные:** Все 10 победителей имели B/S 1.1-1.6x в здоровой фазе.
+
+### 2026-06 — Bonding HOT poller: pump.fun API → DexScreener + dexPool routing
+**Решение:** HOT poller переключён с `frontend-api.pump.fun/coins` на DexScreener поиск (`dexId='pumpfun'|'pumpswap'`).
+**Почему:** pump.fun API возвращает Cloudflare 530 с VPS IP. DexScreener доступен. Плюс добавлен `dexPool` в BondingPosition — при продаже используется тот же pool что при покупке.
+**Ключевое:** HOT mcap ограничен $3k-$12k. Всё что выше $12k уже graduated к PumpSwap — для таких нужен Jupiter (не реализовано). `buyOnBondingCurve`/`sellOnBondingCurve` принимают `pool: string` — передаётся из `coin.dexPool`.
+
+### 2026-06 — $GADAI 3-wallet launch strategy
+**Решение:** Последовательная покупка тремя кошельками с задержкой, разные суммы.
+**Почему:** Параллельные покупки одинаковыми суммами выглядят скоординировано → детектируются как wash trading, токен могут заблокировать в трекерах.
+**Правило:** W1 (dev) держит 2-4ч minimum; W2 выходит на 5-6x; W3 выходит на 3-4x. Dev sells last = доверие комьюнити.
 
 ### 2026-06 — isJupiterOnly флаг в claimAndSell
 **Решение:** Raydium токены (`auto:raydium_scan:*`) имеют `isJupiterOnly=true` → PumpPortal fallback заблокирован.
@@ -247,15 +279,27 @@ RAYDIUM_MAX_PC1H=80
 RAYDIUM_MIN_PC5M=1
 RAYDIUM_MIN_VOL_LIQ_RATIO=0.08  # 8% hourly vol/liq (код дефолт)
 RAYDIUM_MAX_BUY_SELL_RATIO=3.5  # wash trading filter
+RAYDIUM_MAX_AGE_SEC=172800      # 48 часов max (было 21 день!)
 
-# Sell параметры:
-STOP_LOSS_PCT=8                 # глобальный стоп (per-tier = 5%)
+# Sell параметры (Raydium scheduler):
+STOP_LOSS_PCT=8                 # глобальный стоп
 TRAIL_PCT=12
 EARLY_TRAIL_PCT=4
 
-# Slippage:
-# AUTOSELL_SLIPPAGE_BPS=500
-# AUTOSELL_SLIPPAGE_RETRY_BPS=1000
+# Bonding Scanner:
+BONDING_SCANNER_ENABLED=true
+BONDING_BUY_SOL=0.02            # 0.02 SOL позиция (изменено с 0.03)
+BONDING_MAX_SOL_DAILY=0.3
+BONDING_MIN_BUYERS=50           # мин уникальных покупателей (было 20 → потери!)
+BONDING_MIN_DEV_BUY=0.5         # мин SOL dev купил
+BONDING_HOT_ENABLED=true        # HOT poller через DexScreener
+BONDING_HOT_INTERVAL_SEC=60     # каждые 60 секунд
+
+# Кошельки:
+# PUMPFUN_WALLET_ADDRESS=CFmHWpmQ...   (wallet 1 — bonding WebSocket)
+# PUMPFUN_WALLET_PRIVATE_KEY=...
+# PUMPFUN_WALLET_ADDRESS_2=DJ8Tq8vi... (wallet 2 — HOT poller)
+# PUMPFUN_WALLET_PRIVATE_KEY_2=673dGwkz... (добавлен 13.06.2026)
 
 # Birdeye:
 BIRDEYE_MIN_HOLDERS=70

@@ -142,7 +142,7 @@ async function launch() {
   // ── Step 1: Upload metadata to PumpPortal IPFS ─────────────────────────────
   const logoPath = process.env.GADAI_LOGO_PATH
     ?? process.argv.find(a => a.endsWith('.png'))
-    ?? '/tmp/gadai_logo.png';
+    ?? path.join(__dirname, 'gadai_logo.png');
 
   if (!fs.existsSync(logoPath)) {
     console.error(`❌ Logo not found at ${logoPath}`);
@@ -163,7 +163,9 @@ async function launch() {
 
   const ipfsResp = await axios.post(PUMPPORTAL_IPFS, form, {
     headers: form.getHeaders(),
-    timeout: 30_000,
+    maxBodyLength: Infinity,   // required for large PNG files
+    maxContentLength: Infinity,
+    timeout: 60_000,
   });
 
   const metadataUri: string = ipfsResp.data?.metadataUri;
