@@ -7,6 +7,7 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
+    "ignoreDeprecations": "5.0",
     "baseUrl": "/app",
     "paths": {
       "@lib/*": ["libs/*/src"]
