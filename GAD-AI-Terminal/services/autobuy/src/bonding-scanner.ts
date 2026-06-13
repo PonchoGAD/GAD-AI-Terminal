@@ -627,6 +627,7 @@ async function onTradeEvent(
 
 async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): Promise<void> {
   if (!BONDING_HOT_ENABLED) return;
+  try {
   // pump.fun API is Cloudflare-protected from VPS IPs (530 error).
   // Use DexScreener search filtered to pumpfun/pumpswap DEX instead.
   const DEXSCREENER = 'https://api.dexscreener.com/latest/dex';
