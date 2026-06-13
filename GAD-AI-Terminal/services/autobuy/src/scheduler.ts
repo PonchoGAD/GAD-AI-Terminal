@@ -784,40 +784,56 @@ async function runBuyCycle() {
       // Verify actual on-chain balance — Jupiter quote ≠ what wallet received
       // (token transfer fees, max-wallet limits, etc. can reduce actual amount)
       let actualTokensReceived = result.outputAmountRaw ?? 0n;
+      // Entry price in SOL per READABLE token — must match DexScreener priceNative units.
+      // Old bug: dividing SOL by base-unit count produced SOL/base-unit (10^9× smaller than
+      // priceNative), making every TP target fire immediately on the first price check.
+      let actualEntryReadable: number | null = null;
+      let zeroBal = false;
       try {
         await new Promise(r => setTimeout(r, 2000)); // wait 2s for chain to finalize
         const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
           keypair.publicKey,
           { mint: new PublicKey(job.mint_address) }
         );
-        const onChainBalance = BigInt(
-          (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
-        );
+        const parsedInfo = (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info;
+        const onChainBalance = BigInt(parsedInfo?.tokenAmount?.amount ?? '0');
+        // uiAmount = human-readable token balance (base units / 10^decimals)
+        const uiAmount = Number(parsedInfo?.tokenAmount?.uiAmount ?? 0);
         if (onChainBalance === 0n) {
-          console.warn(`[autobuy] ⚠️ ${tag} — TX sent but 0 tokens in wallet. Marking as failed.`);
-          await markBuyError(job.id, 'zero-balance: tokens not received on-chain', job.interval_seconds);
-          continue;
-        }
-        if (onChainBalance !== actualTokensReceived) {
-          console.warn(`[autobuy] Balance mismatch: expected ${actualTokensReceived}, got ${onChainBalance}`);
-          actualTokensReceived = onChainBalance;
+          zeroBal = true;
+        } else {
+          if (onChainBalance !== actualTokensReceived) {
+            console.warn(`[autobuy] Balance mismatch: expected ${actualTokensReceived}, got ${onChainBalance}`);
+            actualTokensReceived = onChainBalance;
+          }
+          // SOL per readable token — same unit as DexScreener priceNative
+          actualEntryReadable = uiAmount > 0 ? Number(job.amount_sol) / uiAmount : null;
         }
       } catch (balErr: any) {
-        console.warn(`[autobuy] Balance check error (using quote): ${balErr.message}`);
+        console.warn(`[autobuy] Balance check error — fetching entry price from DexScreener: ${balErr.message}`);
+        // Fallback: use current market price as entry estimate (close enough for TP/SL)
+        const dsPrice = await getPriceSolViaDS(job.mint_address);
+        actualEntryReadable = dsPrice > 0 ? dsPrice : null;
       }
 
-      console.info(`[autobuy] ✅ Bought ${tag} — tokens: ${actualTokensReceived} tx: ${result.txSignature}`);
-      const actualEntry = actualTokensReceived > 0n
-        ? Number(job.amount_sol) / Number(actualTokensReceived)
-        : (result.entryPriceSol ?? null);
+      if (zeroBal) {
+        console.warn(`[autobuy] ⚠️ ${tag} — TX sent but 0 tokens in wallet. Marking as failed.`);
+        await markBuyError(job.id, 'zero-balance: tokens not received on-chain', job.interval_seconds);
+        continue;
+      }
+
+      console.info(
+        `[autobuy] ✅ Bought ${tag} — tokens: ${actualTokensReceived} ` +
+        `entry: ${actualEntryReadable?.toExponential(4) ?? 'unknown'} SOL/tok tx: ${result.txSignature}`
+      );
       await markBuySuccess(
         job.id, Number(job.amount_sol), result.txSignature, job.interval_seconds,
-        actualEntry, actualTokensReceived
+        actualEntryReadable, actualTokensReceived
       );
-      if (job.autosell_enabled && actualTokensReceived > 0n && actualEntry) {
+      if (job.autosell_enabled && actualTokensReceived > 0n && actualEntryReadable) {
         await createSellStages(
           job.id, job.mint_address, keypair.publicKey.toBase58(),
-          actualEntry, actualTokensReceived, job.label
+          actualEntryReadable, actualTokensReceived, job.label
         );
       }
     } else {

@@ -623,6 +623,53 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     }
   }
 
+  // Source 5: Birdeye trending tokens — high-volume Solana tokens with real momentum.
+  // Uses the same BIRDEYE_API_KEY as holder checks. Skip if no key configured.
+  if (BIRDEYE_API_KEY) {
+    try {
+      const birdR = await axios.get(
+        'https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20&min_liquidity=5000',
+        {
+          headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' },
+          timeout: 6_000,
+        }
+      );
+      const birdTokens: any[] = birdR.data?.data?.tokens ?? birdR.data?.data ?? [];
+      const birdMints: string[] = birdTokens
+        .filter((t: any) => t.address && !seen.has(t.address))
+        .map((t: any) => t.address as string)
+        .slice(0, 20);
+
+      if (birdMints.length > 0) {
+        const chunks: string[][] = [];
+        for (let i = 0; i < birdMints.length; i += 10) chunks.push(birdMints.slice(i, i + 10));
+        let birdAdded = 0;
+        for (const chunk of chunks) {
+          try {
+            const pr = await axios.get(
+              `https://api.dexscreener.com/latest/dex/tokens/${chunk.join(',')}`,
+              { timeout: 6_000 }
+            );
+            const pairs: any[] = pr.data?.pairs ?? [];
+            for (const p of pairs) {
+              if (p.chainId !== 'solana') continue;
+              if (!JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')) continue;
+              const mint = p.baseToken?.address;
+              if (!mint || seen.has(mint)) continue;
+              seen.add(mint);
+              results.push(p);
+              birdAdded++;
+            }
+            await new Promise(r => setTimeout(r, 300));
+          } catch { /* skip chunk */ }
+        }
+        if (birdAdded > 0) console.debug(`[raydium-scan] Birdeye trending: ${birdAdded} new Raydium pairs`);
+      }
+    } catch (e: any) {
+      console.debug(`[raydium-scan] Birdeye trending error: ${e.message?.slice(0, 50)}`);
+    }
+  }
+
   const dxCount = results.length - raydiumDexCount;
   console.debug(`[raydium-scan] total: ${results.length} unique candidates (${raydiumDexCount} raydium-dex + ${dxCount} dx)`);
   return results;
