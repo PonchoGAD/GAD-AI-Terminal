@@ -501,7 +501,65 @@ async function fetchRaydiumPairs(): Promise<any[]> {
   const seen = new Set<string>();
   const results: any[] = [];
 
-  // Source 1: GeckoTerminal trending pools pages 2-4.
+  // Source 0: GeckoTerminal new_pools — freshest Solana Raydium pools (pump.fun graduates + new launches).
+  // PRIMARY discovery channel: tokens 0-6h old, actively building price history.
+  // geckoPoolToPair() already filters to Raydium/Orca/Meteora only — no pump.fun.
+  let newPoolCount = 0;
+  for (let page = 1; page <= 3; page++) {
+    try {
+      const r = await axios.get(
+        `${GECKO_BASE}/networks/solana/new_pools?page=${page}&include=base_token,dex`,
+        { headers: GECKO_HEADERS, timeout: 8_000 }
+      );
+      const pools: any[] = r.data?.data ?? [];
+      for (const pool of pools) {
+        const pair = geckoPoolToPair(pool);
+        if (!pair) continue;
+        const mint = pair.baseToken?.address;
+        if (!mint || seen.has(mint)) continue;
+        seen.add(mint);
+        results.push(pair);
+        newPoolCount++;
+      }
+      await new Promise(r => setTimeout(r, 400));
+    } catch (e: any) {
+      const status = (e as any).response?.status ?? (e as any).code;
+      console.debug(`[raydium-scan] GeckoTerminal new_pools page ${page}: ${status ?? (e as any).message?.slice(0, 30)}`);
+      break;
+    }
+  }
+  if (newPoolCount > 0) console.debug(`[raydium-scan] GeckoTerminal new_pools p1-3: ${newPoolCount} Raydium/Orca pairs`);
+
+  // Source 1: DexScreener token-profiles/latest — freshly launched tokens with community profiles.
+  // These are brand-new tokens someone just added a profile for — high community engagement signal.
+  try {
+    const profR = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
+    const profiles: any[] = Array.isArray(profR.data) ? profR.data : [];
+    const solMints = profiles
+      .filter((p: any) => p.chainId === 'solana' && p.tokenAddress)
+      .map((p: any) => p.tokenAddress as string)
+      .filter((m: string) => !seen.has(m))
+      .slice(0, 30);
+    if (solMints.length > 0) {
+      const pairR = await axios.get(`${DEXSCREENER_BASE}/tokens/${solMints.join(',')}`, { timeout: 8_000 });
+      const pairs: any[] = pairR.data?.pairs ?? [];
+      let added = 0;
+      for (const p of pairs) {
+        if (p.chainId !== 'solana') continue;
+        if (!JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')) continue;
+        const mint = p.baseToken?.address;
+        if (!mint || seen.has(mint)) continue;
+        seen.add(mint);
+        results.push(p);
+        added++;
+      }
+      if (added > 0) console.debug(`[raydium-scan] DexScreener token-profiles: ${added} Raydium pairs from ${solMints.length} new tokens`);
+    }
+  } catch (e: any) {
+    console.debug(`[raydium-scan] token-profiles error: ${(e as any).message?.slice(0, 40)}`);
+  }
+
+  // Source 2: GeckoTerminal trending pools pages 2-4.
   // Page 1 is already consumed by the scanner service — we use pages 2-4 to avoid collision.
   // trending_pools = sorted by vol/liq momentum score = high-signal actionable entries.
   // geckoPoolToPair() filters to Raydium/Orca/Meteora/Lifinity only; skips pump.fun etc.
@@ -622,8 +680,8 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     }
   }
 
-  const dxCount = results.length - geckoCount;
-  console.debug(`[raydium-scan] total: ${results.length} unique candidates (${geckoCount} gecko + ${dxCount} dx)`);
+  const dxCount = results.length - geckoCount - newPoolCount;
+  console.debug(`[raydium-scan] total: ${results.length} unique candidates (${newPoolCount} new_pools + ${geckoCount} trending + ${dxCount} dx)`);
   return results;
 }
 
