@@ -1,16 +1,14 @@
 /**
  * Graduation Scanner
  *
- * Monitors PumpPortal WebSocket for bonding curve completions (migrations to Raydium).
+ * Monitors PumpPortal WebSocket for bonding curve completions (migrations to PumpSwap/Raydium).
  * When a token graduates from pump.fun bonding curve:
- *  1. Wait GRAD_DELAY_MS (default 45s) for Raydium LP to be indexed by DexScreener
+ *  1. Wait GRAD_DELAY_MS (default 45s) for DEX pool to be indexed by DexScreener
  *  2. Verify: liq > $10k, active trading (buys5m >= 3), not dumping (pc5m > -5%)
- *  3. Create autobuy job via Jupiter (Raydium pool guaranteed)
+ *  3. Create autobuy job via Jupiter (routes through PumpSwap or Raydium)
  *
- * Why graduates are excellent signals:
- *  - Survived bonding curve = community proven demand (~$12k raised)
- *  - Fresh Raydium listing = price discovery phase, room to 2-10x
- *  - Real-time detection via WebSocket (sub-second latency vs 120s HTTP scan)
+ * NOTE: pump.fun now graduates primarily to PumpSwap (not Raydium).
+ * Jupiter supports PumpSwap routing, so this scanner handles both.
  */
 
 import WebSocket from 'ws';
@@ -35,7 +33,8 @@ const GRAD_MIN_BUYS_5M = Number(process.env.GRAD_MIN_BUYS_5M || '3');
 // Skip if dumping immediately after graduation
 const GRAD_MIN_PC5M = Number(process.env.GRAD_MIN_PC5M || '-5');
 
-const JUPITER_DEX_IDS = ['raydium', 'orca', 'meteora', 'lifinity'];
+// PumpSwap is pump.fun's own AMM — where most tokens graduate now. Jupiter routes through it.
+const JUPITER_DEX_IDS = ['raydium', 'orca', 'meteora', 'lifinity', 'pumpswap'];
 const SKIP_MINTS = new Set([
   'So11111111111111111111111111111111111111112',
   'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',

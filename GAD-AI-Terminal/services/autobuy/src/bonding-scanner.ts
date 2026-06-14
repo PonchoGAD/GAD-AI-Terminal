@@ -1250,44 +1250,47 @@ async function pollGraduationHunterTokens(keypair: Keypair, connection: Connecti
 
 async function pollPumpswapTokens(keypair: Keypair, connection: Connection): Promise<void> {
   try {
-    const DEXSCREENER = 'https://api.dexscreener.com/latest/dex';
     const seen = new Set<string>();
     const candidates: any[] = [];
 
-    // Token profiles often includes fresh pumpswap graduates
+    // Primary: DexScreener latest pairs for pumpswap DEX (most recently created first)
     try {
-      const profR = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
-      const mints: string[] = ((Array.isArray(profR.data) ? profR.data : []) as any[])
-        .filter((p: any) => p.chainId === 'solana' && p.tokenAddress && !seen.has(p.tokenAddress))
-        .map((p: any) => { seen.add(p.tokenAddress); return p.tokenAddress; })
-        .slice(0, 30);
-      if (mints.length > 0) {
-        const pr = await axios.get(`${DEXSCREENER}/tokens/${mints.join(',')}`, { timeout: 6_000 });
-        for (const p of (pr.data?.pairs ?? []) as any[]) {
-          if (p.chainId !== 'solana') continue;
-          if ((p.dexId ?? '').toLowerCase() !== 'pumpswap') continue;
-          const m = p.baseToken?.address;
-          if (!m || seen.has(m)) continue;
-          seen.add(m);
-          candidates.push(p);
-        }
+      const r = await axios.get(
+        'https://api.dexscreener.com/latest/dex/pairs/solana/pumpswap',
+        { timeout: 7_000 }
+      );
+      for (const p of (r.data?.pairs ?? []) as any[]) {
+        if (p.chainId !== 'solana') continue;
+        const m = p.baseToken?.address;
+        if (!m || seen.has(m)) continue;
+        seen.add(m);
+        candidates.push(p);
       }
     } catch { /* fail-open */ }
 
-    // Also search directly for pumpswap pairs
-    for (const q of ['pumpswap graduated', 'sol new pump']) {
+    // Fallback: token profiles that may include fresh pumpswap graduates
+    if (candidates.length < 10) {
       try {
-        const r = await axios.get(`${DEXSCREENER}/search?q=${encodeURIComponent(q)}`, { timeout: 5_000 });
-        for (const p of (r.data?.pairs ?? []) as any[]) {
-          if (p.chainId !== 'solana') continue;
-          if ((p.dexId ?? '').toLowerCase() !== 'pumpswap') continue;
-          const m = p.baseToken?.address;
-          if (!m || seen.has(m)) continue;
-          seen.add(m);
-          candidates.push(p);
+        const profR = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
+        const mints: string[] = ((Array.isArray(profR.data) ? profR.data : []) as any[])
+          .filter((p: any) => p.chainId === 'solana' && p.tokenAddress && !seen.has(p.tokenAddress))
+          .map((p: any) => { seen.add(p.tokenAddress); return p.tokenAddress; })
+          .slice(0, 20);
+        if (mints.length > 0) {
+          const pr = await axios.get(
+            `https://api.dexscreener.com/latest/dex/tokens/${mints.join(',')}`,
+            { timeout: 6_000 }
+          );
+          for (const p of (pr.data?.pairs ?? []) as any[]) {
+            if (p.chainId !== 'solana') continue;
+            if ((p.dexId ?? '').toLowerCase() !== 'pumpswap') continue;
+            const m = p.baseToken?.address;
+            if (!m || seen.has(m)) continue;
+            seen.add(m);
+            candidates.push(p);
+          }
         }
-        await new Promise(res => setTimeout(res, 300));
-      } catch { /* skip */ }
+      } catch { /* fail-open */ }
     }
 
     let psLiq = 0, psAge = 0, psMom = 0;
