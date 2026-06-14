@@ -146,12 +146,18 @@ console.warn('[sell] ...')
   - CapitalManager: 2% risk/trade, x2 leverage ($5-20), 6% daily stop
   - RiskManager: 3s TP/SL/Trail poll, BE trigger at +3%
   - Telegram: /futures /macro /signal /position /capital /ftrades /fclose
-- [x] **Bonding Scanner HOT poller (июнь 2026):** DexScreener-based (pump.fun API недоступен с VPS)
-  - Wallet 1 (CFmHWpmQ): новые токены через WebSocket, buy/sell через PumpPortal `pool: 'pump'`
-  - Wallet 2 (DJ8Tq8vi): HOT токены через DexScreener polling каждые 60с
-  - dexPool routing: `pumpfun` → pool:'pump', `pumpswap` → pool:'pumpswap'
-  - HOT mcap range: $3k-$12k (выше $12k = уже graduated = PumpSwap, другой механизм)
-  - BONDING_BUY_SOL=0.02 SOL везде
+- [x] **Bonding Scanner MOVERS poller (14.06.2026, обновлено):** DexScreener-based (pump.fun API недоступен с VPS)
+  - Стратегия переименована: HOT (15min-4h) → **MOVERS** (90s-8min): ловим на старте движения
+  - Wallet W3 (DJ8Tq8vi): DexScreener polling каждые **20с** (было 60с)
+  - mcap range: **$500-$6k** (было $3k-$8k) — pre-pump stage
+  - Фильтры: buys5m≥5 (было 15), vol5m≥$300 (было $1500), **pc5m 5-30%** (было 2-6%), bsRatio≥1.5
+  - Добавлен vol momentum check: vol5m/vol1h ≥ 25% для токенов старше 5min
+  - TP levels: [1.5x/60%, 2.5x/30%, 5x/10%] (было [1.25x/30%, 1.7/25%, 2.5/20%, 4/15%, 7/10%])
+  - Stop-loss: 10% (было 12%), Trail stop: 15% (было 20%), Time limit: 120s (было 300s)
+  - WebSocket теперь ВСЕГДА подключён (даже в HOT-only mode) для real-time продаж
+  - DB: накапливает total_sold_sol на КАЖДОЙ продаже (TP + final), не только на 100% продаже
+  - Position poll: 10s (было 30s) — быстрее реагирует на цену
+  - Label в DB: `auto:bonding:mover:SYMBOL:pool:mcapXsol`
 - [x] **3-wallet launch scripts (рабочий паттерн — июнь 2026):**
   - Рабочий подход: **Pinata IPFS** (не pump.fun/pumpportal IPFS!) + **pumpdotfun-sdk** createAndBuy + PumpPortal trade-local для buy
   - PumpPortal `action:'create'` в trade-local **НЕ РАБОТАЕТ** (400 Bad Request). Только SDK!
@@ -324,20 +330,26 @@ console.warn('[sell] ...')
 **Ключевое правило:** Никогда не делать fallback `Transaction.from()` после `VersionedTransaction.deserialize()`. PumpPortal возвращает только versioned TX.
 
 ### 2026-06 — HOT-only mode (14.06.2026)
-**Решение:** `BONDING_SCANNER_ENABLED=false` + `BONDING_HOT_ENABLED=true` → запускает только HOT poller без WebSocket scanner.
-**Почему W2 (CFmHWpmQ) выключен:** WebSocket scanner покупал слишком агрессивно новые токены без достаточной ликвидности. Фокус на HOT поллере с более строгими фильтрами.
-**HOT-only flow:** `startBondingScanner()` теперь поддерживает запуск без WebSocket. `baseKeypair = hotKeypairRaw` (W3) если W2 не нужен.
+**Решение:** `BONDING_SCANNER_ENABLED=false` + `BONDING_HOT_ENABLED=true` → запускает только поллер без WebSocket scanner.
+**Почему W2 выключен:** WebSocket scanner покупал агрессивно новые токены без ликвидности. Фокус на поллере с фильтрами.
+**Важно:** WebSocket теперь ВСЕГДА подключён (`connectBondingWS()` вызывается независимо от wsEnabled) — нужен для real-time продаж позиций по TP/стоп. `wsNewTokenEnabled` флаг управляет subscribeNewToken отдельно от соединения.
 
-### 2026-06 — HOT поллер: строгие фильтры v2 (14.06.2026)
-**Проблема v1:** Старые фильтры (`buys5m >= 8`, `vol5m >= $500`, `pc5m >= 0`) не предотвращали покупку топов. DexScreener данные лагают 30-60с → pc5m +15% = памп уже прошёл.
-**Фиксы v2:**
-- `buys5m >= 10` (вместо 8)
-- `vol5m >= $800` (вместо $500)
-- `pc5m >= 1% И pc5m <= 8%` — избегать и дампы (0%) и уже перегретые (+15%+)
-- `B/S ratio = buys5m/sells5m >= 1.5` — buyers должны превышать sellers в ТЕКУЩЕМ окне
-- `max mcap $8k` (вместо $12k) — покупать раньше на кривой
-- `stop 12%` (вместо 17%) — быстрее выходить из неудачных позиций
-- `time limit 300s` (вместо 600s) — 5 мин max холдинг
+### 2026-06 — MOVERS стратегия (14.06.2026, финальная версия)
+**Проблема HOT стратегии:** Токены 15min-4h = уже пампанули. DexScreener лаг 30-60с означал покупку после пика.
+**Решение — MOVERS:** Ловить токены на СТАРТЕ движения (90с-8min), не после.
+**Фильтры MOVERS:**
+- Возраст: 90с-8min (ловим начало движения, не хвост)
+- mcap: $500-$6k (pre-pump stage, на кривой)
+- pc5m: **5-30%** — резкое ценовое движение СЕЙЧАС (не 2-6% "тепловатый")
+- buys5m: 5+ (ранний сигнал), vol5m: $300+ (реальные деньги)
+- B/S ratio: 1.5+ (покупатели доминируют)
+- vol momentum: vol5m/vol1h ≥ 25% для токенов >5min (активность сейчас, не старый объём)
+**TP стратегия:**
+- 1.5x → продать 60% (lock profit на spike)
+- 2.5x → продать 30% (если продолжает расти)
+- 5x → продать 10% (moon bag)
+- Trail stop 15% от ATH, stop-loss 10%, time limit 120s
+**Почему агрессивные TP:** Bonding curve movers делают spike за 60-120 секунд и откатываются.
 
 ### 2026-06 — Паттерн запуска токенов на pump.fun (рабочий)
 **Решение:** Pinata IPFS для метадаты + `pumpdotfun-sdk.createAndBuy()` для создания + PumpPortal `trade-local action:'buy'` для покупок.
