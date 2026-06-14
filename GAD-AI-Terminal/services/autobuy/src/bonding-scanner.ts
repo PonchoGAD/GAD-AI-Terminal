@@ -77,12 +77,23 @@ const SOLANA_RPC      = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.sola
 // Use case: tokens that launched before the scanner started, or are in the HOT section.
 const BONDING_HOT_ENABLED     = process.env.BONDING_HOT_ENABLED === 'true';
 const BONDING_HOT_INTERVAL_MS = Number(process.env.BONDING_HOT_INTERVAL_SEC || '60') * 1000;
-// Max mcap $8k — keep well below $12k graduation threshold where liquidity is thin.
-// Near-graduation tokens have steep bonding curve → tiny sells cause huge price drops.
+// Max mcap $18k — updated ceiling for HOT tokens
 const BONDING_HOT_MIN_MCAP    = Number(process.env.BONDING_HOT_MIN_MCAP_USD || '3000');
-const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '8000');
+const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '18000');
 const BONDING_HOT_MIN_AGE_SEC = Number(process.env.BONDING_HOT_MIN_AGE_SEC || '900');  // 15 min
 const BONDING_HOT_MAX_AGE_SEC = Number(process.env.BONDING_HOT_MAX_AGE_SEC || String(4 * 3600)); // 4h
+
+// NEW token poller — catches tokens 1-14 min old before they become HOT
+// Earlier stage = higher risk, smaller position, tighter limits
+const BONDING_NEW_ENABLED      = process.env.BONDING_NEW_ENABLED === 'true';
+const BONDING_NEW_INTERVAL_MS  = Number(process.env.BONDING_NEW_INTERVAL_SEC || '30') * 1000;
+const BONDING_NEW_BUY_SOL      = Number(process.env.BONDING_NEW_BUY_SOL      || '0.01');
+const BONDING_NEW_MIN_AGE_SEC  = Number(process.env.BONDING_NEW_MIN_AGE_SEC  || '60');   // 1 min min
+const BONDING_NEW_MAX_AGE_SEC  = Number(process.env.BONDING_NEW_MAX_AGE_SEC  || '840');  // 14 min max
+const BONDING_NEW_MIN_MCAP     = Number(process.env.BONDING_NEW_MIN_MCAP_USD || '500');
+const BONDING_NEW_MAX_MCAP     = Number(process.env.BONDING_NEW_MAX_MCAP_USD || '5000');
+const BONDING_NEW_TIME_LIMIT   = Number(process.env.BONDING_NEW_TIME_LIMIT_SEC || '120'); // 2 min max hold
+const BONDING_NEW_STOP_PCT     = Number(process.env.BONDING_NEW_STOP_PCT     || '0.08'); // 8% stop
 
 // Live SOL price (updated every 5 min)
 let solPriceUsd = 150;
@@ -716,25 +727,24 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
       const pc5m    = Number(coin.pc5m    ?? 0);
       const bsRatio = sells5m > 0 ? buys5m / sells5m : buys5m;
 
-      // Min 10 buy txns in last 5m (real interest, not just dev)
-      if (buys5m < 10) {
-        console.debug(`[bonding-scan] ✗hot ${symbol} buys5m:${buys5m} (min 10)`);
+      // Min 20 buy txns in last 5m (real crowd interest, not just dev+bots)
+      if (buys5m < 20) {
+        console.debug(`[bonding-scan] ✗hot ${symbol} buys5m:${buys5m} (min 20)`);
         continue;
       }
-      // Min $800 vol in 5m (real capital, not micro-trades)
-      if (vol5m < 800) {
-        console.debug(`[bonding-scan] ✗hot ${symbol} vol5m:$${vol5m.toFixed(0)} (min $800)`);
+      // Min $1500 vol in 5m (serious capital, not micro-trades)
+      if (vol5m < 1500) {
+        console.debug(`[bonding-scan] ✗hot ${symbol} vol5m:$${vol5m.toFixed(0)} (min $1500)`);
         continue;
       }
-      // pc5m must be slightly positive but NOT overextended — DexScreener data lags 30-60s,
-      // a +10%+ reading means the pump ALREADY HAPPENED and we'd be buying the top
-      if (pc5m < 1 || pc5m > 8) {
-        console.debug(`[bonding-scan] ✗hot ${symbol} pc5m:${pc5m.toFixed(1)}% (need 1-8%)`);
+      // pc5m 2-6%: rising but not overextended — DexScreener lags 30-60s so +7%+ = top already in
+      if (pc5m < 2 || pc5m > 6) {
+        console.debug(`[bonding-scan] ✗hot ${symbol} pc5m:${pc5m.toFixed(1)}% (need 2-6%)`);
         continue;
       }
-      // Buyers must outnumber sellers: buy/sell ratio >= 1.5
-      if (bsRatio < 1.5) {
-        console.debug(`[bonding-scan] ✗hot ${symbol} bsRatio:${bsRatio.toFixed(1)} (min 1.5)`);
+      // Buyers must strongly outnumber sellers: ratio >= 2.0
+      if (bsRatio < 2.0) {
+        console.debug(`[bonding-scan] ✗hot ${symbol} bsRatio:${bsRatio.toFixed(1)} (min 2.0)`);
         continue;
       }
 
@@ -800,6 +810,180 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
     }
   } catch (err: any) {
     console.debug(`[bonding-scan] HOT poll error: ${err.message?.slice(0, 60)}`);
+  }
+}
+
+// ─── NEW token poller — catches tokens 1-14 min old ──────────────────────────
+// Tokens in this window are past initial sniper phase (first 60s) but haven't
+// built up enough data for the HOT poller (15min+ age). High risk, small size.
+
+async function pollNewPumpfunTokens(keypair: Keypair, connection: Connection): Promise<void> {
+  if (!BONDING_NEW_ENABLED) return;
+  try {
+    const DEXSCREENER = 'https://api.dexscreener.com/latest/dex';
+    const seenDs = new Set<string>();
+    const pairCandidates: any[] = [];
+
+    // Token-profiles endpoint returns freshest listings
+    try {
+      const profR = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
+      const mints: string[] = ((Array.isArray(profR.data) ? profR.data : []) as any[])
+        .filter((p: any) => p.chainId === 'solana' && p.tokenAddress)
+        .map((p: any) => { seenDs.add(p.tokenAddress); return p.tokenAddress; })
+        .slice(0, 30);
+      if (mints.length > 0) {
+        const pr = await axios.get(`${DEXSCREENER}/tokens/${mints.join(',')}`, { timeout: 6_000 });
+        for (const p of (pr.data?.pairs ?? []) as any[]) {
+          if (p.chainId !== 'solana') continue;
+          const dex = (p.dexId ?? '').toLowerCase();
+          if (!['pumpfun'].includes(dex)) continue; // new tokens only on bonding curve
+          const m = p.baseToken?.address;
+          if (!m) continue;
+          pairCandidates.push(p);
+        }
+      }
+    } catch { /* fail-open */ }
+
+    // Also search for very new tokens
+    for (const q of ['sol new', 'sol gem']) {
+      try {
+        const r = await axios.get(`${DEXSCREENER}/search?q=${encodeURIComponent(q)}`, { timeout: 5_000 });
+        for (const p of (r.data?.pairs ?? []) as any[]) {
+          if (p.chainId !== 'solana') continue;
+          if ((p.dexId ?? '').toLowerCase() !== 'pumpfun') continue;
+          const m = p.baseToken?.address;
+          if (!m || seenDs.has(m)) continue;
+          seenDs.add(m);
+          pairCandidates.push(p);
+        }
+        await new Promise(res => setTimeout(res, 400));
+      } catch { /* skip */ }
+    }
+
+    const coins = pairCandidates.map(p => ({
+      mint:            p.baseToken?.address,
+      symbol:          p.baseToken?.symbol,
+      name:            p.baseToken?.name ?? p.baseToken?.symbol,
+      usd_market_cap:  Number(p.fdv ?? p.marketCap ?? 0),
+      created_timestamp: p.pairCreatedAt ? Math.floor(Number(p.pairCreatedAt) / 1000) : 0,
+      last_trade_timestamp: (p.volume?.m5 ?? 0) > 0 ? Math.floor(Date.now() / 1000) : 0,
+      vol5m:   p.volume?.m5 ?? 0,
+      buys5m:  p.txns?.m5?.buys ?? 0,
+      sells5m: p.txns?.m5?.sells ?? 0,
+      pc5m:    Number(p.priceChange?.m5 ?? 0),
+      dexPool: 'pump',
+    }));
+
+    for (const coin of coins) {
+      const mint: string = coin.mint ?? '';
+      if (!mint) continue;
+      if (recentMints.has(mint) || candidateTokens.has(mint)) continue;
+      if (positions.has(mint) || positions2.has(mint)) continue;
+      if (!checkDailyBudget2(BONDING_NEW_BUY_SOL)) break;
+      if (positions2.size >= BONDING_MAX_POSITIONS) break;
+
+      const mcapUsd = Number(coin.usd_market_cap ?? 0);
+      if (mcapUsd < BONDING_NEW_MIN_MCAP || mcapUsd > BONDING_NEW_MAX_MCAP) continue;
+
+      // Must be in the "new" age window (1-14 min)
+      const createdTs = Number(coin.created_timestamp ?? 0) * 1000;
+      const tokenAgeSec = createdTs > 0 ? (Date.now() - createdTs) / 1000 : 0;
+      if (tokenAgeSec < BONDING_NEW_MIN_AGE_SEC || tokenAgeSec > BONDING_NEW_MAX_AGE_SEC) continue;
+
+      // Must have traded very recently
+      const lastTradeTs = Number(coin.last_trade_timestamp ?? 0) * 1000;
+      if (Date.now() - lastTradeTs > 120_000) continue;
+
+      const symbol = (coin.symbol ?? mint.slice(0, 4)).toUpperCase();
+      const name   = coin.name ?? symbol;
+      if (isRugPattern(name, symbol)) continue;
+
+      const buys5m  = Number(coin.buys5m ?? 0);
+      const sells5m = Number(coin.sells5m ?? 0);
+      const vol5m   = Number(coin.vol5m ?? 0);
+      const pc5m    = Number(coin.pc5m ?? 0);
+      const bsRatio = sells5m > 0 ? buys5m / sells5m : buys5m;
+
+      // Early stage filters — looser than HOT but demanding strong buy pressure
+      if (buys5m < 8) {
+        console.debug(`[bonding-scan] ✗new ${symbol} buys5m:${buys5m} (min 8)`);
+        continue;
+      }
+      if (vol5m < 300) {
+        console.debug(`[bonding-scan] ✗new ${symbol} vol5m:$${vol5m.toFixed(0)} (min $300)`);
+        continue;
+      }
+      if (pc5m < 3 || pc5m > 25) {
+        console.debug(`[bonding-scan] ✗new ${symbol} pc5m:${pc5m.toFixed(1)}% (need 3-25%)`);
+        continue;
+      }
+      if (bsRatio < 2.5) {
+        console.debug(`[bonding-scan] ✗new ${symbol} bsRatio:${bsRatio.toFixed(1)} (min 2.5)`);
+        continue;
+      }
+
+      const mcapSol = mcapUsd / solPriceUsd;
+      console.info(
+        `[bonding-scan] 🆕 NEW ${symbol} mcap:$${mcapUsd.toFixed(0)} ` +
+        `buys5m:${buys5m} ratio:${bsRatio.toFixed(1)}x vol5m:$${vol5m.toFixed(0)} ` +
+        `pc5m:${pc5m.toFixed(1)}% age:${(tokenAgeSec / 60).toFixed(1)}min — entering`
+      );
+
+      recentMints.add(mint);
+      const buyResult = await buyOnBondingCurve(mint, BONDING_NEW_BUY_SOL, keypair, connection, 'pump');
+      if (!buyResult.success) { recentMints.delete(mint); continue; }
+
+      bonding2DailySpent += BONDING_NEW_BUY_SOL;
+
+      try {
+        await query(
+          `INSERT INTO autobuy_jobs
+             (mint_address, label, amount_sol, slippage_bps, interval_seconds,
+              autosell_enabled, active, last_tx_signature, bought_at, last_activity_at,
+              total_spent_sol, time_limit_seconds, time_limit_enabled)
+           VALUES ($1,$2,$3,300,60,false,true,$4,now(),now(),$3,$5,true)
+           ON CONFLICT DO NOTHING`,
+          [
+            mint,
+            `auto:bonding:new:${symbol}:pump:mcap${Math.round(mcapSol)}sol`,
+            BONDING_NEW_BUY_SOL, buyResult.txSignature ?? '',
+            BONDING_NEW_TIME_LIMIT,
+          ]
+        );
+      } catch (dbErr: any) {
+        console.warn(`[bonding-scan] NEW DB error ${mint.slice(0, 8)}: ${dbErr.message?.slice(0, 60)}`);
+      }
+
+      positions2.set(mint, {
+        mint, symbol, name,
+        buyTx: buyResult.txSignature ?? '',
+        buyTime: Date.now(),
+        buySol: BONDING_NEW_BUY_SOL,
+        entryMcapSol: mcapSol, currentMcapSol: mcapSol, peakMcapSol: mcapSol,
+        tpIndex: 0, allTpsDone: false,
+        uniqueBuyers: new Set(),
+        recentBuySol: 0, recentSellSol: 0,
+        windowResetAt: Date.now() + 90_000,
+        dexPool: 'pump',
+      });
+
+      if (wsInstance?.readyState === WebSocket.OPEN) {
+        wsInstance.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
+      }
+
+      // Tight time limit for new tokens
+      setTimeout(async () => {
+        const p = positions2.get(mint);
+        if (!p) return;
+        console.info(`[bonding-scan] ⏱ TIME_LIMIT NEW ${p.symbol} — selling 100%`);
+        positions2.delete(mint);
+        await sellOnBondingCurve(mint, 100, keypair, connection, 'pump');
+      }, BONDING_NEW_TIME_LIMIT * 1000);
+
+      await new Promise(res => setTimeout(res, 2000));
+    }
+  } catch (err: any) {
+    console.debug(`[bonding-scan] NEW poll error: ${err.message?.slice(0, 60)}`);
   }
 }
 
@@ -1006,6 +1190,16 @@ export function startBondingScanner(): void {
     const hotKeypair = keypairInstance2 ?? baseKeypair;
     setInterval(() => pollHotPumpfunTokens(hotKeypair, connectionInstance!).catch(() => {}), BONDING_HOT_INTERVAL_MS);
     console.info(`[bonding-scan] HOT poller scheduled every ${BONDING_HOT_INTERVAL_MS / 1000}s`);
+  }
+
+  // NEW token poll — catches tokens 1-14 min old before HOT window
+  if (BONDING_NEW_ENABLED) {
+    const newKeypair = keypairInstance2 ?? baseKeypair;
+    // Offset by 15s so NEW and HOT polls don't overlap on DexScreener
+    setTimeout(() => {
+      setInterval(() => pollNewPumpfunTokens(newKeypair, connectionInstance!).catch(() => {}), BONDING_NEW_INTERVAL_MS);
+    }, 15_000);
+    console.info(`[bonding-scan] NEW poller scheduled every ${BONDING_NEW_INTERVAL_MS / 1000}s (0.01 SOL, 1-14min age)`);
   }
 
   // Only connect WebSocket if explicitly enabled
