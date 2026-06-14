@@ -46,26 +46,24 @@ const BONDING_MIN_BUYERS     = Number(process.env.BONDING_MIN_BUYERS    || '50')
 // Watchlist window: drop candidate if buyers not reached within this time
 const BONDING_WATCH_TIMEOUT_MS = Number(process.env.BONDING_WATCH_TIMEOUT_SEC || '1020') * 1000;
 
-// Time limit before force-exit on bonding curve (seconds).
-// HOT tokens that don't recover in 5 minutes are dead — exit fast, preserve capital.
-const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '300');
+// Time limit before force-exit (seconds).
+// Movers strategy: if token hasn't pumped in 2min → dead, exit fast.
+const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '120');
 
-// Stop loss: 12% from entry price. At bonding curve liquidity levels, a 12% mcap
-// drop already costs ~28% of actual SOL invested due to slippage. Tighter = less damage.
-const BONDING_STOP_PCT = Number(process.env.BONDING_STOP_PCT || '0.12');
+// Stop loss: 10% from entry. Movers either go up fast or dump — no reason to hold losers.
+const BONDING_STOP_PCT = Number(process.env.BONDING_STOP_PCT || '0.10');
 
-// TP levels: take profit early on bonding curve (DexScreener lag = real price lower than shown)
-// Sell 30% at 1.25x (first profit lock), then bigger portions as it goes higher
+// TP levels: aggressive early-exit strategy.
+// Sell majority (60%) at 1.5x to lock profit, trail the rest.
+// Bonding curve movers pump fast and dump fast — capture the spike, not the dream.
 const BONDING_TPS = [
-  { mult: 1.25, sellPct: 30 },
-  { mult: 1.7,  sellPct: 25 },
-  { mult: 2.5,  sellPct: 20 },
-  { mult: 4.0,  sellPct: 15 },
-  { mult: 7.0,  sellPct: 10 },
+  { mult: 1.5, sellPct: 60 },  // lock 60% at 1.5x — first real profit
+  { mult: 2.5, sellPct: 30 },  // 30% more at 2.5x — if it keeps going
+  { mult: 5.0, sellPct: 10 },  // moon bag at 5x
 ];
 
-// Moon bag trailing stop: sell remaining 10% if price drops this much from ATH
-const MOON_BAG_TRAIL_PCT = Number(process.env.MOON_BAG_TRAIL_PCT || '0.20');
+// Moon bag trailing stop: sell remaining if price drops 15% from ATH
+const MOON_BAG_TRAIL_PCT = Number(process.env.MOON_BAG_TRAIL_PCT || '0.15');
 
 // Dump detection: if sell volume > buy volume * this ratio → exit
 const BONDING_DUMP_RATIO = Number(process.env.BONDING_DUMP_RATIO || '2.5');
@@ -77,11 +75,14 @@ const SOLANA_RPC      = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.sola
 // Polls pump.fun for recently-traded bonding curve tokens not yet caught by WebSocket.
 // Use case: tokens that launched before the scanner started, or are in the HOT section.
 const BONDING_HOT_ENABLED     = process.env.BONDING_HOT_ENABLED === 'true';
-const BONDING_HOT_INTERVAL_MS = Number(process.env.BONDING_HOT_INTERVAL_SEC || '60') * 1000;
+// Poll every 20s to catch early movers before the pump is over
+const BONDING_HOT_INTERVAL_MS = Number(process.env.BONDING_HOT_INTERVAL_SEC || '20') * 1000;
 const BONDING_HOT_MIN_MCAP    = Number(process.env.BONDING_HOT_MIN_MCAP_USD || '3000');
 const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '8000');
-const BONDING_HOT_MIN_AGE_SEC = Number(process.env.BONDING_HOT_MIN_AGE_SEC || '900');  // 15 min
-const BONDING_HOT_MAX_AGE_SEC = Number(process.env.BONDING_HOT_MAX_AGE_SEC || String(4 * 3600)); // 4h
+// Movers window: catch tokens 90 seconds to 8 minutes old.
+// Past initial sniper bots (first 60-90s), but before the pump is fully in.
+const BONDING_HOT_MIN_AGE_SEC = Number(process.env.BONDING_HOT_MIN_AGE_SEC || '90');   // 1.5 min
+const BONDING_HOT_MAX_AGE_SEC = Number(process.env.BONDING_HOT_MAX_AGE_SEC || '480');  // 8 min
 
 // NEW token poller — catches tokens 1-14 min old before they become HOT
 // Earlier stage = higher risk, smaller position, tighter limits
@@ -220,13 +221,16 @@ async function sellOnBondingCurve(
     const solReceived = Math.max(0, (balAfter - balBefore) / 1e9);
     console.info(`[bonding-scan] 💰 Sold ${pct}% of ${mint.slice(0, 8)} → ${solReceived.toFixed(5)} SOL`);
 
-    if (pct >= 95) {
-      await query(
-        `UPDATE autobuy_jobs SET active=false, total_sold_sol=$1
-         WHERE mint_address=$2 AND label LIKE 'auto:bonding%' AND active=true`,
-        [solReceived, mint]
-      ).catch(() => {});
-    }
+    // Accumulate total_sold_sol on EVERY sell (partial TPs + final)
+    // pct >= 95 → close position (active=false); partial sells keep active=true
+    await query(
+      `UPDATE autobuy_jobs
+       SET total_sold_sol  = COALESCE(total_sold_sol, 0) + $1,
+           active          = CASE WHEN $2 >= 95 THEN false ELSE active END,
+           last_activity_at = now()
+       WHERE mint_address=$3 AND label LIKE 'auto:bonding%' AND active=true`,
+      [solReceived, pct, mint]
+    ).catch(() => {});
     return { success: true, solReceived };
   } catch (err: any) {
     console.warn(`[bonding-scan] Sell failed ${mint.slice(0, 8)}: ${err.message?.slice(0, 120)}`);
@@ -275,7 +279,8 @@ const positions2 = new Map<string, BondingPosition>();
 
 // ─── DexScreener polling watchdog ────────────────────────────────────────────
 
-const DS_POLL_INTERVAL_MS = 30_000;
+// Poll positions every 10s so we don't miss a fast bonding curve peak
+const DS_POLL_INTERVAL_MS = 10_000;
 const lastWsEventAt = new Map<string, number>();
 
 async function getDSMcapSol(mint: string): Promise<number> {
@@ -679,8 +684,8 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
       usd_market_cap: Number(p.fdv ?? p.marketCap ?? 0),
       last_trade_timestamp: (p.volume?.m5 ?? 0) > 0 ? Math.floor(Date.now() / 1000) : 0,
       created_timestamp:    p.pairCreatedAt ? Math.floor(Number(p.pairCreatedAt) / 1000) : 0,
-      vol5m: p.volume?.m5 ?? 0,
-      vol1h: p.volume?.h1 ?? 0,
+      vol5m:  p.volume?.m5 ?? 0,
+      vol1h:  p.volume?.h1 ?? 0,
       buys5m: p.txns?.m5?.buys ?? 0,
       sells5m: p.txns?.m5?.sells ?? 0,
       complete: false,
@@ -701,8 +706,12 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
       if (!checkDailyBudget2(BONDING_BUY_SOL)) break;
       if (positions2.size >= BONDING_MAX_POSITIONS) break;
 
+      // Movers range: low mcap = early stage (not already pumped)
+      // Min $500 to have some real token value, max $6k to stay pre-pump
       const mcapUsd = Number(coin.usd_market_cap ?? 0);
-      if (mcapUsd < BONDING_HOT_MIN_MCAP || mcapUsd > BONDING_HOT_MAX_MCAP) continue;
+      const hotMinMcap = Number(process.env.BONDING_HOT_MIN_MCAP_USD || '500');
+      const hotMaxMcap = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '6000');
+      if (mcapUsd < hotMinMcap || mcapUsd > hotMaxMcap) continue;
 
       // Must have traded very recently (< 90 seconds ago)
       const lastTradeTs = Number(coin.last_trade_timestamp ?? 0) * 1000;
@@ -720,40 +729,48 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
       const mcapSol = mcapUsd / solPriceUsd;
       if (mcapSol > BONDING_MAX_MCAP_SOL) continue;
 
-      // Require real buying activity — not just dev pumping
+      // ── MOVERS filter: catch sharp early price moves with volume acceleration ──
       const buys5m  = Number(coin.buys5m  ?? 0);
       const sells5m = Number(coin.sells5m ?? 0);
       const vol5m   = Number(coin.vol5m   ?? 0);
+      const vol1h   = Number(coin.vol1h   ?? 0);
       const pc5m    = Number(coin.pc5m    ?? 0);
       const bsRatio = sells5m > 0 ? buys5m / sells5m : buys5m;
 
-      // Min 15 buy txns in last 5m (real crowd interest, not just dev+bots)
-      if (buys5m < 15) {
-        console.debug(`[bonding-scan] ✗hot ${symbol} buys5m:${buys5m} (min 15)`);
+      // Need real buy transactions in last 5m
+      if (buys5m < 5) {
+        console.debug(`[bonding-scan] ✗mover ${symbol} buys5m:${buys5m} (min 5)`);
         continue;
       }
-      // Min $1500 vol in 5m (serious capital, not micro-trades)
-      if (vol5m < 1500) {
-        console.debug(`[bonding-scan] ✗hot ${symbol} vol5m:$${vol5m.toFixed(0)} (min $1500)`);
+      // Need some real volume ($300+) — weeds out micro-trades
+      if (vol5m < 300) {
+        console.debug(`[bonding-scan] ✗mover ${symbol} vol5m:$${vol5m.toFixed(0)} (min $300)`);
         continue;
       }
-      // pc5m 2-6%: rising but not overextended — DexScreener lags 30-60s so +7%+ = top already in
-      if (pc5m < 2 || pc5m > 6) {
-        console.debug(`[bonding-scan] ✗hot ${symbol} pc5m:${pc5m.toFixed(1)}% (need 2-6%)`);
+      // MOVERS: price moving SHARPLY upward (5-30%). Under 5% = not a mover yet.
+      // Over 30% = DexScreener lag means the pump is already over.
+      if (pc5m < 5 || pc5m > 30) {
+        console.debug(`[bonding-scan] ✗mover ${symbol} pc5m:${pc5m.toFixed(1)}% (need 5-30%)`);
         continue;
       }
-      // Buyers must strongly outnumber sellers: ratio >= 2.0
-      if (bsRatio < 2.0) {
-        console.debug(`[bonding-scan] ✗hot ${symbol} bsRatio:${bsRatio.toFixed(1)} (min 2.0)`);
+      // Buyers must outnumber sellers (momentum confirmation)
+      if (bsRatio < 1.5) {
+        console.debug(`[bonding-scan] ✗mover ${symbol} bsRatio:${bsRatio.toFixed(1)} (min 1.5)`);
+        continue;
+      }
+      // Volume momentum: for tokens older than 5min, last 5min must be > 30% of 1h volume
+      // (i.e., this IS the active period, not old volume residue)
+      if (tokenAgeSec > 300 && vol1h > 0 && vol5m / vol1h < 0.25) {
+        console.debug(`[bonding-scan] ✗mover ${symbol} vol5m/vol1h:${(vol5m/vol1h*100).toFixed(0)}% (min 25% — not currently active)`);
         continue;
       }
 
       const dexPool = coin.dexPool ?? 'pump';
       console.info(
-        `[bonding-scan] 🔥 HOT ${symbol} mcap:$${mcapUsd.toFixed(0)} ` +
-        `buys5m:${buys5m} sells5m:${sells5m} ratio:${bsRatio.toFixed(1)}x ` +
-        `vol5m:$${vol5m.toFixed(0)} pc5m:${pc5m.toFixed(1)}% ` +
-        `age:${(tokenAgeSec / 60).toFixed(0)}min pool:${dexPool} — entering w2`
+        `[bonding-scan] 🚀 MOVER ${symbol} mcap:$${mcapUsd.toFixed(0)} ` +
+        `buys5m:${buys5m} ratio:${bsRatio.toFixed(1)}x ` +
+        `vol5m:$${vol5m.toFixed(0)} pc5m:+${pc5m.toFixed(1)}% ` +
+        `age:${(tokenAgeSec / 60).toFixed(1)}min pool:${dexPool} — entering`
       );
 
       recentMints.add(mint);
@@ -772,7 +789,7 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
            ON CONFLICT DO NOTHING`,
           [
             mint,
-            `auto:bonding:hot:${symbol}:${dexPool}:mcap${Math.round(mcapSol)}sol`,
+            `auto:bonding:mover:${symbol}:${dexPool}:mcap${Math.round(mcapSol)}sol`,
             BONDING_BUY_SOL, buyResult.txSignature ?? '',
             BONDING_TIME_LIMIT_SEC,
           ]
@@ -995,6 +1012,9 @@ let running = false;
 let keypairInstance: Keypair | null = null;
 let keypairInstance2: Keypair | null = null;
 let connectionInstance: Connection | null = null;
+// Whether to subscribe to new token events (only when WebSocket scanner is enabled).
+// WebSocket is always connected for real-time position price updates.
+let wsNewTokenEnabled = false;
 
 function connectBondingWS(): void {
   if (wsInstance) {
@@ -1007,8 +1027,10 @@ function connectBondingWS(): void {
   wsInstance = ws;
 
   ws.on('open', () => {
-    console.info('[bonding-scan] ✅ Connected — subscribing new tokens');
-    ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+    console.info('[bonding-scan] ✅ WebSocket connected' + (wsNewTokenEnabled ? ' — subscribing new tokens' : ' (position monitor only)'));
+    if (wsNewTokenEnabled) {
+      ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+    }
     // Re-subscribe to trades for active positions after reconnect
     const activeMints = [...positions.keys(), ...positions2.keys(), ...candidateTokens.keys()];
     if (activeMints.length > 0) {
@@ -1057,7 +1079,7 @@ async function recoverOrphanedPositions(keypair: Keypair, connection: Connection
       mint_address: string; label: string; amount_sol: string; bought_at: Date; time_limit_seconds: string;
     }>(
       `SELECT mint_address, label, amount_sol, bought_at, time_limit_seconds
-       FROM autobuy_jobs WHERE label LIKE 'auto:bonding%' AND active = true`
+       FROM autobuy_jobs WHERE (label LIKE 'auto:bonding%' OR label LIKE 'auto:mover%') AND active = true`
     );
     const rows = result.rows;
     if (!rows.length) return;
@@ -1202,8 +1224,10 @@ export function startBondingScanner(): void {
     console.info(`[bonding-scan] NEW poller scheduled every ${BONDING_NEW_INTERVAL_MS / 1000}s (0.01 SOL, 1-14min age)`);
   }
 
-  // Only connect WebSocket if explicitly enabled
-  if (wsEnabled) connectBondingWS();
+  // Always connect WebSocket — needed for real-time TP/stop sells even in HOT-only mode.
+  // wsNewTokenEnabled controls whether we subscribe to new-token events (WS scanner).
+  wsNewTokenEnabled = wsEnabled;
+  connectBondingWS();
 }
 
 export function stopBondingScanner(): void {
