@@ -54,13 +54,14 @@ const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '300
 // drop already costs ~28% of actual SOL invested due to slippage. Tighter = less damage.
 const BONDING_STOP_PCT = Number(process.env.BONDING_STOP_PCT || '0.12');
 
-// 5 TP levels: mult → sell pct
+// TP levels: take profit early on bonding curve (DexScreener lag = real price lower than shown)
+// Sell 30% at 1.25x (first profit lock), then bigger portions as it goes higher
 const BONDING_TPS = [
-  { mult: 1.5, sellPct: 20 },
-  { mult: 2.0, sellPct: 20 },
-  { mult: 3.0, sellPct: 20 },
-  { mult: 5.0, sellPct: 20 },
-  { mult: 8.0, sellPct: 10 },
+  { mult: 1.25, sellPct: 30 },
+  { mult: 1.7,  sellPct: 25 },
+  { mult: 2.5,  sellPct: 20 },
+  { mult: 4.0,  sellPct: 15 },
+  { mult: 7.0,  sellPct: 10 },
 ];
 
 // Moon bag trailing stop: sell remaining 10% if price drops this much from ATH
@@ -77,9 +78,8 @@ const SOLANA_RPC      = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.sola
 // Use case: tokens that launched before the scanner started, or are in the HOT section.
 const BONDING_HOT_ENABLED     = process.env.BONDING_HOT_ENABLED === 'true';
 const BONDING_HOT_INTERVAL_MS = Number(process.env.BONDING_HOT_INTERVAL_SEC || '60') * 1000;
-// Max mcap $18k — updated ceiling for HOT tokens
 const BONDING_HOT_MIN_MCAP    = Number(process.env.BONDING_HOT_MIN_MCAP_USD || '3000');
-const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '18000');
+const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '8000');
 const BONDING_HOT_MIN_AGE_SEC = Number(process.env.BONDING_HOT_MIN_AGE_SEC || '900');  // 15 min
 const BONDING_HOT_MAX_AGE_SEC = Number(process.env.BONDING_HOT_MAX_AGE_SEC || String(4 * 3600)); // 4h
 
