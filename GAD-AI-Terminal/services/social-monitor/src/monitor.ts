@@ -5,6 +5,9 @@
  */
 import { query } from '@lib/db';
 import { fetchTweetsForHandle } from './twitter';
+import { scanXTrends, XTrend } from './x-trends';
+import { huntCoinForTheme } from './coin-hunter';
+import axios from 'axios';
 
 const POLL_INTERVAL_MS = Number(process.env.SOCIAL_POLL_INTERVAL_SECONDS ?? '120') * 1000;
 
@@ -161,12 +164,89 @@ async function processUnprocessedSignals(): Promise<void> {
   }
 }
 
+const TG_BOT_TOKEN  = process.env.TELEGRAM_BOT_TOKEN ?? '';
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ?? process.env.TELEGRAM_ADMIN_CHAT_ID ?? '';
+
+async function sendTelegramAlert(text: string): Promise<void> {
+  if (!TG_BOT_TOKEN || !ADMIN_CHAT_ID) return;
+  try {
+    await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+      chat_id: ADMIN_CHAT_ID,
+      text,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+    }, { timeout: 8000 });
+  } catch (err: any) {
+    console.warn(`[social] TG alert failed: ${err.message}`);
+  }
+}
+
+async function saveXSignal(trend: XTrend, coinMint: string | null, coinSymbol: string | null, action: string): Promise<void> {
+  await query(`
+    INSERT INTO x_trend_signals
+      (theme, keywords, tweet_url, engagement, coin_mint, coin_symbol, action)
+    VALUES ($1,$2,$3,$4,$5,$6,$7)
+    ON CONFLICT DO NOTHING
+  `, [
+    trend.theme,
+    trend.keywords,
+    trend.tweetUrl,
+    trend.engagement,
+    coinMint,
+    coinSymbol,
+    action,
+  ]).catch(() => {});
+}
+
+async function runXTrendCycle(): Promise<void> {
+  const trends = await scanXTrends();
+  if (!trends.length) return;
+
+  // Process top 3 trends
+  for (const trend of trends.slice(0, 3)) {
+    const coin = await huntCoinForTheme(trend.theme, trend.keywords);
+
+    if (coin) {
+      const signalText =
+        `🔥 *X TREND SIGNAL*\n` +
+        `Theme: *${trend.theme}* (${trend.retweets} RT, ${trend.likes} ❤️)\n` +
+        `"${trend.topTweet.slice(0, 120)}..."\n\n` +
+        `🪙 *${coin.symbol}* (${coin.name})\n` +
+        `Liq: $${(coin.liqUsd / 1000).toFixed(0)}k | Vol24h: $${(coin.vol24h / 1000).toFixed(0)}k\n` +
+        `5m: ${coin.priceChange5m > 0 ? '+' : ''}${coin.priceChange5m.toFixed(1)}% | 1h: ${coin.priceChange1h > 0 ? '+' : ''}${coin.priceChange1h.toFixed(1)}%\n` +
+        `DEX: ${coin.dex} | Score: ${coin.score.toFixed(1)}\n` +
+        `[DexScreener](${coin.pairUrl}) | [Tweet](${trend.tweetUrl})\n\n` +
+        `CA: \`${coin.mint}\``;
+
+      console.info(`[social] 🔥 X trend → ${trend.theme} → ${coin.symbol} (score: ${coin.score.toFixed(1)})`);
+      await sendTelegramAlert(signalText);
+      await saveXSignal(trend, coin.mint, coin.symbol, 'ALERT_SENT');
+    } else {
+      // Log trend without a coin match for later review
+      console.info(`[social] X trend: ${trend.theme} — no tradeable coin found`);
+      await saveXSignal(trend, null, null, 'NO_COIN');
+    }
+
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
 export async function startSocialMonitor(): Promise<void> {
   console.info(`[social] Social Monitor started. Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
 
   let shouldStop = false;
   process.on('SIGINT',  () => { shouldStop = true; });
   process.on('SIGTERM', () => { shouldStop = true; });
+
+  // Offset X trend cycle so it doesn't run simultaneously with KOL poll
+  setTimeout(() => {
+    const runXCycle = async () => {
+      if (shouldStop) return;
+      try { await runXTrendCycle(); } catch (err: any) { console.warn(`[social] X cycle error: ${err.message}`); }
+      if (!shouldStop) setTimeout(runXCycle, 15 * 60 * 1000);
+    };
+    runXCycle();
+  }, 60_000); // first run 60s after start
 
   while (!shouldStop) {
     try {

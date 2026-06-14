@@ -1292,6 +1292,62 @@ bot.onText(/^\/basetokens(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
   }
 }));
 
+// ─── X Trend Commands ─────────────────────────────────────────────────────────
+
+// /xtrends — last 10 X trend signals found by social-monitor
+bot.onText(/^\/xtrends(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const { rows } = await (await import('@lib/db')).query<any>(`
+      SELECT theme, keywords, tweet_url, engagement, coin_mint, coin_symbol, action, created_at
+      FROM x_trend_signals
+      ORDER BY created_at DESC
+      LIMIT 10
+    `);
+    if (!rows.length) return send(chatId, '📡 No X trend signals yet.\nSocial monitor scans every 15 minutes.');
+    const lines = [`📡 *X TREND SIGNALS (last 10)*`, ``];
+    for (const r of rows) {
+      const ts = new Date(r.created_at).toISOString().slice(11, 16);
+      const coin = r.coin_symbol ? `→ *${r.coin_symbol}* (\`${(r.coin_mint ?? '').slice(0, 8)}...\`)` : '→ no coin';
+      const icon = r.action === 'ALERT_SENT' ? '🔥' : '📊';
+      lines.push(`${icon} [${ts}] *${r.theme}* ${coin}`);
+      if (r.tweet_url) lines.push(`  [Tweet](${r.tweet_url}) | eng:${r.engagement}`);
+    }
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ X trends error: ${e.message}`);
+  }
+}));
+
+// /xsignal — latest actionable X signal (coin with volume found)
+bot.onText(/^\/xsignal(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const { rows } = await (await import('@lib/db')).query<any>(`
+      SELECT theme, coin_mint, coin_symbol, tweet_url, engagement, created_at
+      FROM x_trend_signals
+      WHERE coin_mint IS NOT NULL
+      ORDER BY created_at DESC
+      LIMIT 1
+    `);
+    if (!rows.length) return send(chatId, '📡 No X trade signals yet. Check back in 15 minutes.');
+    const r = rows[0];
+    const ts = new Date(r.created_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+    const text =
+      `📡 *Latest X Signal* (${ts})\n\n` +
+      `Theme: *${r.theme}* | Eng: ${r.engagement}\n` +
+      `Token: *${r.coin_symbol}*\n` +
+      `CA: \`${r.coin_mint}\`\n\n` +
+      `[Source Tweet](${r.tweet_url})\n\n` +
+      `_Tip: paste CA into /tokenscore for full analysis_`;
+    await send(chatId, text);
+  } catch (e: any) {
+    await send(chatId, `❌ X signal error: ${e.message}`);
+  }
+}));
+
 // ─── Errors ───────────────────────────────────────────────────────────────────
 bot.on('polling_error', (err) => log('error', 'polling:', err.message));
 if (ADMIN_ID) bot.sendMessage(ADMIN_ID, '🤖 GAD AI Terminal online.').catch(() => {});
