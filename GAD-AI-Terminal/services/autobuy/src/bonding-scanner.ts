@@ -97,6 +97,38 @@ const BONDING_NEW_MAX_MCAP     = Number(process.env.BONDING_NEW_MAX_MCAP_USD || 
 const BONDING_NEW_TIME_LIMIT   = Number(process.env.BONDING_NEW_TIME_LIMIT_SEC || '120'); // 2 min max hold
 const BONDING_NEW_STOP_PCT     = Number(process.env.BONDING_NEW_STOP_PCT     || '0.08'); // 8% stop
 
+// ─── Graduation Hunter — pump.fun tokens close to $69k graduation ─────────────
+// Pre-graduation pump: community rushes to push mcap over $69k → token graduates to Raydium.
+// Entry at $40k-65k gives a 5-70% gain on graduation. Uses bonding curve sell (pool='pump').
+const GRAD_HUNTER_ENABLED     = process.env.GRAD_HUNTER_ENABLED === 'true';
+const GRAD_HUNTER_INTERVAL_MS = Number(process.env.GRAD_HUNTER_INTERVAL_SEC  || '30') * 1000;
+const GRAD_HUNTER_BUY_SOL     = Number(process.env.GRAD_HUNTER_BUY_SOL       || '0.015');
+const GRAD_HUNTER_MIN_MCAP    = Number(process.env.GRAD_HUNTER_MIN_MCAP_USD  || '40000');
+const GRAD_HUNTER_MAX_MCAP    = Number(process.env.GRAD_HUNTER_MAX_MCAP_USD  || '65000');
+const GRAD_HUNTER_TIME_LIMIT  = Number(process.env.GRAD_HUNTER_TIME_LIMIT_SEC || '1800'); // 30 min
+const GRAD_HUNTER_STOP_PCT    = Number(process.env.GRAD_HUNTER_STOP_PCT       || '0.10');
+// TP: capture graduation pop (5-60% from $40k-65k → $69k+)
+const GRAD_TPS = [
+  { mult: 1.15, sellPct: 50 },  // book half at +15%
+  { mult: 1.40, sellPct: 50 },  // exit rest at +40%
+];
+
+// ─── PumpSwap Trader — graduated tokens on real AMM pool ─────────────────────
+// After graduation to PumpSwap, tokens get real AMM depth → sell via PumpPortal pool='pumpswap'.
+// Fresh graduates (<2h old) often rally 30-100% as new buyers discover them on DEX aggregators.
+const PUMPSWAP_ENABLED        = process.env.PUMPSWAP_ENABLED === 'true';
+const PUMPSWAP_INTERVAL_MS    = Number(process.env.PUMPSWAP_INTERVAL_SEC      || '20') * 1000;
+const PUMPSWAP_BUY_SOL        = Number(process.env.PUMPSWAP_BUY_SOL           || '0.015');
+const PUMPSWAP_MIN_LIQ        = Number(process.env.PUMPSWAP_MIN_LIQ_USD       || '30000');
+const PUMPSWAP_MAX_LIQ        = Number(process.env.PUMPSWAP_MAX_LIQ_USD       || '300000');
+const PUMPSWAP_MAX_AGE_MIN    = Number(process.env.PUMPSWAP_MAX_AGE_MIN       || '120');   // 2 hours
+const PUMPSWAP_TIME_LIMIT     = Number(process.env.PUMPSWAP_TIME_LIMIT_SEC    || '1800');  // 30 min
+const PUMPSWAP_STOP_PCT       = Number(process.env.PUMPSWAP_STOP_PCT          || '0.08');
+const PUMPSWAP_TPS = [
+  { mult: 1.30, sellPct: 60 },  // fresh graduates often +30-50%
+  { mult: 2.00, sellPct: 40 },  // moon bag if it keeps running
+];
+
 // Live SOL price (updated every 5 min)
 let solPriceUsd = 150;
 
@@ -272,6 +304,8 @@ interface BondingPosition {
   recentSellSol: number;
   windowResetAt: number;
   dexPool?: string;      // 'pump' = bonding curve | 'pumpswap' = graduated PumpSwap
+  tpLevels?: Array<{ mult: number; sellPct: number }>;  // per-strategy TP, defaults to BONDING_TPS
+  stopPct?: number;      // per-strategy stop-loss, defaults to BONDING_STOP_PCT
 }
 
 const positions = new Map<string, BondingPosition>();
@@ -336,10 +370,12 @@ async function checkPositionExits(
   keypair: Keypair, connection: Connection, source: string,
   posMap: Map<string, BondingPosition> = positions
 ): Promise<void> {
-  const pool = pos.dexPool ?? 'pump';
+  const pool      = pos.dexPool ?? 'pump';
+  const tpLevels  = pos.tpLevels ?? BONDING_TPS;
+  const stopPct   = pos.stopPct  ?? BONDING_STOP_PCT;
 
-  // Stop-loss: 17% from entry
-  if (mult <= 1 - BONDING_STOP_PCT) {
+  // Stop-loss
+  if (mult <= 1 - stopPct) {
     console.info(`[bonding-scan] 🔴 STOP ${pos.symbol} ${mult.toFixed(2)}x [${source}] — selling 100%`);
     posMap.delete(mint);
     await sellOnBondingCurve(mint, 100, keypair, connection, pool);
@@ -357,14 +393,14 @@ async function checkPositionExits(
     return;
   }
 
-  // 5 TP levels
-  while (pos.tpIndex < BONDING_TPS.length) {
-    const tp = BONDING_TPS[pos.tpIndex];
+  // TP levels (per-strategy or global)
+  while (pos.tpIndex < tpLevels.length) {
+    const tp = tpLevels[pos.tpIndex];
     if (mult >= tp.mult) {
       console.info(`[bonding-scan] 🎯 TP${pos.tpIndex + 1} ${pos.symbol} ${mult.toFixed(2)}x — selling ${tp.sellPct}% [${source}]`);
       await sellOnBondingCurve(mint, tp.sellPct, keypair, connection, pool);
       pos.tpIndex++;
-      if (pos.tpIndex >= BONDING_TPS.length) {
+      if (pos.tpIndex >= tpLevels.length) {
         pos.allTpsDone = true;
         console.info(`[bonding-scan] 🌙 All TPs done ${pos.symbol} — moon bag mode, trail ${MOON_BAG_TRAIL_PCT * 100}%`);
       }
@@ -1079,6 +1115,271 @@ function connectBondingWS(): void {
   });
 }
 
+// ─── Graduation Hunter — buy pump.fun tokens at $40k-65k (pre-graduation zone) ──
+// Strategy: community rushes to push mcap past $69k threshold → graduation pop.
+// Entry in last mile before graduation → 5-70% gain with real AMM depth on exit.
+
+async function pollGraduationHunterTokens(keypair: Keypair, connection: Connection): Promise<void> {
+  try {
+    const DEXSCREENER = 'https://api.dexscreener.com/latest/dex';
+    const seen = new Set<string>();
+    const candidates: any[] = [];
+
+    for (const q of ['sol meme', 'sol pump new', 'pumpfun sol']) {
+      try {
+        const r = await axios.get(`${DEXSCREENER}/search?q=${encodeURIComponent(q)}`, { timeout: 5_000 });
+        for (const p of (r.data?.pairs ?? []) as any[]) {
+          if (p.chainId !== 'solana') continue;
+          if ((p.dexId ?? '').toLowerCase() !== 'pumpfun') continue;
+          const m = p.baseToken?.address;
+          if (!m || seen.has(m)) continue;
+          seen.add(m);
+          candidates.push(p);
+        }
+        await new Promise(res => setTimeout(res, 400));
+      } catch { /* skip */ }
+    }
+
+    for (const p of candidates) {
+      const mint: string = p.baseToken?.address ?? '';
+      if (!mint) continue;
+      if (recentMints.has(mint) || positions.has(mint) || positions2.has(mint)) continue;
+      if (!checkDailyBudget2(GRAD_HUNTER_BUY_SOL)) break;
+      if (positions2.size >= BONDING_MAX_POSITIONS) break;
+
+      const mcapUsd = Number(p.fdv ?? p.marketCap ?? 0);
+      if (mcapUsd < GRAD_HUNTER_MIN_MCAP || mcapUsd > GRAD_HUNTER_MAX_MCAP) continue;
+
+      // Must have recent trade volume (not a stale listing)
+      const vol5m  = Number(p.volume?.m5 ?? 0);
+      if (vol5m < 200) continue;
+
+      const createdAt = p.pairCreatedAt ? Number(p.pairCreatedAt) : 0;
+      const ageSec = createdAt > 0 ? (Date.now() - createdAt) / 1000 : 0;
+      if (ageSec > 6 * 3600) continue; // max 6 hours — if still not graduated in 6h, probably never will
+
+      const pc5m   = Number(p.priceChange?.m5 ?? 0);
+      const buys5m = Number(p.txns?.m5?.buys ?? 0);
+      const sells5m = Number(p.txns?.m5?.sells ?? 0);
+
+      if (pc5m <= 0) continue;   // must be rising right now
+      if (buys5m < 3) continue;
+      const bsRatio = sells5m > 0 ? buys5m / sells5m : buys5m;
+      if (bsRatio < 1.2) continue; // buyers outnumber sellers
+
+      const symbol = (p.baseToken?.symbol ?? mint.slice(0, 4)).toUpperCase();
+      const name   = p.baseToken?.name ?? symbol;
+      if (isRugPattern(name, symbol)) continue;
+
+      const mcapSol = mcapUsd / solPriceUsd;
+      const toGrad  = ((69000 - mcapUsd) / mcapUsd * 100).toFixed(0);
+
+      console.info(
+        `[bonding-scan] 🎓 GRAD-HUNTER ${symbol} mcap:$${mcapUsd.toFixed(0)} ` +
+        `(${toGrad}% to graduation) buys5m:${buys5m} pc5m:+${pc5m.toFixed(1)}% ` +
+        `age:${(ageSec / 60).toFixed(0)}min — entering`
+      );
+
+      recentMints.add(mint);
+      const buyResult = await buyOnBondingCurve(mint, GRAD_HUNTER_BUY_SOL, keypair, connection, 'pump');
+      if (!buyResult.success) { recentMints.delete(mint); continue; }
+
+      bonding2DailySpent += GRAD_HUNTER_BUY_SOL;
+
+      try {
+        await query(
+          `INSERT INTO autobuy_jobs
+             (mint_address, label, amount_sol, slippage_bps, interval_seconds,
+              autosell_enabled, active, last_tx_signature, bought_at, last_activity_at,
+              total_spent_sol, time_limit_seconds, time_limit_enabled)
+           VALUES ($1,$2,$3,200,60,false,true,$4,now(),now(),$3,$5,true)
+           ON CONFLICT DO NOTHING`,
+          [mint, `auto:bonding:grad:${symbol}:pump:mcap${Math.round(mcapSol)}sol`, GRAD_HUNTER_BUY_SOL, buyResult.txSignature ?? '', GRAD_HUNTER_TIME_LIMIT]
+        );
+        await query(
+          `INSERT INTO tokens (mint_address, symbol, name, last_updated) VALUES ($1,$2,$3,now())
+           ON CONFLICT (mint_address) DO UPDATE SET symbol=COALESCE(EXCLUDED.symbol,tokens.symbol), name=COALESCE(EXCLUDED.name,tokens.name), last_updated=now()`,
+          [mint, symbol || null, name || null]
+        );
+      } catch (e: any) {
+        console.warn(`[bonding-scan] GRAD DB error ${mint.slice(0, 8)}: ${e.message?.slice(0, 60)}`);
+      }
+
+      positions2.set(mint, {
+        mint, symbol, name,
+        buyTx: buyResult.txSignature ?? '',
+        buyTime: Date.now(),
+        buySol: GRAD_HUNTER_BUY_SOL,
+        entryMcapSol: mcapSol, currentMcapSol: mcapSol, peakMcapSol: mcapSol,
+        tpIndex: 0, allTpsDone: false,
+        uniqueBuyers: new Set(), recentBuySol: 0, recentSellSol: 0,
+        windowResetAt: Date.now() + 90_000,
+        dexPool: 'pump',
+        tpLevels: GRAD_TPS,
+        stopPct: GRAD_HUNTER_STOP_PCT,
+      });
+
+      if (wsInstance?.readyState === WebSocket.OPEN) {
+        wsInstance.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
+      }
+
+      setTimeout(async () => {
+        const pos = positions2.get(mint);
+        if (!pos) return;
+        console.info(`[bonding-scan] ⏱ TIME_LIMIT GRAD ${pos.symbol} — selling 100%`);
+        positions2.delete(mint);
+        await sellOnBondingCurve(mint, 100, keypair, connection, 'pump');
+      }, GRAD_HUNTER_TIME_LIMIT * 1000);
+
+      await new Promise(res => setTimeout(res, 2000));
+    }
+  } catch (err: any) {
+    console.debug(`[bonding-scan] GRAD poll error: ${err.message?.slice(0, 60)}`);
+  }
+}
+
+// ─── PumpSwap Trader — graduated tokens with real AMM pool ────────────────────
+// PumpSwap = Raydium-equivalent after pump.fun graduation.
+// Real AMM depth means sells work properly (unlike bonding curve).
+// Fresh graduates (<2h) often rally 30-100% as DEX aggregators list them.
+
+async function pollPumpswapTokens(keypair: Keypair, connection: Connection): Promise<void> {
+  try {
+    const DEXSCREENER = 'https://api.dexscreener.com/latest/dex';
+    const seen = new Set<string>();
+    const candidates: any[] = [];
+
+    // Token profiles often includes fresh pumpswap graduates
+    try {
+      const profR = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
+      const mints: string[] = ((Array.isArray(profR.data) ? profR.data : []) as any[])
+        .filter((p: any) => p.chainId === 'solana' && p.tokenAddress && !seen.has(p.tokenAddress))
+        .map((p: any) => { seen.add(p.tokenAddress); return p.tokenAddress; })
+        .slice(0, 30);
+      if (mints.length > 0) {
+        const pr = await axios.get(`${DEXSCREENER}/tokens/${mints.join(',')}`, { timeout: 6_000 });
+        for (const p of (pr.data?.pairs ?? []) as any[]) {
+          if (p.chainId !== 'solana') continue;
+          if ((p.dexId ?? '').toLowerCase() !== 'pumpswap') continue;
+          const m = p.baseToken?.address;
+          if (!m || seen.has(m)) continue;
+          seen.add(m);
+          candidates.push(p);
+        }
+      }
+    } catch { /* fail-open */ }
+
+    // Also search directly for pumpswap pairs
+    for (const q of ['pumpswap graduated', 'sol new pump']) {
+      try {
+        const r = await axios.get(`${DEXSCREENER}/search?q=${encodeURIComponent(q)}`, { timeout: 5_000 });
+        for (const p of (r.data?.pairs ?? []) as any[]) {
+          if (p.chainId !== 'solana') continue;
+          if ((p.dexId ?? '').toLowerCase() !== 'pumpswap') continue;
+          const m = p.baseToken?.address;
+          if (!m || seen.has(m)) continue;
+          seen.add(m);
+          candidates.push(p);
+        }
+        await new Promise(res => setTimeout(res, 300));
+      } catch { /* skip */ }
+    }
+
+    for (const p of candidates) {
+      const mint: string = p.baseToken?.address ?? '';
+      if (!mint) continue;
+      if (recentMints.has(mint) || positions.has(mint) || positions2.has(mint)) continue;
+      if (!checkDailyBudget2(PUMPSWAP_BUY_SOL)) break;
+      if (positions2.size >= BONDING_MAX_POSITIONS) break;
+
+      const liq = Number(p.liquidity?.usd ?? 0);
+      if (liq < PUMPSWAP_MIN_LIQ || liq > PUMPSWAP_MAX_LIQ) continue;
+
+      const createdAt = p.pairCreatedAt ? Number(p.pairCreatedAt) : 0;
+      const ageSec    = createdAt > 0 ? (Date.now() - createdAt) / 1000 : 0;
+      if (ageSec < 60 || ageSec > PUMPSWAP_MAX_AGE_MIN * 60) continue;
+
+      const pc5m   = Number(p.priceChange?.m5 ?? 0);
+      const pc1h   = Number(p.priceChange?.h1 ?? 0);
+      const vol1h  = Number(p.volume?.h1 ?? 0);
+      const buys5m = Number(p.txns?.m5?.buys ?? 0);
+
+      if (pc5m < 1)    continue; // must be rising right now
+      if (pc1h < 0)    continue; // no downtrend in last hour
+      if (vol1h < 3000) continue; // real volume (not ghost pair)
+      if (buys5m < 3)  continue;
+
+      const symbol  = (p.baseToken?.symbol ?? mint.slice(0, 4)).toUpperCase();
+      const name    = p.baseToken?.name ?? symbol;
+      if (isRugPattern(name, symbol)) continue;
+
+      const mcapUsd = Number(p.fdv ?? p.marketCap ?? 0);
+      const mcapSol = mcapUsd / solPriceUsd;
+
+      console.info(
+        `[bonding-scan] 🔄 PUMPSWAP ${symbol} liq:$${liq.toFixed(0)} mcap:$${mcapUsd.toFixed(0)} ` +
+        `pc5m:+${pc5m.toFixed(1)}% pc1h:+${pc1h.toFixed(1)}% vol1h:$${vol1h.toFixed(0)} ` +
+        `age:${(ageSec / 60).toFixed(0)}min — entering`
+      );
+
+      recentMints.add(mint);
+      const buyResult = await buyOnBondingCurve(mint, PUMPSWAP_BUY_SOL, keypair, connection, 'pumpswap');
+      if (!buyResult.success) { recentMints.delete(mint); continue; }
+
+      bonding2DailySpent += PUMPSWAP_BUY_SOL;
+
+      try {
+        await query(
+          `INSERT INTO autobuy_jobs
+             (mint_address, label, amount_sol, slippage_bps, interval_seconds,
+              autosell_enabled, active, last_tx_signature, bought_at, last_activity_at,
+              total_spent_sol, time_limit_seconds, time_limit_enabled)
+           VALUES ($1,$2,$3,150,60,false,true,$4,now(),now(),$3,$5,true)
+           ON CONFLICT DO NOTHING`,
+          [mint, `auto:bonding:pumpswap:${symbol}:liq${Math.round(liq / 1000)}k:mcap${Math.round(mcapSol)}sol`, PUMPSWAP_BUY_SOL, buyResult.txSignature ?? '', PUMPSWAP_TIME_LIMIT]
+        );
+        await query(
+          `INSERT INTO tokens (mint_address, symbol, name, last_updated) VALUES ($1,$2,$3,now())
+           ON CONFLICT (mint_address) DO UPDATE SET symbol=COALESCE(EXCLUDED.symbol,tokens.symbol), name=COALESCE(EXCLUDED.name,tokens.name), last_updated=now()`,
+          [mint, symbol || null, name || null]
+        );
+      } catch (e: any) {
+        console.warn(`[bonding-scan] PUMPSWAP DB error ${mint.slice(0, 8)}: ${e.message?.slice(0, 60)}`);
+      }
+
+      positions2.set(mint, {
+        mint, symbol, name,
+        buyTx: buyResult.txSignature ?? '',
+        buyTime: Date.now(),
+        buySol: PUMPSWAP_BUY_SOL,
+        entryMcapSol: mcapSol, currentMcapSol: mcapSol, peakMcapSol: mcapSol,
+        tpIndex: 0, allTpsDone: false,
+        uniqueBuyers: new Set(), recentBuySol: 0, recentSellSol: 0,
+        windowResetAt: Date.now() + 90_000,
+        dexPool: 'pumpswap',
+        tpLevels: PUMPSWAP_TPS,
+        stopPct: PUMPSWAP_STOP_PCT,
+      });
+
+      if (wsInstance?.readyState === WebSocket.OPEN) {
+        wsInstance.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
+      }
+
+      setTimeout(async () => {
+        const pos = positions2.get(mint);
+        if (!pos) return;
+        console.info(`[bonding-scan] ⏱ TIME_LIMIT PUMPSWAP ${pos.symbol} — selling 100%`);
+        positions2.delete(mint);
+        await sellOnBondingCurve(mint, 100, keypair, connection, 'pumpswap');
+      }, PUMPSWAP_TIME_LIMIT * 1000);
+
+      await new Promise(res => setTimeout(res, 2000));
+    }
+  } catch (err: any) {
+    console.debug(`[bonding-scan] PUMPSWAP poll error: ${err.message?.slice(0, 60)}`);
+  }
+}
+
 // ─── Recover positions from DB after restart ──────────────────────────────────
 
 async function recoverOrphanedPositions(keypair: Keypair, connection: Connection): Promise<void> {
@@ -1161,19 +1462,21 @@ async function recoverOrphanedPositions(keypair: Keypair, connection: Connection
 export function startBondingScanner(): void {
   if (running) return;
 
-  const wsEnabled  = process.env.BONDING_SCANNER_ENABLED === 'true';
-  const hotEnabled = BONDING_HOT_ENABLED;
+  const wsEnabled   = process.env.BONDING_SCANNER_ENABLED === 'true';
+  const hotEnabled  = BONDING_HOT_ENABLED;
+  const gradEnabled = GRAD_HUNTER_ENABLED;
+  const psEnabled   = PUMPSWAP_ENABLED;
 
   // Need at least one active mode and a keypair to run
-  if (!wsEnabled && !hotEnabled) {
-    console.info('[bonding-scan] Both BONDING_SCANNER_ENABLED and BONDING_HOT_ENABLED are false — disabled');
+  if (!wsEnabled && !hotEnabled && !gradEnabled && !psEnabled) {
+    console.info('[bonding-scan] All modes disabled (WS/HOT/GRAD/PUMPSWAP) — skipping');
     return;
   }
 
-  // HOT-only mode: PUMPFUN_WALLET_PRIVATE_KEY_2 is the HOT wallet
+  // HOT/GRAD/PUMPSWAP modes use wallet 2
   const hotKeypairRaw = loadPumpFunKeypair2();
-  if (hotEnabled && !wsEnabled && !hotKeypairRaw) {
-    console.info('[bonding-scan] HOT mode requires PUMPFUN_WALLET_PRIVATE_KEY_2 — disabled');
+  if ((hotEnabled || gradEnabled || psEnabled) && !wsEnabled && !hotKeypairRaw) {
+    console.info('[bonding-scan] HOT/GRAD/PUMPSWAP modes require PUMPFUN_WALLET_PRIVATE_KEY_2 — disabled');
     return;
   }
 
@@ -1234,11 +1537,30 @@ export function startBondingScanner(): void {
   // NEW token poll — catches tokens 1-14 min old before HOT window
   if (BONDING_NEW_ENABLED) {
     const newKeypair = keypairInstance2 ?? baseKeypair;
-    // Offset by 15s so NEW and HOT polls don't overlap on DexScreener
     setTimeout(() => {
       setInterval(() => pollNewPumpfunTokens(newKeypair, connectionInstance!).catch(() => {}), BONDING_NEW_INTERVAL_MS);
     }, 15_000);
     console.info(`[bonding-scan] NEW poller scheduled every ${BONDING_NEW_INTERVAL_MS / 1000}s (0.01 SOL, 1-14min age)`);
+  }
+
+  // Graduation Hunter — pre-graduation pump.fun tokens ($40k-65k mcap)
+  if (gradEnabled) {
+    const gradKeypair = keypairInstance2 ?? baseKeypair;
+    // Offset 10s from HOT poll to spread DexScreener load
+    setTimeout(() => {
+      setInterval(() => pollGraduationHunterTokens(gradKeypair, connectionInstance!).catch(() => {}), GRAD_HUNTER_INTERVAL_MS);
+    }, 10_000);
+    console.info(`[bonding-scan] GRAD-HUNTER scheduled every ${GRAD_HUNTER_INTERVAL_MS / 1000}s ($${GRAD_HUNTER_MIN_MCAP / 1000}k-${GRAD_HUNTER_MAX_MCAP / 1000}k mcap)`);
+  }
+
+  // PumpSwap Trader — recently graduated tokens on real AMM
+  if (psEnabled) {
+    const psKeypair = keypairInstance2 ?? baseKeypair;
+    // Offset 20s from grad poll
+    setTimeout(() => {
+      setInterval(() => pollPumpswapTokens(psKeypair, connectionInstance!).catch(() => {}), PUMPSWAP_INTERVAL_MS);
+    }, 20_000);
+    console.info(`[bonding-scan] PUMPSWAP scheduled every ${PUMPSWAP_INTERVAL_MS / 1000}s (liq $${PUMPSWAP_MIN_LIQ / 1000}k-${PUMPSWAP_MAX_LIQ / 1000}k, max age ${PUMPSWAP_MAX_AGE_MIN}min)`);
   }
 
   // Always connect WebSocket — needed for real-time TP/stop sells even in HOT-only mode.
