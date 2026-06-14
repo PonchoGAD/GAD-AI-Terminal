@@ -119,7 +119,7 @@ const GRAD_TPS = [
 const PUMPSWAP_ENABLED        = process.env.PUMPSWAP_ENABLED === 'true';
 const PUMPSWAP_INTERVAL_MS    = Number(process.env.PUMPSWAP_INTERVAL_SEC      || '20') * 1000;
 const PUMPSWAP_BUY_SOL        = Number(process.env.PUMPSWAP_BUY_SOL           || '0.015');
-const PUMPSWAP_MIN_LIQ        = Number(process.env.PUMPSWAP_MIN_LIQ_USD       || '30000');
+const PUMPSWAP_MIN_LIQ        = Number(process.env.PUMPSWAP_MIN_LIQ_USD       || '15000');
 const PUMPSWAP_MAX_LIQ        = Number(process.env.PUMPSWAP_MAX_LIQ_USD       || '300000');
 const PUMPSWAP_MAX_AGE_MIN    = Number(process.env.PUMPSWAP_MAX_AGE_MIN       || '120');   // 2 hours
 const PUMPSWAP_TIME_LIMIT     = Number(process.env.PUMPSWAP_TIME_LIMIT_SEC    || '1800');  // 30 min
@@ -1154,20 +1154,20 @@ async function pollGraduationHunterTokens(keypair: Keypair, connection: Connecti
 
       // Must have recent trade volume (not a stale listing)
       const vol5m  = Number(p.volume?.m5 ?? 0);
-      if (vol5m < 200) continue;
+      if (vol5m < 100) { gradFiltered++; continue; }
 
       const createdAt = p.pairCreatedAt ? Number(p.pairCreatedAt) : 0;
       const ageSec = createdAt > 0 ? (Date.now() - createdAt) / 1000 : 0;
-      if (ageSec > 6 * 3600) continue; // max 6 hours — if still not graduated in 6h, probably never will
+      if (ageSec > 6 * 3600) { gradFiltered++; continue; }
 
       const pc5m   = Number(p.priceChange?.m5 ?? 0);
       const buys5m = Number(p.txns?.m5?.buys ?? 0);
       const sells5m = Number(p.txns?.m5?.sells ?? 0);
 
-      if (pc5m <= 0) continue;   // must be rising right now
-      if (buys5m < 3) continue;
+      if (pc5m <= 0) { gradFiltered++; continue; }
+      if (buys5m < 3) { gradFiltered++; continue; }
       const bsRatio = sells5m > 0 ? buys5m / sells5m : buys5m;
-      if (bsRatio < 1.2) continue; // buyers outnumber sellers
+      if (bsRatio < 1.2) { gradFiltered++; continue; }
 
       const symbol = (p.baseToken?.symbol ?? mint.slice(0, 4)).toUpperCase();
       const name   = p.baseToken?.name ?? symbol;
@@ -1235,6 +1235,9 @@ async function pollGraduationHunterTokens(keypair: Keypair, connection: Connecti
 
       await new Promise(res => setTimeout(res, 2000));
     }
+    if (gradFiltered > 0) {
+      console.debug(`[bonding-scan] GRAD filtered: ${gradFiltered} rejected (mcap/vol/age/momentum)`);
+    }
   } catch (err: any) {
     console.debug(`[bonding-scan] GRAD poll error: ${err.message?.slice(0, 60)}`);
   }
@@ -1287,6 +1290,7 @@ async function pollPumpswapTokens(keypair: Keypair, connection: Connection): Pro
       } catch { /* skip */ }
     }
 
+    let psLiq = 0, psAge = 0, psMom = 0;
     console.debug(`[bonding-scan] PUMPSWAP poll: ${candidates.length} candidates from DexScreener`);
     for (const p of candidates) {
       const mint: string = p.baseToken?.address ?? '';
@@ -1296,21 +1300,18 @@ async function pollPumpswapTokens(keypair: Keypair, connection: Connection): Pro
       if (positions2.size >= BONDING_MAX_POSITIONS) break;
 
       const liq = Number(p.liquidity?.usd ?? 0);
-      if (liq < PUMPSWAP_MIN_LIQ || liq > PUMPSWAP_MAX_LIQ) continue;
+      if (liq < PUMPSWAP_MIN_LIQ || liq > PUMPSWAP_MAX_LIQ) { psLiq++; continue; }
 
       const createdAt = p.pairCreatedAt ? Number(p.pairCreatedAt) : 0;
       const ageSec    = createdAt > 0 ? (Date.now() - createdAt) / 1000 : 0;
-      if (ageSec < 60 || ageSec > PUMPSWAP_MAX_AGE_MIN * 60) continue;
+      if (ageSec < 60 || ageSec > PUMPSWAP_MAX_AGE_MIN * 60) { psAge++; continue; }
 
       const pc5m   = Number(p.priceChange?.m5 ?? 0);
       const pc1h   = Number(p.priceChange?.h1 ?? 0);
       const vol1h  = Number(p.volume?.h1 ?? 0);
       const buys5m = Number(p.txns?.m5?.buys ?? 0);
 
-      if (pc5m < 1)    continue; // must be rising right now
-      if (pc1h < 0)    continue; // no downtrend in last hour
-      if (vol1h < 3000) continue; // real volume (not ghost pair)
-      if (buys5m < 3)  continue;
+      if (pc5m < 1 || pc1h < 0 || vol1h < 1000 || buys5m < 3) { psMom++; continue; }
 
       const symbol  = (p.baseToken?.symbol ?? mint.slice(0, 4)).toUpperCase();
       const name    = p.baseToken?.name ?? symbol;
@@ -1377,6 +1378,9 @@ async function pollPumpswapTokens(keypair: Keypair, connection: Connection): Pro
       }, PUMPSWAP_TIME_LIMIT * 1000);
 
       await new Promise(res => setTimeout(res, 2000));
+    }
+    if (psLiq + psAge + psMom > 0) {
+      console.debug(`[bonding-scan] PUMPSWAP filtered: liq=${psLiq} age=${psAge} mom=${psMom}`);
     }
   } catch (err: any) {
     console.debug(`[bonding-scan] PUMPSWAP poll error: ${err.message?.slice(0, 60)}`);
