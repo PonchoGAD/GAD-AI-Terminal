@@ -1140,6 +1140,8 @@ async function pollGraduationHunterTokens(keypair: Keypair, connection: Connecti
       } catch { /* skip */ }
     }
 
+    console.debug(`[bonding-scan] GRAD poll: ${candidates.length} candidates from DexScreener`);
+    let gradFiltered = 0;
     for (const p of candidates) {
       const mint: string = p.baseToken?.address ?? '';
       if (!mint) continue;
@@ -1148,7 +1150,7 @@ async function pollGraduationHunterTokens(keypair: Keypair, connection: Connecti
       if (positions2.size >= BONDING_MAX_POSITIONS) break;
 
       const mcapUsd = Number(p.fdv ?? p.marketCap ?? 0);
-      if (mcapUsd < GRAD_HUNTER_MIN_MCAP || mcapUsd > GRAD_HUNTER_MAX_MCAP) continue;
+      if (mcapUsd < GRAD_HUNTER_MIN_MCAP || mcapUsd > GRAD_HUNTER_MAX_MCAP) { gradFiltered++; continue; }
 
       // Must have recent trade volume (not a stale listing)
       const vol5m  = Number(p.volume?.m5 ?? 0);
@@ -1285,6 +1287,7 @@ async function pollPumpswapTokens(keypair: Keypair, connection: Connection): Pro
       } catch { /* skip */ }
     }
 
+    console.debug(`[bonding-scan] PUMPSWAP poll: ${candidates.length} candidates from DexScreener`);
     for (const p of candidates) {
       const mint: string = p.baseToken?.address ?? '';
       if (!mint) continue;
