@@ -46,11 +46,13 @@ const BONDING_MIN_BUYERS     = Number(process.env.BONDING_MIN_BUYERS    || '50')
 // Watchlist window: drop candidate if buyers not reached within this time
 const BONDING_WATCH_TIMEOUT_MS = Number(process.env.BONDING_WATCH_TIMEOUT_SEC || '1020') * 1000;
 
-// Time limit before force-exit on bonding curve (seconds)
-const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '600');
+// Time limit before force-exit on bonding curve (seconds).
+// HOT tokens that don't recover in 5 minutes are dead — exit fast, preserve capital.
+const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '300');
 
-// Stop loss: 17% from entry price
-const BONDING_STOP_PCT = Number(process.env.BONDING_STOP_PCT || '0.17');
+// Stop loss: 12% from entry price. At bonding curve liquidity levels, a 12% mcap
+// drop already costs ~28% of actual SOL invested due to slippage. Tighter = less damage.
+const BONDING_STOP_PCT = Number(process.env.BONDING_STOP_PCT || '0.12');
 
 // 5 TP levels: mult → sell pct
 const BONDING_TPS = [
@@ -75,10 +77,10 @@ const SOLANA_RPC      = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.sola
 // Use case: tokens that launched before the scanner started, or are in the HOT section.
 const BONDING_HOT_ENABLED     = process.env.BONDING_HOT_ENABLED === 'true';
 const BONDING_HOT_INTERVAL_MS = Number(process.env.BONDING_HOT_INTERVAL_SEC || '60') * 1000;
-// Max mcap $12k keeps tokens on bonding curve (graduation threshold ≈ $12-13k at ~$150/SOL)
-// Tokens above $12k have graduated to PumpSwap and need different buy/sell mechanism
+// Max mcap $8k — keep well below $12k graduation threshold where liquidity is thin.
+// Near-graduation tokens have steep bonding curve → tiny sells cause huge price drops.
 const BONDING_HOT_MIN_MCAP    = Number(process.env.BONDING_HOT_MIN_MCAP_USD || '3000');
-const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '12000');
+const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '8000');
 const BONDING_HOT_MIN_AGE_SEC = Number(process.env.BONDING_HOT_MIN_AGE_SEC || '900');  // 15 min
 const BONDING_HOT_MAX_AGE_SEC = Number(process.env.BONDING_HOT_MAX_AGE_SEC || String(4 * 3600)); // 4h
 
@@ -708,26 +710,39 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
       if (mcapSol > BONDING_MAX_MCAP_SOL) continue;
 
       // Require real buying activity — not just dev pumping
-      const buys5m = Number(coin.buys5m ?? 0);
-      const vol5m  = Number(coin.vol5m ?? 0);
-      const pc5m   = Number(coin.pc5m ?? 0);
-      if (buys5m < 8) {
-        console.debug(`[bonding-scan] ✗hot ${symbol} buys5m:${buys5m} (min 8)`);
+      const buys5m  = Number(coin.buys5m  ?? 0);
+      const sells5m = Number(coin.sells5m ?? 0);
+      const vol5m   = Number(coin.vol5m   ?? 0);
+      const pc5m    = Number(coin.pc5m    ?? 0);
+      const bsRatio = sells5m > 0 ? buys5m / sells5m : buys5m;
+
+      // Min 10 buy txns in last 5m (real interest, not just dev)
+      if (buys5m < 10) {
+        console.debug(`[bonding-scan] ✗hot ${symbol} buys5m:${buys5m} (min 10)`);
         continue;
       }
-      if (vol5m < 500) {
-        console.debug(`[bonding-scan] ✗hot ${symbol} vol5m:$${vol5m.toFixed(0)} (min $500)`);
+      // Min $800 vol in 5m (real capital, not micro-trades)
+      if (vol5m < 800) {
+        console.debug(`[bonding-scan] ✗hot ${symbol} vol5m:$${vol5m.toFixed(0)} (min $800)`);
         continue;
       }
-      if (pc5m < 0) {
-        console.debug(`[bonding-scan] ✗hot ${symbol} pc5m:${pc5m.toFixed(1)}% (must be positive)`);
+      // pc5m must be slightly positive but NOT overextended — DexScreener data lags 30-60s,
+      // a +10%+ reading means the pump ALREADY HAPPENED and we'd be buying the top
+      if (pc5m < 1 || pc5m > 8) {
+        console.debug(`[bonding-scan] ✗hot ${symbol} pc5m:${pc5m.toFixed(1)}% (need 1-8%)`);
+        continue;
+      }
+      // Buyers must outnumber sellers: buy/sell ratio >= 1.5
+      if (bsRatio < 1.5) {
+        console.debug(`[bonding-scan] ✗hot ${symbol} bsRatio:${bsRatio.toFixed(1)} (min 1.5)`);
         continue;
       }
 
       const dexPool = coin.dexPool ?? 'pump';
       console.info(
         `[bonding-scan] 🔥 HOT ${symbol} mcap:$${mcapUsd.toFixed(0)} ` +
-        `buys5m:${buys5m} vol5m:$${vol5m.toFixed(0)} pc5m:${pc5m.toFixed(1)}% ` +
+        `buys5m:${buys5m} sells5m:${sells5m} ratio:${bsRatio.toFixed(1)}x ` +
+        `vol5m:$${vol5m.toFixed(0)} pc5m:${pc5m.toFixed(1)}% ` +
         `age:${(tokenAgeSec / 60).toFixed(0)}min pool:${dexPool} — entering w2`
       );
 
