@@ -47,8 +47,8 @@ const BONDING_MIN_BUYERS     = Number(process.env.BONDING_MIN_BUYERS    || '50')
 const BONDING_WATCH_TIMEOUT_MS = Number(process.env.BONDING_WATCH_TIMEOUT_SEC || '1020') * 1000;
 
 // Time limit before force-exit (seconds).
-// Movers strategy: if token hasn't pumped in 2min → dead, exit fast.
-const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '120');
+// 10 min hold — mover tokens can take 3-8 min to fully pump after initial signal.
+const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '600');
 
 // Stop loss: 10% from entry. Movers either go up fast or dump — no reason to hold losers.
 const BONDING_STOP_PCT = Number(process.env.BONDING_STOP_PCT || '0.10');
@@ -77,12 +77,13 @@ const SOLANA_RPC      = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.sola
 const BONDING_HOT_ENABLED     = process.env.BONDING_HOT_ENABLED === 'true';
 // Poll every 20s to catch early movers before the pump is over
 const BONDING_HOT_INTERVAL_MS = Number(process.env.BONDING_HOT_INTERVAL_SEC || '20') * 1000;
-const BONDING_HOT_MIN_MCAP    = Number(process.env.BONDING_HOT_MIN_MCAP_USD || '3000');
-const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '8000');
+// $10k+ mcap = enough pool depth to avoid 20-50% slippage on exit (0.015 SOL = 0.01% of pool)
+const BONDING_HOT_MIN_MCAP    = Number(process.env.BONDING_HOT_MIN_MCAP_USD || '10000');
+const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '25000');
 // Movers window: catch tokens 90 seconds to 8 minutes old.
 // Past initial sniper bots (first 60-90s), but before the pump is fully in.
-const BONDING_HOT_MIN_AGE_SEC = Number(process.env.BONDING_HOT_MIN_AGE_SEC || '90');   // 1.5 min
-const BONDING_HOT_MAX_AGE_SEC = Number(process.env.BONDING_HOT_MAX_AGE_SEC || '480');  // 8 min
+const BONDING_HOT_MIN_AGE_SEC = Number(process.env.BONDING_HOT_MIN_AGE_SEC || '60');    // 1 min
+const BONDING_HOT_MAX_AGE_SEC = Number(process.env.BONDING_HOT_MAX_AGE_SEC || '1200'); // 20 min
 
 // NEW token poller — catches tokens 1-14 min old before they become HOT
 // Earlier stage = higher risk, smaller position, tighter limits
@@ -706,12 +707,9 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
       if (!checkDailyBudget2(BONDING_BUY_SOL)) break;
       if (positions2.size >= BONDING_MAX_POSITIONS) break;
 
-      // Movers range: low mcap = early stage (not already pumped)
-      // Min $500 to have some real token value, max $6k to stay pre-pump
+      // Movers range: enough mcap for liquidity (avoid slippage), not yet fully pumped
       const mcapUsd = Number(coin.usd_market_cap ?? 0);
-      const hotMinMcap = Number(process.env.BONDING_HOT_MIN_MCAP_USD || '500');
-      const hotMaxMcap = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '6000');
-      if (mcapUsd < hotMinMcap || mcapUsd > hotMaxMcap) continue;
+      if (mcapUsd < BONDING_HOT_MIN_MCAP || mcapUsd > BONDING_HOT_MAX_MCAP) continue;
 
       // Must have traded very recently (< 90 seconds ago)
       const lastTradeTs = Number(coin.last_trade_timestamp ?? 0) * 1000;
@@ -793,6 +791,16 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
             BONDING_BUY_SOL, buyResult.txSignature ?? '',
             BONDING_TIME_LIMIT_SEC,
           ]
+        );
+        // Enrich tokens table with symbol/name from DexScreener (bonding scanner bypasses scanner service)
+        await query(
+          `INSERT INTO tokens (mint_address, symbol, name, last_updated)
+           VALUES ($1,$2,$3,now())
+           ON CONFLICT (mint_address) DO UPDATE
+             SET symbol = COALESCE(EXCLUDED.symbol, tokens.symbol),
+                 name   = COALESCE(EXCLUDED.name, tokens.name),
+                 last_updated = now()`,
+          [mint, symbol || null, name || null]
         );
       } catch (dbErr: any) {
         console.warn(`[bonding-scan] HOT DB error ${mint.slice(0, 8)}: ${dbErr.message?.slice(0, 60)}`);
@@ -1203,6 +1211,15 @@ export function startBondingScanner(): void {
 
   refreshSolPrice().catch(() => {});
   setInterval(() => refreshSolPrice().catch(() => {}), 5 * 60_000);
+
+  // Restore today's spending from DB so daily limit survives container restarts
+  query<{ spent: string }>(
+    `SELECT COALESCE(SUM(total_spent_sol), 0) AS spent FROM autobuy_jobs
+     WHERE label LIKE 'auto:bonding%' AND bought_at >= CURRENT_DATE`
+  ).then(r => {
+    bonding2DailySpent = Number(r.rows[0]?.spent ?? 0);
+    console.info(`[bonding-scan] Daily spent (W2) restored: ${bonding2DailySpent.toFixed(4)} SOL`);
+  }).catch(() => {});
 
   recoverOrphanedPositions(baseKeypair, connectionInstance).catch(() => {});
   setInterval(() => pollBondingPositions(baseKeypair, connectionInstance!).catch(() => {}), DS_POLL_INTERVAL_MS);

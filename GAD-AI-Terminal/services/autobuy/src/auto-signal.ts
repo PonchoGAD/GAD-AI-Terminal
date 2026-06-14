@@ -735,10 +735,9 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     return;
   }
 
-  // FEAR regime: require stronger momentum to enter
-  const minPc1hOverride = regime === 'FEAR'
-    ? Math.max(RAYDIUM_MIN_PC1H, 15)   // need 15% 1h gain minimum in fear
-    : RAYDIUM_MIN_PC1H;
+  // Contrarian buy in FEAR: same momentum threshold in all regimes.
+  // TP targets are already lowered in FEAR (1.18x vs 1.30x) — no need to gate on pc1h.
+  const minPc1hOverride = RAYDIUM_MIN_PC1H;
 
   const dailySpent = await getDailySpent();
   if (dailySpent >= DAILY_MAX_SOL) return;
