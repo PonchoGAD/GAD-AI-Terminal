@@ -121,7 +121,7 @@ const PUMPSWAP_INTERVAL_MS    = Number(process.env.PUMPSWAP_INTERVAL_SEC      ||
 const PUMPSWAP_BUY_SOL        = Number(process.env.PUMPSWAP_BUY_SOL           || '0.015');
 const PUMPSWAP_MIN_LIQ        = Number(process.env.PUMPSWAP_MIN_LIQ_USD       || '8000');
 const PUMPSWAP_MAX_LIQ        = Number(process.env.PUMPSWAP_MAX_LIQ_USD       || '500000');
-const PUMPSWAP_MAX_AGE_MIN    = Number(process.env.PUMPSWAP_MAX_AGE_MIN       || '240');   // 4 hours
+const PUMPSWAP_MAX_AGE_MIN    = Number(process.env.PUMPSWAP_MAX_AGE_MIN       || '480');   // 8 hours
 const PUMPSWAP_TIME_LIMIT     = Number(process.env.PUMPSWAP_TIME_LIMIT_SEC    || '1800');  // 30 min
 const PUMPSWAP_STOP_PCT       = Number(process.env.PUMPSWAP_STOP_PCT          || '0.08');
 const PUMPSWAP_TPS = [
@@ -1253,45 +1253,51 @@ async function pollPumpswapTokens(keypair: Keypair, connection: Connection): Pro
     const seen = new Set<string>();
     const candidates: any[] = [];
 
-    // Primary: DexScreener latest pairs for pumpswap DEX (most recently created first)
+    // Primary: token profiles (trending/recently listed solana tokens)
     try {
-      const r = await axios.get(
-        'https://api.dexscreener.com/latest/dex/pairs/solana/pumpswap',
-        { timeout: 7_000 }
-      );
-      for (const p of (r.data?.pairs ?? []) as any[]) {
-        if (p.chainId !== 'solana') continue;
-        const m = p.baseToken?.address;
-        if (!m || seen.has(m)) continue;
-        seen.add(m);
-        candidates.push(p);
+      const profR = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
+      const mints: string[] = ((Array.isArray(profR.data) ? profR.data : []) as any[])
+        .filter((p: any) => p.chainId === 'solana' && p.tokenAddress && !seen.has(p.tokenAddress))
+        .map((p: any) => { seen.add(p.tokenAddress); return p.tokenAddress; })
+        .slice(0, 30);
+      if (mints.length > 0) {
+        const pr = await axios.get(
+          `https://api.dexscreener.com/latest/dex/tokens/${mints.join(',')}`,
+          { timeout: 6_000 }
+        );
+        for (const p of (pr.data?.pairs ?? []) as any[]) {
+          if (p.chainId !== 'solana') continue;
+          if ((p.dexId ?? '').toLowerCase() !== 'pumpswap') continue;
+          const m = p.baseToken?.address;
+          if (!m || seen.has(m)) continue;
+          seen.add(m);
+          candidates.push(p);
+        }
       }
     } catch { /* fail-open */ }
 
-    // Fallback: token profiles that may include fresh pumpswap graduates
-    if (candidates.length < 10) {
-      try {
-        const profR = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
-        const mints: string[] = ((Array.isArray(profR.data) ? profR.data : []) as any[])
-          .filter((p: any) => p.chainId === 'solana' && p.tokenAddress && !seen.has(p.tokenAddress))
-          .map((p: any) => { seen.add(p.tokenAddress); return p.tokenAddress; })
-          .slice(0, 20);
-        if (mints.length > 0) {
-          const pr = await axios.get(
-            `https://api.dexscreener.com/latest/dex/tokens/${mints.join(',')}`,
-            { timeout: 6_000 }
-          );
-          for (const p of (pr.data?.pairs ?? []) as any[]) {
-            if (p.chainId !== 'solana') continue;
-            if ((p.dexId ?? '').toLowerCase() !== 'pumpswap') continue;
-            const m = p.baseToken?.address;
-            if (!m || seen.has(m)) continue;
-            seen.add(m);
-            candidates.push(p);
-          }
+    // Secondary: token-boosts endpoint (recently boosted = recently graduated often)
+    try {
+      const boostR = await axios.get('https://api.dexscreener.com/token-boosts/latest/v1', { timeout: 6_000 });
+      const boostMints: string[] = ((Array.isArray(boostR.data) ? boostR.data : []) as any[])
+        .filter((p: any) => p.chainId === 'solana' && p.tokenAddress && !seen.has(p.tokenAddress))
+        .map((p: any) => { seen.add(p.tokenAddress); return p.tokenAddress; })
+        .slice(0, 20);
+      if (boostMints.length > 0) {
+        const pr2 = await axios.get(
+          `https://api.dexscreener.com/latest/dex/tokens/${boostMints.join(',')}`,
+          { timeout: 6_000 }
+        );
+        for (const p of (pr2.data?.pairs ?? []) as any[]) {
+          if (p.chainId !== 'solana') continue;
+          if ((p.dexId ?? '').toLowerCase() !== 'pumpswap') continue;
+          const m = p.baseToken?.address;
+          if (!m || seen.has(m)) continue;
+          seen.add(m);
+          candidates.push(p);
         }
-      } catch { /* fail-open */ }
-    }
+      }
+    } catch { /* fail-open */ }
 
     let psLiq = 0, psAge = 0, psMom = 0;
     console.debug(`[bonding-scan] PUMPSWAP poll: ${candidates.length} candidates from DexScreener`);
