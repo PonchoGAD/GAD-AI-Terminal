@@ -947,52 +947,69 @@ async function recoverOrphanedPositions(keypair: Keypair, connection: Connection
 export function startBondingScanner(): void {
   if (running) return;
 
-  if (process.env.BONDING_SCANNER_ENABLED !== 'true') {
-    console.info('[bonding-scan] BONDING_SCANNER_ENABLED≠true — disabled');
+  const wsEnabled  = process.env.BONDING_SCANNER_ENABLED === 'true';
+  const hotEnabled = BONDING_HOT_ENABLED;
+
+  // Need at least one active mode and a keypair to run
+  if (!wsEnabled && !hotEnabled) {
+    console.info('[bonding-scan] Both BONDING_SCANNER_ENABLED and BONDING_HOT_ENABLED are false — disabled');
     return;
   }
 
-  if (!process.env.PUMPFUN_WALLET_PRIVATE_KEY) {
-    console.info('[bonding-scan] PUMPFUN_WALLET_PRIVATE_KEY not set — disabled');
+  // HOT-only mode: PUMPFUN_WALLET_PRIVATE_KEY_2 is the HOT wallet
+  const hotKeypairRaw = loadPumpFunKeypair2();
+  if (hotEnabled && !wsEnabled && !hotKeypairRaw) {
+    console.info('[bonding-scan] HOT mode requires PUMPFUN_WALLET_PRIVATE_KEY_2 — disabled');
     return;
   }
 
+  // WebSocket mode requires wallet 1
   const keypair = loadPumpFunKeypair();
-  if (!keypair) return;
+  if (wsEnabled && !keypair) return;
 
-  keypairInstance = keypair;
+  // Use wallet 1 as connection base (or create dummy connection for HOT-only)
+  const baseKeypair = keypair ?? hotKeypairRaw!;
+  keypairInstance = baseKeypair;
   connectionInstance = new Connection(SOLANA_RPC, 'confirmed');
   running = true;
 
-  // Load wallet 2 for HOT token trading
-  const keypair2 = loadPumpFunKeypair2();
-  if (keypair2) {
-    keypairInstance2 = keypair2;
-    console.info(`[bonding-scan] Wallet 2 loaded: ${keypair2.publicKey.toBase58().slice(0, 8)} (HOT tokens)`);
+  if (hotKeypairRaw) {
+    keypairInstance2 = hotKeypairRaw;
+    console.info(`[bonding-scan] Wallet 2 loaded: ${hotKeypairRaw.publicKey.toBase58().slice(0, 8)} (HOT tokens)`);
   }
 
-  console.info(
-    `[bonding-scan] Starting — wallet1:${keypair.publicKey.toBase58().slice(0, 8)} ` +
-    `buy:${BONDING_BUY_SOL} SOL daily:${BONDING_MAX_SOL_DAILY} SOL ` +
-    `entry:${BONDING_MIN_BUYERS}+ buyers $${BONDING_MIN_MCAP_USD}+ mcap ` +
-    `stop:${BONDING_STOP_PCT * 100}% TPs:1.5/2/3/5/8x trail:${MOON_BAG_TRAIL_PCT * 100}% ` +
-    `HOT:${BONDING_HOT_ENABLED ? `enabled w${keypair2 ? '2' : '1'} every ${BONDING_HOT_INTERVAL_MS / 1000}s` : 'disabled'}`
-  );
+  if (wsEnabled) {
+    console.info(
+      `[bonding-scan] Starting — wallet1:${baseKeypair.publicKey.toBase58().slice(0, 8)} ` +
+      `buy:${BONDING_BUY_SOL} SOL daily:${BONDING_MAX_SOL_DAILY} SOL ` +
+      `entry:${BONDING_MIN_BUYERS}+ buyers $${BONDING_MIN_MCAP_USD}+ mcap ` +
+      `stop:${BONDING_STOP_PCT * 100}% TPs:1.5/2/3/5/8x trail:${MOON_BAG_TRAIL_PCT * 100}% ` +
+      `HOT:${hotEnabled ? `enabled w${hotKeypairRaw ? '2' : '1'} every ${BONDING_HOT_INTERVAL_MS / 1000}s` : 'disabled'}`
+    );
+  } else {
+    console.info(
+      `[bonding-scan] HOT-only mode — WebSocket scanner disabled. ` +
+      `wallet:${baseKeypair.publicKey.toBase58().slice(0, 8)} ` +
+      `buy:${BONDING_BUY_SOL} SOL stop:${BONDING_STOP_PCT * 100}% maxMcap:$${BONDING_HOT_MAX_MCAP} ` +
+      `poll every ${BONDING_HOT_INTERVAL_MS / 1000}s`
+    );
+  }
 
   refreshSolPrice().catch(() => {});
   setInterval(() => refreshSolPrice().catch(() => {}), 5 * 60_000);
 
-  recoverOrphanedPositions(keypair, connectionInstance).catch(() => {});
-  setInterval(() => pollBondingPositions(keypair, connectionInstance!).catch(() => {}), DS_POLL_INTERVAL_MS);
+  recoverOrphanedPositions(baseKeypair, connectionInstance).catch(() => {});
+  setInterval(() => pollBondingPositions(baseKeypair, connectionInstance!).catch(() => {}), DS_POLL_INTERVAL_MS);
 
   // HOT token poll — use wallet 2 if available, otherwise wallet 1
-  if (BONDING_HOT_ENABLED) {
-    const hotKeypair = keypairInstance2 ?? keypair;
+  if (hotEnabled) {
+    const hotKeypair = keypairInstance2 ?? baseKeypair;
     setInterval(() => pollHotPumpfunTokens(hotKeypair, connectionInstance!).catch(() => {}), BONDING_HOT_INTERVAL_MS);
     console.info(`[bonding-scan] HOT poller scheduled every ${BONDING_HOT_INTERVAL_MS / 1000}s`);
   }
 
-  connectBondingWS();
+  // Only connect WebSocket if explicitly enabled
+  if (wsEnabled) connectBondingWS();
 }
 
 export function stopBondingScanner(): void {
