@@ -198,5 +198,37 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+  base-scanner:
+    build:
+      context: .
+      dockerfile: services/base-scanner/Dockerfile
+    container_name: gad-ai-base-scanner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      PORT: "4005"
+      BASE_AUTO_BUY: "false"
+      BASE_BUY_ETH: "0.005"
+      BASE_MAX_POSITIONS: "5"
+      BASE_MAX_ETH_DAILY: "0.1"
+      BASE_SCAN_INTERVAL_SEC: "30"
+      BASE_MIN_LIQUIDITY_USD: "15000"
+      BASE_MAX_LIQUIDITY_USD: "500000"
+      BASE_MIN_PC1H: "8"
+      BASE_MAX_PC1H: "60"
+      BASE_MIN_PC5M: "2"
+      BASE_MIN_VOL_LIQ_RATIO: "0.20"
+      BASE_STOP_LOSS_PCT: "10"
+      BASE_TRAIL_PCT: "8"
+      BASE_TIME_LIMIT_SEC: "3600"
+    ports:
+      - "4005:4005"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
 volumes:
   postgres-data:

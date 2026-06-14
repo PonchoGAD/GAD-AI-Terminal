@@ -959,6 +959,49 @@ export function registerRoutes(app: Application) {
       res.json({ trending: trending.rows, breakdown: scores.rows });
     });
   });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // BASE NETWORK (EVM) — proxy to base-scanner service
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  const BASE_SCANNER_URL = process.env.BASE_SCANNER_URL ?? 'http://base-scanner:4005';
+
+  async function proxyBase(res: Response, path: string, opts?: { method?: string; body?: any }) {
+    const http = await import('http');
+    const url = new URL(path, BASE_SCANNER_URL);
+    return new Promise<void>((resolve) => {
+      const reqOpts = {
+        hostname: url.hostname,
+        port:     url.port || 4005,
+        path:     url.pathname + url.search,
+        method:   opts?.method ?? 'GET',
+        headers:  opts?.body ? { 'Content-Type': 'application/json' } : {},
+      };
+      const req2 = http.request(reqOpts, (r2) => {
+        let body = '';
+        r2.on('data', (d: Buffer) => { body += d.toString(); });
+        r2.on('end', () => {
+          try { res.status(r2.statusCode ?? 200).json(JSON.parse(body)); }
+          catch { res.status(500).json({ ok: false, error: 'base-scanner parse error' }); }
+          resolve();
+        });
+      });
+      req2.on('error', (e: Error) => {
+        res.status(503).json({ ok: false, error: `base-scanner unavailable: ${e.message}` });
+        resolve();
+      });
+      if (opts?.body) req2.write(JSON.stringify(opts.body));
+      req2.end();
+    });
+  }
+
+  app.get('/base/status',          (req, res) => proxyBase(res, '/base/status'));
+  app.get('/base/positions',       (req, res) => proxyBase(res, `/base/positions?limit=${req.query.limit ?? 20}&offset=${req.query.offset ?? 0}`));
+  app.get('/base/positions/:id',   (req, res) => proxyBase(res, `/base/positions/${req.params.id}`));
+  app.get('/base/trades',          (req, res) => proxyBase(res, `/base/trades?limit=${req.query.limit ?? 10}&offset=${req.query.offset ?? 0}`));
+  app.get('/base/tokens',          (req, res) => proxyBase(res, `/base/tokens?limit=${req.query.limit ?? 20}`));
+  app.get('/base/stats',           (req, res) => proxyBase(res, `/base/stats?days=${req.query.days ?? 7}`));
+  app.post('/base/buy', async (req, res) => proxyBase(res, '/base/buy', { method: 'POST', body: req.body }));
 }
 
 // ─── GAD AI narrative builders ────────────────────────────────────────────────

@@ -177,7 +177,7 @@ bot.onText(/\/start/, async (msg) => {
   send(msg.chat.id,
     `🤖 *GAD AI Terminal*\n\nGM, ${name}! Real-time Solana alpha.\n\n${tierLine}\n\n` +
     `*📊 Analytics (Starter+):*\n/trending /new /highscore /highrisk\n/analyze /signals /whales /tokenscore\n\n` +
-    `*🤖 Bot Control (PRO):*\n/bot — bot status & PnL\n/autobuy — manage positions\n/portfolio /futures\n\n` +
+    `*🤖 Bot Control (PRO):*\n/bot — Solana bot PnL\n/futures — futures trading\n/basestatus — Base Network\n/autobuy /portfolio\n\n` +
     `*🔑 Free:*\n/subscribe /status /wallet /help`,
     {
       reply_markup: {
@@ -226,9 +226,14 @@ bot.onText(/\/help/, (msg) => {
     `/launch — deploy token on Pump.fun\n` +
     `/futures — futures trading\n` +
     `/macro — market macro signal\n` +
-    `/ideas — AI coin ideas\n\n` +
+    `/ideas — AI coin ideas\n` +
+    `/basestatus — Base Network scanner\n` +
+    `/basepositions — open Base positions\n` +
+    `/basetokens — discovered Base tokens\n\n` +
+    `⚡ *STARTER+ Base:*\n` +
+    `/basetrades — Base trade history\n\n` +
     `📈 *Platforms we track:*\n` +
-    `pump.fun · DexScreener · Birdeye · Raydium`
+    `pump.fun · DexScreener · Birdeye · Raydium · Base`
   );
 });
 
@@ -1181,6 +1186,110 @@ bot.onText(/^\/trades(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
   await send(chatId, lines.join('\n'), {
     reply_markup: { inline_keyboard: [[{ text: '🔄 Refresh', callback_data: 'trades:0' }]] }
   });
+}));
+
+// ─── BASE NETWORK (EVM) commands ─────────────────────────────────────────────
+
+// /basestatus — PRO: Base scanner status
+bot.onText(/^\/basestatus(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const d = await apiGet<any>('/base/status');
+    const today = d.data ?? d;
+    const pnl = Number(today.today_pnl_eth ?? 0);
+    const lines = [
+      `⛓ *BASE NETWORK STATUS*`,
+      ``,
+      `💰 ETH Balance: ${Number(today.eth_balance ?? 0).toFixed(5)} ETH`,
+      `📂 Open Positions: ${today.open_count ?? 0}`,
+      ``,
+      `*Today*`,
+      `Trades: ${today.today_trades ?? 0} | Wins: ${today.today_wins ?? 0}`,
+      `PnL: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(5)} ETH`,
+      ``,
+      `/basepositions — open positions`,
+      `/basetrades — trade history`,
+    ];
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ Base scanner: ${e.message}\nIs base-scanner running?`);
+  }
+}));
+
+// /basepositions — PRO: open Base positions
+bot.onText(/^\/basepositions(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const d = await apiGet<any>('/base/positions?limit=10');
+    const positions: any[] = d.data ?? [];
+    if (!positions.length) return send(chatId, '⛓ No open Base positions.');
+    const lines = [`⛓ *BASE OPEN POSITIONS*`, ``];
+    for (const p of positions) {
+      const age = p.bought_at ? Math.floor((Date.now() - new Date(p.bought_at).getTime()) / 60000) : '?';
+      const tp = p.tp_index ?? 0;
+      lines.push(`• ${p.symbol}  ${Number(p.amount_eth).toFixed(4)} ETH  TP${tp}/5  ${age}m`);
+      lines.push(`  \`${p.contract_address}\``);
+    }
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ Base positions error: ${e.message}`);
+  }
+}));
+
+// /basetrades — STARTER+: last 10 Base trades
+bot.onText(/^\/basetrades(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const d = await apiGet<any>('/base/trades?limit=10');
+    const trades: any[] = d.data ?? [];
+    if (!trades.length) return send(chatId, '⛓ No Base trades yet.');
+    const lines = [`⛓ *BASE TRADE HISTORY*`, ``];
+    for (const t of trades) {
+      const ethIn  = Number(t.amount_eth ?? 0).toFixed(4);
+      const ethOut = Number(t.total_sold_eth ?? 0).toFixed(4);
+      const pnlPct = t.amount_eth && t.total_sold_eth
+        ? ((Number(t.total_sold_eth) / Number(t.amount_eth) - 1) * 100).toFixed(1) : null;
+      const icon = pnlPct == null ? '⏳' : Number(pnlPct) >= 0 ? '✅' : '❌';
+      const time = t.bought_at ? new Date(t.bought_at).toISOString().slice(11, 16) : '?';
+      lines.push(`${icon} ${t.symbol}  ${ethIn}→${ethOut} ETH  ${pnlPct != null ? (Number(pnlPct) >= 0 ? '+' : '') + pnlPct + '%' : 'open'}  ${time}`);
+    }
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ Base trades error: ${e.message}`);
+  }
+}));
+
+// /basestart — PRO admin: enable auto-buy on Base
+bot.onText(/^\/basestart(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  await send(chatId,
+    `⛓ *Base Auto-Buy*\n\nTo enable: set \`BASE_AUTO_BUY=true\` in .env and restart base-scanner.\n\n` +
+    `Default: 0.005 ETH/trade, max 5 positions.\n` +
+    `Use /basestatus to check current state.`
+  );
+}));
+
+// /basetokens — PRO: recently discovered Base tokens
+bot.onText(/^\/basetokens(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const d = await apiGet<any>('/base/tokens?limit=8');
+    const tokens: any[] = d.data ?? [];
+    if (!tokens.length) return send(chatId, '⛓ No Base tokens discovered yet.');
+    const lines = [`⛓ *DISCOVERED BASE TOKENS*`, ``];
+    for (const t of tokens) {
+      lines.push(`• *${t.symbol}* — liq $${Number(t.liquidity_usd).toFixed(0)} | +${Number(t.price_change_1h).toFixed(1)}%/1h | score:${t.safe_score}`);
+      lines.push(`  \`${t.contract_address}\``);
+    }
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ Base tokens error: ${e.message}`);
+  }
 }));
 
 // ─── Errors ───────────────────────────────────────────────────────────────────

@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target":            "ES2020",
+    "module":            "commonjs",
+    "lib":               ["ES2020"],
+    "strict":            false,
+    "esModuleInterop":   true,
+    "skipLibCheck":      true,
+    "resolveJsonModule": true,
+    "outDir":            "./dist",
+    "rootDir":           "./src",
+    "baseUrl":           "/app",
+    "paths": {
+      "@lib/*": ["libs/*/src"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
