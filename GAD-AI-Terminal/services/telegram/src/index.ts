@@ -95,6 +95,20 @@ async function getSubStatus(telegramId: number): Promise<SubStatus> {
   catch { return { active: false, walletLinked: false }; }
 }
 
+function planTier(plan?: string): 'free' | 'starter' | 'pro' {
+  if (!plan) return 'free';
+  if (plan === 'monthly' || plan === 'autobuy_pro') return 'pro';
+  return 'starter'; // trial_1d, trial_3d
+}
+
+function planLabel(plan?: string): string {
+  if (plan === 'monthly')     return '💎 Monthly';
+  if (plan === 'trial_3d')    return '⚡ 3-Day Access';
+  if (plan === 'trial_1d')    return '🧪 1-Day Trial';
+  if (plan === 'autobuy_pro') return '🤖 AutoBuy Pro';
+  return '❓ Unknown';
+}
+
 async function requireSub(chatId: number, telegramId: number): Promise<boolean> {
   const status  = await getSubStatus(telegramId);
   if (status.active) return true;
@@ -107,6 +121,20 @@ async function requireSub(chatId: number, telegramId: number): Promise<boolean> 
   await send(chatId, msg, {
     reply_markup: { inline_keyboard: [[{ text: '💳 Get Access', url: payUrl }]] }
   });
+  return false;
+}
+
+// Requires monthly (PRO) plan — shows upgrade prompt for trial users
+async function requirePro(chatId: number, telegramId: number): Promise<boolean> {
+  const status = await getSubStatus(telegramId);
+  if (!status.active) return requireSub(chatId, telegramId);
+  if (planTier(status.plan) === 'pro') return true;
+
+  const payUrl = `${SITE_URL}/pay?tg_id=${telegramId}`;
+  await send(chatId,
+    `🔒 *PRO Feature*\n\nThis command requires *Monthly* subscription.\n\nYour plan: ${planLabel(status.plan)}\n\n💎 *Monthly — 1 SOL / 30 days*\n✅ All analytics\n✅ AutoBuy bot control\n✅ Portfolio & Launch\n✅ Futures trading`,
+    { reply_markup: { inline_keyboard: [[{ text: '🚀 Upgrade to PRO', url: payUrl }]] } }
+  );
   return false;
 }
 
@@ -135,21 +163,31 @@ async function sendAnalysis(chatId: number, mint: string) {
 //  COMMANDS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-bot.onText(/\/start/, (msg) => {
+bot.onText(/\/start/, async (msg) => {
   const name = msg.from?.first_name ?? 'degen';
+  const tgId = msg.from?.id ?? msg.chat.id;
+  const status = await getSubStatus(tgId);
+  const tier = status.active ? planTier(status.plan) : 'free';
+
+  const tierBadge = tier === 'pro' ? '💎 PRO' : tier === 'starter' ? '⚡ STARTER' : '🆓 FREE';
+  const tierLine  = status.active
+    ? `Plan: ${tierBadge} | ${planLabel(status.plan)} | ~${status.remainingHours}h left`
+    : `Plan: ${tierBadge} — /subscribe to unlock features`;
+
   send(msg.chat.id,
-    `🤖 *GAD AI Terminal*\n\nGM, ${name}! The Solana degen terminal is live.\n\n` +
-    `*Premium commands:*\n/trending /new /highscore /highrisk\n/token /analyze /whales /signals\n/portfolio /watchlist /autobuy\n\n` +
-    `*Free:*\n/subscribe — get access\n/status — subscription info\n/wallet — link Solana wallet\n\nWAGMI 🚀`,
+    `🤖 *GAD AI Terminal*\n\nGM, ${name}! Real-time Solana alpha.\n\n${tierLine}\n\n` +
+    `*📊 Analytics (Starter+):*\n/trending /new /highscore /highrisk\n/analyze /signals /whales /tokenscore\n\n` +
+    `*🤖 Bot Control (PRO):*\n/bot — bot status & PnL\n/autobuy — manage positions\n/portfolio /futures\n\n` +
+    `*🔑 Free:*\n/subscribe /status /wallet /help`,
     {
       reply_markup: {
         inline_keyboard: [
-          [{ text: '📈 Trending',    callback_data: 'trending:0' }, { text: '🆕 New Tokens',  callback_data: 'new:0' }],
-          [{ text: '🏆 High Score',  callback_data: 'highscore:0' }, { text: '⚠️ High Risk',  callback_data: 'highrisk:0' }],
-          [{ text: '🐋 Whales',      callback_data: 'whales:0' },   { text: '🧠 Smart Money', callback_data: 'smartmoney:0' }],
-          [{ text: '📋 Watchlist',   callback_data: 'watchlist:0' }, { text: '🚨 Signals',    callback_data: 'alerts:0' }],
-          [{ text: '💼 Portfolio',   callback_data: 'portfolio:0' }],
-          [{ text: '💳 Subscribe',   callback_data: 'subscribe' },  { text: '📊 My Status',  callback_data: 'status' }],
+          [{ text: '📈 Trending', callback_data: 'trending:0' }, { text: '🆕 New', callback_data: 'new:0' }],
+          [{ text: '🏆 Top Score', callback_data: 'highscore:0' }, { text: '🚨 Signals', callback_data: 'alerts:0' }],
+          [{ text: '🐋 Whales', callback_data: 'whales:0' }, { text: '📋 Trades', callback_data: 'trades:0' }],
+          tier === 'pro'
+            ? [{ text: '🤖 Bot Status', callback_data: 'botstatus' }, { text: '💼 Portfolio', callback_data: 'portfolio:0' }]
+            : [{ text: '💳 Subscribe', callback_data: 'subscribe' }, { text: '📊 My Status', callback_data: 'status' }],
         ]
       }
     }
@@ -158,25 +196,39 @@ bot.onText(/\/start/, (msg) => {
 
 bot.onText(/\/help/, (msg) => {
   send(msg.chat.id,
-    `*GAD AI Terminal — Commands*\n\n` +
-    `*Free:*\n` +
-    `/start — main menu\n/subscribe — get access\n/status — subscription status\n/wallet <address> — link wallet\n\n` +
-    `*Analytics (subscription required):*\n` +
-    `/trending /new /highscore /highrisk\n` +
-    `/token <mint> — token details\n/analyze <mint> — full GAD AI report\n` +
-    `/tokenscore <mint> — safety & transparency score\n` +
-    `/whales — top whale traders\n/signals — active signals\n\n` +
-    `*Trading Tools:*\n` +
-    `/portfolio — positions & P&L\n/watchlist — your watchlist\n` +
-    `/autobuy list|add|stop|resume|delete\n\n` +
-    `*Trade Journal:*\n` +
-    `/journal — your trade history + P&L\n` +
-    `/riskpassport — personal risk profile\n\n` +
-    `*Alpha Engine:*\n` +
-    `/opportunity /lifecycle /regime /reputation /memory\n\n` +
-    `*Coin Launcher:*\n` +
+    `*GAD AI Terminal — Command Guide*\n\n` +
+    `🆓 *FREE (no subscription):*\n` +
+    `/start — main menu\n` +
+    `/subscribe — view plans & pay\n` +
+    `/status — your subscription status\n` +
+    `/wallet <address> — link Solana wallet\n` +
+    `/help — this menu\n\n` +
+    `⚡ *STARTER — 0.05 SOL (1d) | 0.1 SOL (3d):*\n` +
+    `/trending — hot Solana tokens\n` +
+    `/new — freshly listed tokens\n` +
+    `/highscore — top AI-scored tokens\n` +
+    `/highrisk — high-risk radar\n` +
+    `/analyze <mint> — full GAD AI report\n` +
+    `/tokenscore <mint> — safety score 0-100\n` +
+    `/signals — active buy signals\n` +
+    `/whales — top whale activity\n` +
+    `/journal — trade history\n` +
+    `/riskpassport — your risk profile\n` +
+    `/trends — meme coin trend engine\n` +
+    `/trades — bot recent trades\n\n` +
+    `💎 *PRO — 1 SOL / 30 days:*\n` +
+    `/bot — bot status & today's PnL\n` +
+    `/autobuy list|add|stop — manage bot\n` +
+    `/portfolio — positions & P&L\n` +
+    `/watchlist — your watchlist\n` +
+    `/mycoins — deployed tokens\n` +
+    `/exitcoin <mint> — sell position\n` +
     `/launch — deploy token on Pump.fun\n` +
-    `/mycoins — your deployed tokens\n/exitcoin <ticker> — sell position`
+    `/futures — futures trading\n` +
+    `/macro — market macro signal\n` +
+    `/ideas — AI coin ideas\n\n` +
+    `📈 *Platforms we track:*\n` +
+    `pump.fun · DexScreener · Birdeye · Raydium`
   );
 });
 
@@ -184,11 +236,22 @@ bot.onText(/\/subscribe/, (msg) => guard(msg.chat.id, async () => {
   const tgId   = msg.from?.id ?? msg.chat.id;
   const payUrl = `${SITE_URL}/pay?tg_id=${tgId}`;
   send(msg.chat.id,
-    `💳 *Subscription Plans*\n\n` +
-    `🧪 *1-Day Trial* — 0.05 SOL\n  24h full access, one trial per wallet\n\n` +
-    `⚡ *3-Day Access* — 0.1 SOL\n  72h full access, all Alpha Engine features\n\n` +
-    `💎 *Monthly Full Access* — 1 SOL\n  30 days, all features + Auto-buy\n\n` +
-    `Payment goes directly to treasury on Solana mainnet.\nAccepted wallets: Phantom, Solflare.`,
+    `💳 *GAD AI Terminal — Plans*\n\n` +
+    `🧪 *1-Day Trial* — 0.05 SOL\n` +
+    `  24h · One trial per wallet\n` +
+    `  ✅ All analytics, signals, whales\n` +
+    `  ✅ Trade journal & risk passport\n\n` +
+    `⚡ *3-Day Access* — 0.1 SOL\n` +
+    `  72h · Best for testing the alpha\n` +
+    `  ✅ Everything in Trial\n` +
+    `  ✅ Trend engine & coin ideas\n\n` +
+    `💎 *Monthly PRO* — 1 SOL / 30 days\n` +
+    `  ✅ Everything above\n` +
+    `  ✅ Bot control (AutoBuy /bot)\n` +
+    `  ✅ Portfolio manager\n` +
+    `  ✅ Token launcher on Pump.fun\n` +
+    `  ✅ Futures trading module\n\n` +
+    `Payment: Phantom or Solflare → direct to treasury.\nNo middleman. Verified on-chain.`,
     { reply_markup: { inline_keyboard: [[{ text: '💳 Pay & Get Access', url: payUrl }]] } }
   );
 }));
@@ -210,12 +273,23 @@ bot.onText(/\/status/, (msg) => guard(msg.chat.id, async () => {
       { reply_markup: { inline_keyboard: [[{ text: '🔄 Renew', url: payUrl }]] } }
     );
   }
-  const plan    = status.isTrial ? '🧪 1-Day Trial' : '💎 Monthly';
+  const tier    = planTier(status.plan);
+  const badge   = tier === 'pro' ? '💎 PRO' : '⚡ STARTER';
   const expires = status.expiresAt
     ? new Date(status.expiresAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC' }) + ' UTC'
     : '?';
+  const features = tier === 'pro'
+    ? '✅ Analytics · Signals · Whales\n✅ Bot control · Portfolio · Launch\n✅ Futures trading'
+    : '✅ Analytics · Signals · Whales\n✅ Journal · Risk passport · Trends\n🔒 Bot control (upgrade to PRO)';
   send(msg.chat.id,
-    `📊 *Status*\n\n✅ *Active*\nPlan: ${plan}\nExpires: ${expires}\nRemaining: ~${status.remainingHours}h\nWallet: \`${status.wallet?.slice(0, 16)}…\``
+    `📊 *Subscription Status*\n\n` +
+    `✅ *Active* — ${badge}\n` +
+    `Plan: ${planLabel(status.plan)}\n` +
+    `Expires: ${expires}\n` +
+    `Remaining: ~${status.remainingHours}h\n` +
+    `Wallet: \`${status.wallet?.slice(0, 20)}…\`\n\n` +
+    `${features}`,
+    tier !== 'pro' ? { reply_markup: { inline_keyboard: [[{ text: '🚀 Upgrade to PRO', url: payUrl }]] } } : {}
   );
 }));
 
@@ -322,7 +396,7 @@ bot.onText(/\/whales/, (msg) => guard(msg.chat.id, async () => {
 }));
 
 bot.onText(/\/portfolio/, (msg) => guard(msg.chat.id, async () => {
-  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const data  = await apiGet('/portfolio');
   const stats = data.stats ?? {};
   const open  = (data.positions ?? []).filter((p: any) => p.status === 'open');
@@ -335,7 +409,7 @@ bot.onText(/\/portfolio/, (msg) => guard(msg.chat.id, async () => {
 }));
 
 bot.onText(/\/autobuy list/, (msg) => guard(msg.chat.id, async () => {
-  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const data = await apiGet('/autobuy');
   const jobs = data.jobs ?? [];
   if (!jobs.length) return send(msg.chat.id, '💰 No auto-buy jobs.');
@@ -349,7 +423,7 @@ bot.onText(/\/autobuy list/, (msg) => guard(msg.chat.id, async () => {
 }));
 
 bot.onText(/\/autobuy add (.+)/, (msg, match) => guard(msg.chat.id, async () => {
-  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const parts = (match?.[1] ?? '').trim().split(/\s+/);
   if (parts.length < 3) return send(msg.chat.id, 'Usage: `/autobuy add <mint_or_ticker> <sol> <min> [label]`');
   const [mintOrTicker, solStr, minStr, ...lbl] = parts;
@@ -366,7 +440,7 @@ bot.onText(/\/autobuy add (.+)/, (msg, match) => guard(msg.chat.id, async () => 
 }));
 
 bot.onText(/\/autobuy stop (.+)/, (msg, match) => guard(msg.chat.id, async () => {
-  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const prefix = (match?.[1] ?? '').trim();
   const job = ((await apiGet('/autobuy')).jobs ?? []).find((j: any) => j.id.startsWith(prefix));
   if (!job) return send(msg.chat.id, `Job \`${prefix}…\` not found.`);
@@ -375,7 +449,7 @@ bot.onText(/\/autobuy stop (.+)/, (msg, match) => guard(msg.chat.id, async () =>
 }));
 
 bot.onText(/\/autobuy resume (.+)/, (msg, match) => guard(msg.chat.id, async () => {
-  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const prefix = (match?.[1] ?? '').trim();
   const job = ((await apiGet('/autobuy')).jobs ?? []).find((j: any) => j.id.startsWith(prefix));
   if (!job) return send(msg.chat.id, `Job \`${prefix}…\` not found.`);
@@ -384,7 +458,7 @@ bot.onText(/\/autobuy resume (.+)/, (msg, match) => guard(msg.chat.id, async () 
 }));
 
 bot.onText(/\/autobuy delete (.+)/, (msg, match) => guard(msg.chat.id, async () => {
-  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const prefix = (match?.[1] ?? '').trim();
   const job = ((await apiGet('/autobuy')).jobs ?? []).find((j: any) => j.id.startsWith(prefix));
   if (!job) return send(msg.chat.id, `Job \`${prefix}…\` not found.`);
@@ -524,6 +598,41 @@ bot.on('callback_query', async (query) => {
         bot.sendMessage(chatId, `✅ \`${param.slice(0, 12)}…\` added to watchlist.`);
         break;
       }
+      case 'botstatus': {
+        if (!await requirePro(chatId, tgId)) break;
+        const data = await apiGet<any>('/autobuy/bot-status');
+        const s = data.summary ?? {};
+        const opens: any[] = data.openPositions ?? [];
+        const winRate = s.win_rate != null ? `${s.win_rate}%` : 'N/A';
+        const pnl = s.net_pnl != null ? (Number(s.net_pnl) >= 0 ? `+${s.net_pnl}` : `${s.net_pnl}`) : '0';
+        const lines = [
+          `🤖 *BOT STATUS — 24h*`,
+          `Closed: ${s.closed ?? 0}  Wins: ${s.wins ?? 0}  WR: ${winRate}  PnL: *${pnl} SOL*`,
+          opens.length ? opens.slice(0, 5).map((p: any) => `• ${(p.label ?? '').split(':')[3] ?? '?'}  ${p.amount_sol} SOL`).join('\n') : 'No open positions',
+        ];
+        edit(chatId, msgId, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '🔄 Refresh', callback_data: 'botstatus' }]] } });
+        break;
+      }
+      case 'trades': {
+        const offset = page * 10;
+        const data = await apiGet<any>(`/autobuy/trades?limit=10&offset=${offset}`);
+        const trades: any[] = data.trades ?? [];
+        const total = Number(data.total ?? 0);
+        const tLines = [`📋 *Trades* (${offset + 1}-${Math.min(offset + 10, total)} of ${total})`, ``];
+        for (const t of trades) {
+          const sym = (t.label ?? '').split(':')[3] ?? '?';
+          const pnlPct = t.total_sold_sol && t.amount_sol
+            ? ((Number(t.total_sold_sol) / Number(t.amount_sol) - 1) * 100).toFixed(1) : null;
+          const res = !t.total_sold_sol || Number(t.total_sold_sol) === 0 ? '⏳' : Number(pnlPct) >= 0 ? `✅ +${pnlPct}%` : `❌ ${pnlPct}%`;
+          tLines.push(`${sym}  ${Number(t.amount_sol).toFixed(3)} SOL  ${res}`);
+        }
+        const hasNext = offset + 10 < total;
+        const hasPrev = page > 0;
+        edit(chatId, msgId, tLines.join('\n'), {
+          reply_markup: { inline_keyboard: pageButtons('trades', page, hasNext, hasPrev) }
+        });
+        break;
+      }
     }
   });
 });
@@ -630,7 +739,7 @@ bot.onText(/\/tokenscore (.+)/, (msg, match) => guard(msg.chat.id, async () => {
 }));
 
 bot.onText(/\/launch/, (msg) => guard(msg.chat.id, async () => {
-  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const launchUrl = `${SITE_URL}/launch`;
   send(msg.chat.id,
     `🚀 *Honest Token Launcher*\n\n` +
@@ -656,7 +765,7 @@ bot.onText(/\/launch/, (msg) => guard(msg.chat.id, async () => {
 // ─── Coin Launcher ────────────────────────────────────────────────────────────
 
 bot.onText(/\/mycoins/, (msg) => guard(msg.chat.id, async () => {
-  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const coins: any[] = await apiGet('/launcher/coins');
   if (!coins.length) return send(msg.chat.id, '🚀 *My Tokens*\n\nNo tokens launched yet.\nUse the Dashboard to deploy your first token.');
   const lines = coins.map((c: any) => {
@@ -669,7 +778,7 @@ bot.onText(/\/mycoins/, (msg) => guard(msg.chat.id, async () => {
 }));
 
 bot.onText(/\/exitcoin (.+)/, (msg, match) => guard(msg.chat.id, async () => {
-  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const ticker = (match?.[1] ?? '').trim().toUpperCase();
   const coins: any[] = await apiGet('/launcher/coins');
   const coin = coins.find((c: any) => c.ticker.toUpperCase() === ticker && c.status === 'LIVE');
@@ -863,6 +972,7 @@ async function futuresApi<T = any>(path: string): Promise<T> {
 
 // /macro — macro market status
 bot.onText(/^\/macro(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const chatId = msg.chat.id;
   await send(chatId, '🔄 Fetching macro data...');
   try {
@@ -875,6 +985,7 @@ bot.onText(/^\/macro(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
 
 // /signal — technical entry signal for SOL-PERP
 bot.onText(/^\/signal(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const chatId = msg.chat.id;
   await send(chatId, '📊 Analyzing SOL 15m chart...');
   try {
@@ -893,6 +1004,7 @@ bot.onText(/^\/signal(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
 
 // /position — show open futures positions
 bot.onText(/^\/position(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const chatId = msg.chat.id;
   try {
     const { positions, mode } = await futuresApi<any>('/positions');
@@ -918,6 +1030,7 @@ bot.onText(/^\/position(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
 
 // /ftrades — recent trade history
 bot.onText(/^\/ftrades(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const chatId = msg.chat.id;
   try {
     const { trades } = await futuresApi<any>('/trades?limit=10');
@@ -945,6 +1058,7 @@ bot.onText(/^\/ftrades(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
 
 // /capital — capital management status
 bot.onText(/^\/capital(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const chatId = msg.chat.id;
   try {
     const data = await futuresApi<any>('/capital');
@@ -973,6 +1087,7 @@ bot.onText(/^\/fclose(?:\s+(.+))?$/, (msg, match) => {
 
 // /futures — overview panel
 bot.onText(/^\/futures(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const chatId = msg.chat.id;
   await send(chatId, '🔄 Loading futures dashboard...');
   try {
@@ -1001,6 +1116,71 @@ bot.onText(/^\/futures(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
   } catch (e: any) {
     await send(chatId, `❌ Futures dashboard error: ${e.message}\nIs futures service running?`);
   }
+}));
+
+// /bot — PRO: bot trading status + open positions + 24h PnL
+bot.onText(/^\/bot(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  const data = await apiGet<any>('/autobuy/bot-status');
+  const s = data.summary ?? {};
+  const opens: any[] = data.openPositions ?? [];
+  const closed: any[] = data.recentClosed ?? [];
+
+  const winRate = s.win_rate != null ? `${s.win_rate}%` : 'N/A';
+  const pnl = s.net_pnl != null ? (Number(s.net_pnl) >= 0 ? `+${s.net_pnl}` : `${s.net_pnl}`) : '0';
+  const lines = [
+    `🤖 *BOT STATUS — 24h*`,
+    ``,
+    `📊 Closed: ${s.closed ?? 0} | Wins: ${s.wins ?? 0} | Losses: ${s.losses ?? 0}`,
+    `📈 Win rate: ${winRate} | Net PnL: *${pnl} SOL*`,
+    `💸 Total spent: ${s.total_spent ?? 0} SOL`,
+    ``,
+  ];
+
+  if (opens.length) {
+    lines.push(`🟢 *Open Positions (${opens.length})*`);
+    for (const p of opens.slice(0, 8)) {
+      const sym = (p.label ?? '').split(':')[3] ?? p.label ?? '?';
+      const age = p.bought_at ? Math.floor((Date.now() - new Date(p.bought_at).getTime()) / 60000) : '?';
+      lines.push(`  • ${sym}  ${p.amount_sol} SOL  ${age}m ago`);
+    }
+  } else {
+    lines.push(`🟢 *Open Positions:* none`);
+  }
+
+  lines.push(``, `📋 /trades — see trade history`);
+  await send(chatId, lines.join('\n'));
+}));
+
+// /trades — STARTER+: last bot auto-trades with PnL
+bot.onText(/^\/trades(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  const data = await apiGet<any>('/autobuy/trades?limit=10&offset=0');
+  const trades: any[] = data.trades ?? [];
+  if (!trades.length) return send(chatId, '📋 No trades yet.');
+
+  const lines = [`📋 *Recent Auto-Trades*`, ``];
+  for (const t of trades) {
+    const sym = (t.label ?? '').split(':')[3] ?? '?';
+    const spent = Number(t.amount_sol).toFixed(3);
+    const recv  = Number(t.total_sold_sol ?? 0).toFixed(3);
+    const pnlPct = t.total_sold_sol && t.amount_sol
+      ? ((Number(t.total_sold_sol) / Number(t.amount_sol) - 1) * 100).toFixed(1)
+      : null;
+    const res = t.total_sold_sol == null || Number(t.total_sold_sol) === 0
+      ? '⏳ open'
+      : pnlPct && Number(pnlPct) >= 0 ? `✅ +${pnlPct}%` : `❌ ${pnlPct}%`;
+    const time = t.bought_at ? new Date(t.bought_at).toISOString().slice(11, 16) : '?';
+    lines.push(`${sym}  ${spent}→${recv} SOL  ${res}  ${time}`);
+  }
+  if (Number(data.total) > 10) {
+    lines.push(``, `_Showing 10 of ${data.total} trades_`);
+  }
+  await send(chatId, lines.join('\n'), {
+    reply_markup: { inline_keyboard: [[{ text: '🔄 Refresh', callback_data: 'trades:0' }]] }
+  });
 }));
 
 // ─── Errors ───────────────────────────────────────────────────────────────────

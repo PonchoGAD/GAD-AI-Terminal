@@ -414,6 +414,41 @@ export function registerRoutes(app: Application) {
   // AUTO-BUY (Sprint 2 + improved ticker search)
   // ═══════════════════════════════════════════════════════════════════════════
 
+  app.get('/autobuy/bot-status', async (_req, res: Response) => {
+    await safeRes(res, async () => {
+      const [summary, open, recent] = await Promise.all([
+        query(`
+          SELECT
+            COUNT(*) FILTER (WHERE total_sold_sol > 0) AS closed,
+            COUNT(*) FILTER (WHERE total_sold_sol >= amount_sol * 1.02) AS wins,
+            COUNT(*) FILTER (WHERE total_sold_sol > 0 AND total_sold_sol < amount_sol) AS losses,
+            ROUND(SUM(total_sold_sol - amount_sol) FILTER (WHERE total_sold_sol > 0)::numeric, 4) AS net_pnl,
+            ROUND(SUM(amount_sol)::numeric, 4) AS total_spent,
+            ROUND(COUNT(*) FILTER (WHERE total_sold_sol >= amount_sol * 1.02) * 100.0 / NULLIF(COUNT(*) FILTER (WHERE total_sold_sol > 0), 0), 1) AS win_rate
+          FROM autobuy_jobs WHERE bought_at > NOW() - INTERVAL '24 hours'
+        `),
+        query(`SELECT label, amount_sol, entry_price_sol, bought_at FROM autobuy_jobs WHERE total_sold_sol = 0 AND bought_at IS NOT NULL ORDER BY bought_at DESC LIMIT 10`),
+        query(`SELECT label, amount_sol, total_sold_sol, bought_at FROM autobuy_jobs WHERE total_sold_sol > 0 ORDER BY bought_at DESC LIMIT 5`),
+      ]);
+      res.json({ summary: summary.rows[0], openPositions: open.rows, recentClosed: recent.rows });
+    });
+  });
+
+  app.get('/autobuy/trades', async (req, res: Response) => {
+    await safeRes(res, async () => {
+      const limit  = Math.min(Number(req.query.limit  ?? 10), 50);
+      const offset = Number(req.query.offset ?? 0);
+      const { rows } = await query(
+        `SELECT label, amount_sol, total_sold_sol, entry_price_sol, bought_at, sold_at
+         FROM autobuy_jobs WHERE bought_at IS NOT NULL
+         ORDER BY bought_at DESC LIMIT $1 OFFSET $2`,
+        [limit, offset]
+      );
+      const total = (await query(`SELECT COUNT(*) FROM autobuy_jobs WHERE bought_at IS NOT NULL`)).rows[0].count;
+      res.json({ trades: rows, total: Number(total) });
+    });
+  });
+
   app.get('/autobuy', async (_req, res: Response) => {
     await safeRes(res, async () => {
       const { rows } = await query(`SELECT * FROM autobuy_jobs ORDER BY created_at DESC`);
