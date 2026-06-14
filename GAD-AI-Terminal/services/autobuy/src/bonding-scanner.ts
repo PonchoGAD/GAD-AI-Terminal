@@ -119,9 +119,9 @@ const GRAD_TPS = [
 const PUMPSWAP_ENABLED        = process.env.PUMPSWAP_ENABLED === 'true';
 const PUMPSWAP_INTERVAL_MS    = Number(process.env.PUMPSWAP_INTERVAL_SEC      || '20') * 1000;
 const PUMPSWAP_BUY_SOL        = Number(process.env.PUMPSWAP_BUY_SOL           || '0.015');
-const PUMPSWAP_MIN_LIQ        = Number(process.env.PUMPSWAP_MIN_LIQ_USD       || '15000');
-const PUMPSWAP_MAX_LIQ        = Number(process.env.PUMPSWAP_MAX_LIQ_USD       || '300000');
-const PUMPSWAP_MAX_AGE_MIN    = Number(process.env.PUMPSWAP_MAX_AGE_MIN       || '120');   // 2 hours
+const PUMPSWAP_MIN_LIQ        = Number(process.env.PUMPSWAP_MIN_LIQ_USD       || '8000');
+const PUMPSWAP_MAX_LIQ        = Number(process.env.PUMPSWAP_MAX_LIQ_USD       || '500000');
+const PUMPSWAP_MAX_AGE_MIN    = Number(process.env.PUMPSWAP_MAX_AGE_MIN       || '240');   // 4 hours
 const PUMPSWAP_TIME_LIMIT     = Number(process.env.PUMPSWAP_TIME_LIMIT_SEC    || '1800');  // 30 min
 const PUMPSWAP_STOP_PCT       = Number(process.env.PUMPSWAP_STOP_PCT          || '0.08');
 const PUMPSWAP_TPS = [
