@@ -1,20 +1,10 @@
 FROM node:20-alpine
-
-WORKDIR /app
-
-# Root workspace files
-COPY package.json package-lock.json ./
-
-# Libs
-COPY libs/db        ./libs/db
-COPY libs/base      ./libs/base
-
-# Service
+WORKDIR /usr/src/app
+COPY package.json ./
+COPY tsconfig.base.json ./
+COPY services/base-scanner/package.json ./services/base-scanner/package.json
+COPY libs ./libs
 COPY services/base-scanner ./services/base-scanner
-
-RUN npm install --workspace=@service/base-scanner --workspace=@lib/db --workspace=@lib/base --include-workspace-root
-
-WORKDIR /app/services/base-scanner
-RUN npm run build
-
-CMD ["node", "dist/index.js"]
+RUN npm install
+RUN npm --workspace services/base-scanner run build
+CMD ["npm", "--workspace", "services/base-scanner", "start"]
