@@ -330,8 +330,8 @@ export async function processAutoSignals(walletAddress: string): Promise<void> {
 
 // ─── Market Regime Auto-Detection ────────────────────────────────────────────
 // Fear & Greed index from Alternative.me. Cached 30 min.
-// EXTREME_FEAR (<25): PAUSE all buys — memes don't pump in panic market
-// FEAR (25-45):       STRICT mode — require strong pc1h, small positions
+// EXTREME_FEAR (<13): PAUSE all buys — true capitulation/black swan only
+// FEAR (13-45):       STRICT mode — require strong pc1h, small positions (contrarian buy zone)
 // NEUTRAL (45-60):    NORMAL mode — standard filters
 // GREED (60-80):      BULL mode — lower TP targets, larger positions allowed
 // EXTREME_GREED(>80): CAUTION — euphoria = top risk, tighten stops
@@ -356,7 +356,7 @@ export async function getMarketRegime(): Promise<string> {
   const override = (process.env.MARKET_REGIME ?? '').toUpperCase();
   if (override && override !== 'AUTO') return override;
   const fg = await getFearGreed();
-  if (fg < 25) return 'EXTREME_FEAR';
+  if (fg < 13) return 'EXTREME_FEAR';
   if (fg < 45) return 'FEAR';
   if (fg < 60) return 'NEUTRAL';
   if (fg < 80) return 'BULL';
@@ -727,11 +727,11 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
   lastRaydiumScan = now;
 
   // ── Market Regime Gate ──────────────────────────────────────────────────────
-  // EXTREME_FEAR (F&G < 25): memes don't pump in panic mode. Skip all new buys.
-  // Every trade we checked in this regime produced losses. Wait it out.
+  // EXTREME_FEAR (F&G < 13): true capitulation/black swan — pause all buys.
+  // F&G 13-45 = FEAR = contrarian buy zone (user strategy: buy on fear).
   const regime = await getMarketRegime();
   if (regime === 'EXTREME_FEAR') {
-    console.info(`[raydium-scan] 🚫 EXTREME_FEAR market (F&G=${cachedFearGreed}) — skipping new buys. Existing positions monitored.`);
+    console.info(`[raydium-scan] 🚫 EXTREME_FEAR market (F&G=${cachedFearGreed} < 13) — pausing buys. Existing positions monitored.`);
     return;
   }
 

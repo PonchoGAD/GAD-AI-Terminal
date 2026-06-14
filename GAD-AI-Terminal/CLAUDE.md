@@ -189,8 +189,9 @@ console.warn('[sell] ...')
 - [x] **Market Regime Gating для Raydium autobuy (14.06.2026):**
   - `getFearGreed()` — Fear&Greed API (alternative.me), кеш 30мин
   - `getMarketRegime()` → EXTREME_FEAR/FEAR/NEUTRAL/BULL/EUPHORIA (или overrideMARKET_REGIME=AUTO)
-  - EXTREME_FEAR (F&G < 25): все новые покупки заморожены, только мониторинг открытых позиций
-  - FEAR (F&G < 45): мин pc1h повышен до 15%, TP снижен (1.18x/1.15x/1.12x)
+  - **EXTREME_FEAR (F&G < 13):** все новые покупки заморожены — только реальная капитуляция (было: < 25)
+  - **FEAR (F&G 13-45):** контрарная зона покупок — мин pc1h 15%, TP снижен (1.18x/1.15x/1.12x)
+  - Стратегия: покупать на страхе (buy the fear) — изменено с 14.06.2026 по решению владельца
   - NEUTRAL: 1.30x/1.28x/1.25x; BULL/EUPHORIA: 1.55x/1.45x/1.38x
   - HOT poller: buys5m снижен с 20 до 15 (более мягкий рынок)
   - `.env`: `MARKET_REGIME=AUTO`, `STOP_LOSS_PCT=10`, `BONDING_STOP_PCT=0.12`
@@ -200,6 +201,14 @@ console.warn('[sell] ...')
   - `monitor.ts`: `runXTrendCycle()` каждые 15мин — находит тренд + монету → Telegram алерт в ADMIN_CHAT_ID
   - Telegram: `/xtrends` (последние 10 сигналов), `/xsignal` (последний с монетой) — PRO
   - DB: `x_trend_signals` таблица с theme/coin_mint/engagement/action
+- [x] **Token Launcher на gadai.shop (14.06.2026):** migration 017, /launcher/submit API, Telegram /auto_launch
+  - Форма на сайте: submit-to-queue (без Phantom wallet) → VPS API → coin_ideas → TG бот /auto_launch
+  - `/auto_launch` в боте: список pending идей, запуск по UUID или ручной ввод, загрузка фото
+  - `services/telegram/src/launcher.ts`: Pinata upload + pumpdotfun-sdk + staggered PumpPortal buys
+  - API: `POST /launcher/submit` в `services/api/src/launcher.routes.ts`
+  - Сайт (`gadai.shop`): Vercel → `PonchoGAD/gadai.git` → `C:\Users\gafit\saas-landing-demo`
+  - Деплой сайта: `cd C:\Users\gafit\saas-landing-demo && git push gadai main`
+- [x] **EXTREME_FEAR порог снижен до 13 (14.06.2026):** бот покупает при F&G 13-45 (FEAR = contrarian buy zone)
 
 ---
 
@@ -207,12 +216,12 @@ console.warn('[sell] ...')
 
 | Кошелёк | Адрес | Роль | Баланс |
 |---|---|---|---|
-| W1 WALLET_PRIVATE_KEY | EL4mS7Xg | Главный/казна/dev launch/Raydium autobuy | ~0.27 SOL (13.06.26) |
-| W2 PUMPFUN_WALLET_PRIVATE_KEY | CFmHWpmQ | **ОТКЛЮЧЁН** (WebSocket scanner off) | 0.2671 SOL (13.06.26) |
-| W3 PUMPFUN_WALLET_PRIVATE_KEY_2 | DJ8Tq8vi | HOT poller (активен) | **~0.0027 SOL (нужна пополнение!)** |
+| W1 WALLET_PRIVATE_KEY | EL4mS7Xg | Главный/казна/dev launch/Raydium autobuy | ~0.29 SOL (14.06.26) |
+| W2 PUMPFUN_WALLET_PRIVATE_KEY | CFmHWpmQ | **ОТКЛЮЧЁН** (WebSocket scanner off) | 0.244 SOL (14.06.26) |
+| W3 PUMPFUN_WALLET_PRIVATE_KEY_2 | DJ8Tq8vi | HOT poller (активен) | **0.13 SOL ✅ (14.06.26 — пополнен)** |
 
-> **W3 критически мало SOL (14.06.2026):** DJ8Tq8vi имеет ~0.0027 SOL — ниже минимума 0.02 SOL для HOT trades. HOT поллер скипает покупки из-за недостатка баланса. Нужно пополнить W3 минимум 0.1 SOL.
-> **W3 GADAI:** 1,407,117 токенов $GADAI (~$2.75 при mcap $1,955). Продажа не проходит из-за почти пустого bonding curve. Можно списать как потерю (~0.04 SOL).
+> **W3 пополнен (14.06.2026):** DJ8Tq8vi теперь 0.13 SOL — достаточно для HOT trades (BONDING_BUY_SOL=0.015).
+> **Адреса:** W1=EL4mS7XgNPWRLca38vHu8JHPhpZcupLKuMipPNJeNwqt | W3=DJ8Tq8viRtMPb3HsK9NwoM2yhVgUdcwuxxePuQ1zPF6e | W2=CFmHWpmQki6dDhV9G82JWCq68x2axTwdnKDQvu7dPTcL
 
 ---
 
@@ -247,7 +256,7 @@ console.warn('[sell] ...')
 ## Что НЕ СДЕЛАНО / требует доработки
 
 ### КРИТИЧНО
-- [ ] **W3 нужна пополнение SOL** — DJ8Tq8vi: ~0.0027 SOL (мин 0.02 для HOT trade). Перевести минимум 0.1 SOL
+- [x] ~~W3 нужна пополнение SOL~~ — DJ8Tq8vi теперь 0.13 SOL ✅ (пополнен 14.06.2026)
 - [ ] **Metadata enrichment** — tokens.symbol/name остаются NULL
 - [ ] **ANTHROPIC_API_KEY** в VPS .env — нужен для trend-engine AI генерации идей
 - [ ] **Migration 011** применить на VPS: `docker compose exec -T postgres psql -U gad -d gad_ai < migrations/011_trend_engine.sql`
@@ -340,6 +349,18 @@ console.warn('[sell] ...')
 ### 2026-06 — isJupiterOnly флаг в claimAndSell
 **Решение:** Raydium токены (`auto:raydium_scan:*`) имеют `isJupiterOnly=true` → PumpPortal fallback заблокирован.
 **Почему:** При TIME_LIMIT_EXPIRED Raydium токены падали в PumpPortal → транзакция проходила но 0 SOL возвращалось (неправильный DEX).
+
+### 2026-06 — EXTREME_FEAR порог снижен с 25 до 13 (14.06.2026)
+**Решение:** `getMarketRegime()` теперь возвращает EXTREME_FEAR только при F&G < 13 (было < 25).
+**Почему:** F&G=18 → EXTREME_FEAR → все покупки заморожены. Но стратегия владельца: "покупать на страхе" (contrarian). Снижение порога до 13 означает: бот покупает в FEAR-режиме (F&G 13-45) но с жёсткими фильтрами (мин pc1h 15%, сниженные TP). EXTREME_FEAR = только реальная капитуляция/чёрный лебедь (< 13), не обычный коррекционный страх.
+**Не менять** порог назад без явного решения владельца.
+
+### 2026-06 — gadai.shop — Vercel, не VPS (14.06.2026)
+**Факт:** `gadai.shop` хостится на Vercel, подключён к `https://github.com/PonchoGAD/gadai.git`.
+**Локальная папка:** `C:\Users\gafit\saas-landing-demo` — отдельный git-репо с `gadai` remote → `PonchoGAD/gadai.git`.
+**Деплой сайта:** `cd C:\Users\gafit\saas-landing-demo && git push gadai main` (НЕ `git push gad main`!).
+**Launcher форма** на сайте: submit-to-queue (без Phantom wallet) → `/api/proxy/launcher/submit` → VPS:4000 → coin_ideas → `/auto_launch` в TG боте.
+**Если Vercel не деплоит автоматически:** Зайти на vercel.com, найти проект `gadai`, нажать "Redeploy" вручную.
 
 ---
 
