@@ -186,6 +186,20 @@ console.warn('[sell] ...')
   - Telegram: /basestatus /basepositions /basetrades /basetokens (PRO/STARTER+)
   - API: /base/* routes proxied from api service to base-scanner:4005
   - Docker: `BASE_AUTO_BUY=false` by default (dry-run) — set to true + add BASE_WALLET_PRIVATE_KEY to activate
+- [x] **Market Regime Gating для Raydium autobuy (14.06.2026):**
+  - `getFearGreed()` — Fear&Greed API (alternative.me), кеш 30мин
+  - `getMarketRegime()` → EXTREME_FEAR/FEAR/NEUTRAL/BULL/EUPHORIA (или overrideMARKET_REGIME=AUTO)
+  - EXTREME_FEAR (F&G < 25): все новые покупки заморожены, только мониторинг открытых позиций
+  - FEAR (F&G < 45): мин pc1h повышен до 15%, TP снижен (1.18x/1.15x/1.12x)
+  - NEUTRAL: 1.30x/1.28x/1.25x; BULL/EUPHORIA: 1.55x/1.45x/1.38x
+  - HOT poller: buys5m снижен с 20 до 15 (более мягкий рынок)
+  - `.env`: `MARKET_REGIME=AUTO`, `STOP_LOSS_PCT=10`, `BONDING_STOP_PCT=0.12`
+- [x] **X (Twitter) Trend Pipeline (14.06.2026):** migration 016, social-monitor/x-trends + coin-hunter
+  - `x-trends.ts`: Twitter Bearer API поиск каждые 15мин, определение нарратива (AI_AGENT/DOG/CAT/PEPE/TRUMP/ELON/ANIME/SPORTS/FOOD/MEME)
+  - `coin-hunter.ts`: DexScreener поиск монеты под нарратив (liq $15k+, vol24h $30k+, pc5m 1%+, pc1h 5-100%)
+  - `monitor.ts`: `runXTrendCycle()` каждые 15мин — находит тренд + монету → Telegram алерт в ADMIN_CHAT_ID
+  - Telegram: `/xtrends` (последние 10 сигналов), `/xsignal` (последний с монетой) — PRO
+  - DB: `x_trend_signals` таблица с theme/coin_mint/engagement/action
 
 ---
 
@@ -202,6 +216,34 @@ console.warn('[sell] ...')
 
 ---
 
+## VPS — Что работает 24/7 (все сервисы Docker)
+
+| Сервис | Порт | Статус | Описание |
+|---|---|---|---|
+| postgres | 5432 | ✅ 24/7 | База данных |
+| redis | 6379 | ✅ 24/7 | Кеш |
+| api | 4000 | ✅ 24/7 | REST API |
+| scanner | — | ✅ 24/7 | DexScreener + GeckoTerminal сканер |
+| telegram | — | ✅ 24/7 | Telegram бот @gadai_sol_bot |
+| autobuy | — | ✅ 24/7 | Raydium/HOT autobuy + sell |
+| whale-tracker | — | ✅ 24/7 | Мониторинг китов |
+| social-monitor | — | ✅ 24/7 | KOL Twitter + X тренды (каждые 15мин) |
+| dashboard | 3000 | ✅ 24/7 | Next.js фронтенд |
+| landing | 3001 | ✅ 24/7 | gadai.shop |
+| futures | 4003 | ✅ 24/7 | BTC futures анализ (paper mode) |
+| base-scanner | 4005 | ✅ 24/7 | Base Network EVM (dry-run) |
+
+**Только локально (НЕ на VPS):**
+- `scripts/launch-*.ts` — запуск токенов на pump.fun (нужен ключ + pumpdotfun-sdk локально)
+- `scripts/twitter-post.ts` — постинг в X после запуска (OAuth 2.0 refresh-token хранится локально)
+- `scripts/launch-fte.ts` — FTE launch скрипт
+
+**Что нужно для полной 24/7 автоматизации:**
+- [ ] Telegram команда `/auto_launch` на VPS — берёт coin_idea из тренд-движка, запускает через pumpdotfun-sdk + PINATA_JWT (уже в .env VPS)
+- [ ] Автопостинг в X после запуска — перенести twitter-post.ts логику в social-monitor
+
+---
+
 ## Что НЕ СДЕЛАНО / требует доработки
 
 ### КРИТИЧНО
@@ -213,6 +255,7 @@ console.warn('[sell] ...')
 - [ ] **Futures LIVE MODE:** отключён по умолчанию (FUTURES_LIVE_MODE=false → paper trading). Для real Drift Protocol включить через .env + депозит USDC на Drift аккаунт
 - [ ] **PumpSwap graduated token sells** — HOT токены > $8k mcap нужно продавать через Jupiter, не PumpPortal. Сейчас ограничено max $8k в HOT poller.
 - [ ] **Периодический pruning Docker cache** — `docker builder prune -af` на VPS раз в 1-2 недели (диск был 100% 14.06.2026, PostgreSQL упал)
+- [ ] **Auto-launch на VPS** — токены сейчас запускаются только локально через scripts/. Нужна Telegram /auto_launch команда.
 
 ### ВАЖНО
 - [ ] **Unit-тесты** для rug, gad-score, narrative, survival, dna, social, lifecycle, regime
