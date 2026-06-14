@@ -200,40 +200,53 @@ bot.onText(/\/help/, (msg) => {
     `🆓 *FREE (no subscription):*\n` +
     `/start — main menu\n` +
     `/subscribe — view plans & pay\n` +
-    `/status — your subscription status\n` +
+    `/status — subscription status\n` +
     `/wallet <address> — link Solana wallet\n` +
-    `/help — this menu\n\n` +
-    `⚡ *STARTER — 0.05 SOL (1d) | 0.1 SOL (3d):*\n` +
-    `/trending — hot Solana tokens\n` +
+    `/help — this guide\n\n` +
+    `⚡ *ANY PLAN (0.05 SOL trial / 0.1 SOL 3d / 1 SOL monthly):*\n` +
+    `*Solana Scanner:*\n` +
+    `/trending — hot tokens right now\n` +
     `/new — freshly listed tokens\n` +
     `/highscore — top AI-scored tokens\n` +
     `/highrisk — high-risk radar\n` +
     `/analyze <mint> — full GAD AI report\n` +
     `/tokenscore <mint> — safety score 0-100\n` +
     `/signals — active buy signals\n` +
-    `/whales — top whale activity\n` +
-    `/journal — trade history\n` +
-    `/riskpassport — your risk profile\n` +
-    `/trends — meme coin trend engine\n` +
-    `/trades — bot recent trades\n\n` +
-    `💎 *PRO — 1 SOL / 30 days:*\n` +
-    `/bot — bot status & today's PnL\n` +
-    `/autobuy list|add|stop — manage bot\n` +
-    `/portfolio — positions & P&L\n` +
-    `/watchlist — your watchlist\n` +
-    `/mycoins — deployed tokens\n` +
-    `/exitcoin <mint> — sell position\n` +
-    `/launch — deploy token on Pump.fun\n` +
-    `/futures — futures trading\n` +
-    `/macro — market macro signal\n` +
-    `/ideas — AI coin ideas\n` +
-    `/basestatus — Base Network scanner\n` +
-    `/basepositions — open Base positions\n` +
-    `/basetokens — discovered Base tokens\n\n` +
-    `⚡ *STARTER+ Base:*\n` +
+    `/whales — top whale wallets\n` +
+    `*Trading:*\n` +
+    `/trades — bot trade history (24h)\n` +
+    `/journal — your personal trade log\n` +
+    `/riskpassport — risk DNA profile\n` +
+    `*Trends & Intelligence:*\n` +
+    `/trends — GDELT + News meme engine\n` +
+    `/ideas — AI-generated coin concepts\n` +
+    `/xtrends — X/Twitter trend signals\n` +
+    `/xsignal — latest X trend + coin\n` +
+    `*Futures:*\n` +
+    `/macro — BTC/SP500/F&G macro score\n` +
+    `/signal — SOL futures entry signal\n` +
+    `/futures — full futures dashboard\n` +
+    `*Base Network (EVM):*\n` +
+    `/basestatus — Base scanner status\n` +
+    `/basepositions — open ETH positions\n` +
+    `/basetokens — discovered Base tokens\n` +
     `/basetrades — Base trade history\n\n` +
-    `📈 *Platforms we track:*\n` +
-    `pump.fun · DexScreener · Birdeye · Raydium · Base`
+    `💎 *PRO (1 SOL / 30 days) — extra:*\n` +
+    `/bot — Solana bot PnL & status\n` +
+    `/autobuy list|add|stop — manage bot\n` +
+    `/portfolio — full portfolio view\n` +
+    `/watchlist — token watchlist\n` +
+    `/mycoins — your deployed tokens\n` +
+    `/exitcoin <ticker> — sell launched token\n` +
+    `/position — futures position\n` +
+    `/capital — futures capital manager\n` +
+    `/ftrades — futures trade log\n` +
+    `/fclose — close futures position\n\n` +
+    `🔑 *Admin only:*\n` +
+    `/auto_launch — launch token on pump.fun 24/7\n` +
+    `/approve_idea <id> — approve AI coin idea\n\n` +
+    `📈 *Networks:* Solana · Base (EVM)\n` +
+    `📡 *Sources:* DexScreener · Birdeye · Helius · GDELT · X/Twitter · Binance`
   );
 });
 
@@ -1347,6 +1360,160 @@ bot.onText(/^\/xsignal(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
     await send(chatId, `❌ X signal error: ${e.message}`);
   }
 }));
+
+// ─── Auto Launch (ADMIN ONLY) ─────────────────────────────────────────────────
+
+import { launchToken, downloadTgPhoto, getPendingIdeas, LaunchConfig } from './launcher';
+
+// In-memory launch session per admin chat
+const launchSessions = new Map<number, {
+  ideaId?: string; ticker: string; name: string; description: string;
+  devBuySol: number; w2BuySol: number; w3BuySol: number;
+  waitingImage: boolean;
+}>();
+
+function isAdmin(chatId: number): boolean {
+  return ADMIN_ID != null && String(chatId) === String(ADMIN_ID);
+}
+
+// /auto_launch — show pending ideas OR show usage
+bot.onText(/^\/auto_launch(@\w+)?$/, async (msg) => {
+  if (!isAdmin(msg.chat.id)) return;
+  const chatId = msg.chat.id;
+
+  const ideas = await getPendingIdeas(8).catch(() => []);
+  if (!ideas.length) {
+    return send(chatId,
+      `🚀 *Auto Launch — No pending ideas*\n\n` +
+      `Use /trends to find trends, then /idea <cluster_id> to generate coin ideas.\n\n` +
+      `Or launch manually:\n` +
+      `/auto_launch TICKER "Token Name" "Description" DEV_SOL W2_SOL W3_SOL\n\n` +
+      `Example:\n` +
+      `/auto_launch MOON "Moon Dog" "Dog going to the moon" 0.1 0.05 0.03`
+    );
+  }
+
+  const lines = [`🚀 *Auto Launch — Pending Ideas*`, ``];
+  for (const idea of ideas) {
+    lines.push(`• *${idea.ticker}* — ${idea.name} (score: ${idea.score}) [${idea.status}]`);
+    lines.push(`  ID: \`${idea.id}\``);
+    lines.push(`  /auto_launch ${idea.id}`);
+  }
+  lines.push(`\n_Send /auto_launch <id> to start launching_`);
+  await send(chatId, lines.join('\n'));
+});
+
+// /auto_launch <id_or_args> — start launch session for a specific idea or manual config
+bot.onText(/^\/auto_launch(?:@\w+)?\s+(.+)$/, async (msg, match) => {
+  if (!isAdmin(msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  const args = (match![1] ?? '').trim();
+
+  // Check if it's a UUID (existing idea from DB)
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (uuidRe.test(args)) {
+    const { rows } = await (await import('@lib/db')).query<any>(
+      'SELECT * FROM coin_ideas WHERE id = $1', [args]
+    );
+    if (!rows.length) return send(chatId, `❌ Idea ${args} not found.`);
+    const idea = rows[0];
+    launchSessions.set(chatId, {
+      ideaId: idea.id, ticker: idea.ticker, name: idea.name,
+      description: idea.description ?? '',
+      devBuySol: 0.1, w2BuySol: 0.05, w3BuySol: 0.03, waitingImage: true,
+    });
+    return send(chatId,
+      `🚀 *Ready to launch:* ${idea.ticker} — ${idea.name}\n\n` +
+      `Description: ${(idea.description ?? '').slice(0, 200)}\n\n` +
+      `*Now send the token logo image (photo) to this chat.*\n` +
+      `The bot will upload it to Pinata and create the token on pump.fun.\n\n` +
+      `Buys: W1 dev 0.1 SOL | W2 +12min 0.05 SOL | W3 +28min 0.03 SOL\n` +
+      `_Send /launch_cancel to abort_`
+    );
+  }
+
+  // Manual config: TICKER "Name" "Description" dev_sol w2_sol w3_sol
+  const parts = args.match(/^(\w+)\s+"([^"]+)"\s+"([^"]+)"\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)$/);
+  if (!parts) {
+    return send(chatId,
+      `❌ Invalid format. Use:\n` +
+      `/auto_launch TICKER "Token Name" "Description" DEV_SOL W2_SOL W3_SOL\n\n` +
+      `Example:\n/auto_launch MOON "Moon Dog" "Dog going to the moon" 0.1 0.05 0.03`
+    );
+  }
+  const [, ticker, name, description, devStr, w2Str, w3Str] = parts;
+  launchSessions.set(chatId, {
+    ticker: ticker.toUpperCase(), name, description,
+    devBuySol: Number(devStr), w2BuySol: Number(w2Str), w3BuySol: Number(w3Str),
+    waitingImage: true,
+  });
+  await send(chatId,
+    `🚀 *Manual launch configured:*\n` +
+    `Token: *${ticker.toUpperCase()}* — ${name}\n` +
+    `Dev buy: ${devStr} SOL | W2: ${w2Str} SOL | W3: ${w3Str} SOL\n\n` +
+    `*Send the token logo image (photo) to launch.*\n` +
+    `_/launch_cancel to abort_`
+  );
+});
+
+bot.onText(/^\/launch_cancel$/, async (msg) => {
+  if (!isAdmin(msg.chat.id)) return;
+  launchSessions.delete(msg.chat.id);
+  await send(msg.chat.id, '❌ Launch cancelled.');
+});
+
+// Handle photo for launch
+bot.on('photo', async (msg) => {
+  if (!isAdmin(msg.chat.id)) return;
+  const session = launchSessions.get(msg.chat.id);
+  if (!session?.waitingImage) return;
+
+  launchSessions.delete(msg.chat.id);
+  const chatId = msg.chat.id;
+
+  await send(chatId, `📤 Got it! Uploading logo and launching *${session.ticker}* on pump.fun...`);
+
+  try {
+    const photos = msg.photo!;
+    const bestPhoto = photos[photos.length - 1]; // highest quality
+    const imageBuffer = await downloadTgPhoto(bestPhoto.file_id);
+
+    const cfg: LaunchConfig = {
+      name:         session.name,
+      ticker:       session.ticker,
+      description:  session.description,
+      imageBuffer,
+      imageType:    'image/jpeg',
+      website:      'https://gadai.shop',
+      twitter:      'https://x.com/gadaisol',
+      telegram:     'https://t.me/gadfamilytg',
+      devBuySol:    session.devBuySol,
+      w2BuySol:     session.w2BuySol,
+      w3BuySol:     session.w3BuySol,
+      w2DelayMs:    12 * 60 * 1000,  // 12 min
+      w3DelayMs:    16 * 60 * 1000,  // +16 min = T+28min total
+    };
+
+    const result = await launchToken(cfg);
+
+    if (result.ok) {
+      await send(chatId,
+        `✅ *TOKEN LAUNCHED!*\n\n` +
+        `*${session.ticker}* — ${session.name}\n\n` +
+        `🪙 CA: \`${result.mintAddr}\`\n` +
+        `📌 Image: [IPFS](${result.imageUrl})\n` +
+        `📄 Meta: [Pinata](${result.metaUri})\n\n` +
+        `[pump.fun](https://pump.fun/coin/${result.mintAddr}) | [Solscan TX](https://solscan.io/tx/${result.createTx})\n\n` +
+        `W2 buys in 12min (+${cfg.w2BuySol} SOL)\n` +
+        `W3 buys in 28min (+${cfg.w3BuySol} SOL)`
+      );
+    } else {
+      await send(chatId, `❌ Launch failed: ${result.error}`);
+    }
+  } catch (e: any) {
+    await send(chatId, `❌ Error during launch: ${e.message}`);
+  }
+});
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 bot.on('polling_error', (err) => log('error', 'polling:', err.message));

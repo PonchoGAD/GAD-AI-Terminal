@@ -28,39 +28,59 @@ async function verifyPaymentTx(
   txSignature: string,
   expectedRecipient: string,
   minSol: number
-): Promise<{ ok: boolean; actualSol?: number; from?: string }> {
-  try {
-    const tx = await connection.getParsedTransaction(txSignature, {
-      maxSupportedTransactionVersion: 0,
-      commitment: 'confirmed'
-    });
-    if (!tx) return { ok: false };
+): Promise<{ ok: boolean; actualSol?: number; from?: string; detail?: string }> {
+  // Retry with exponential backoff — TX may not be confirmed yet when frontend submits
+  const RETRIES = 6;
+  const DELAYS  = [1000, 2000, 4000, 8000, 12000, 16000];
 
-    const preBalances  = tx.meta?.preBalances  ?? [];
-    const postBalances = tx.meta?.postBalances ?? [];
-    const accounts     = tx.transaction.message.accountKeys;
+  for (let attempt = 0; attempt < RETRIES; attempt++) {
+    try {
+      const tx = await connection.getParsedTransaction(txSignature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: attempt < 4 ? 'confirmed' : 'finalized',
+      });
 
-    // Find the recipient account index
-    const recipientIdx = accounts.findIndex(
-      (a: any) => (a.pubkey ?? a).toString() === expectedRecipient
-    );
-    if (recipientIdx < 0) return { ok: false };
+      if (!tx) {
+        // TX not found yet — wait and retry
+        if (attempt < RETRIES - 1) {
+          console.info(`[sub] TX ${txSignature.slice(0, 12)}... not found (attempt ${attempt + 1}/${RETRIES}), retrying in ${DELAYS[attempt]}ms`);
+          await new Promise(r => setTimeout(r, DELAYS[attempt]));
+          continue;
+        }
+        return { ok: false, detail: 'Transaction not found after 6 attempts. Please wait 30s and try again.' };
+      }
 
-    // Guard against missing balance metadata
-    if (recipientIdx >= postBalances.length || recipientIdx >= preBalances.length) {
-      return { ok: false };
+      const preBalances  = tx.meta?.preBalances  ?? [];
+      const postBalances = tx.meta?.postBalances ?? [];
+      const accounts     = tx.transaction.message.accountKeys;
+
+      const recipientIdx = accounts.findIndex(
+        (a: any) => (a.pubkey ?? a).toString() === expectedRecipient
+      );
+      if (recipientIdx < 0) return { ok: false, detail: 'Treasury wallet not found in transaction.' };
+
+      if (recipientIdx >= postBalances.length || recipientIdx >= preBalances.length) {
+        return { ok: false, detail: 'Balance metadata missing.' };
+      }
+
+      const received = (postBalances[recipientIdx] - preBalances[recipientIdx]) / LAMPORTS_PER_SOL;
+      if (received <= 0 || received < minSol * 0.99) {
+        return { ok: false, actualSol: received, detail: `Received ${received.toFixed(4)} SOL, expected ${minSol} SOL.` };
+      }
+
+      const from = (accounts[0]?.pubkey ?? accounts[0])?.toString();
+      console.info(`[sub] ✅ Payment verified: ${received.toFixed(4)} SOL from ${from?.slice(0, 8)}...`);
+      return { ok: true, actualSol: received, from };
+
+    } catch (err: any) {
+      if (attempt < RETRIES - 1) {
+        await new Promise(r => setTimeout(r, DELAYS[attempt]));
+        continue;
+      }
+      return { ok: false, detail: `RPC error: ${err.message}` };
     }
-
-    const received = (postBalances[recipientIdx] - preBalances[recipientIdx]) / LAMPORTS_PER_SOL;
-    // Must be positive (not a withdrawal) and meet minimum amount
-    if (received <= 0 || received < minSol * 0.99) return { ok: false, actualSol: received };
-
-    // Fee payer / sender is always the first account (index 0) in Solana
-    const from = (accounts[0]?.pubkey ?? accounts[0])?.toString();
-    return { ok: true, actualSol: received, from };
-  } catch {
-    return { ok: false };
   }
+  return { ok: false, detail: 'Max retries exceeded.' };
 }
 
 export function registerSubscriptionRoutes(app: Application) {
@@ -178,9 +198,10 @@ export function registerSubscriptionRoutes(app: Application) {
 
       if (!verification.ok) {
         return res.status(402).json({
-          error: 'Payment verification failed. Transaction not found or insufficient amount.',
+          error: verification.detail ?? 'Payment verification failed. Transaction not found or insufficient amount.',
           expected: `${plan.price_sol} SOL to ${TREASURY_WALLET}`,
-          actualSol: verification.actualSol
+          actualSol: verification.actualSol,
+          hint: 'Wait 30 seconds after sending SOL, then try again. If the problem persists, contact support.'
         });
       }
 
