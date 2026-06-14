@@ -1276,19 +1276,14 @@ async function pollPumpswapTokens(keypair: Keypair, connection: Connection): Pro
       }
     } catch { /* fail-open */ }
 
-    // Secondary: token-boosts endpoint (recently boosted = recently graduated often)
-    try {
-      const boostR = await axios.get('https://api.dexscreener.com/token-boosts/latest/v1', { timeout: 6_000 });
-      const boostMints: string[] = ((Array.isArray(boostR.data) ? boostR.data : []) as any[])
-        .filter((p: any) => p.chainId === 'solana' && p.tokenAddress && !seen.has(p.tokenAddress))
-        .map((p: any) => { seen.add(p.tokenAddress); return p.tokenAddress; })
-        .slice(0, 20);
-      if (boostMints.length > 0) {
-        const pr2 = await axios.get(
-          `https://api.dexscreener.com/latest/dex/tokens/${boostMints.join(',')}`,
-          { timeout: 6_000 }
+    // Secondary: DexScreener search for pumpswap tokens (returns actual pumpswap pairs)
+    for (const q of ['pumpswap', 'pump fun graduated sol', 'new pumpswap']) {
+      try {
+        const r = await axios.get(
+          `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`,
+          { timeout: 5_000 }
         );
-        for (const p of (pr2.data?.pairs ?? []) as any[]) {
+        for (const p of (r.data?.pairs ?? []) as any[]) {
           if (p.chainId !== 'solana') continue;
           if ((p.dexId ?? '').toLowerCase() !== 'pumpswap') continue;
           const m = p.baseToken?.address;
@@ -1296,8 +1291,9 @@ async function pollPumpswapTokens(keypair: Keypair, connection: Connection): Pro
           seen.add(m);
           candidates.push(p);
         }
-      }
-    } catch { /* fail-open */ }
+        await new Promise(res => setTimeout(res, 300));
+      } catch { /* skip */ }
+    }
 
     let psLiq = 0, psAge = 0, psMom = 0;
     console.debug(`[bonding-scan] PUMPSWAP poll: ${candidates.length} candidates from DexScreener`);
