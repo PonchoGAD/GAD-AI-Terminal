@@ -119,4 +119,58 @@ router.get('/coins/:mint/events', async (req: Request, res: Response) => {
   }
 });
 
+// POST /launcher/submit — website form submission (JSON + base64 image)
+// Creates a coin_idea in DB + notifies admin via Telegram
+router.post('/submit', async (req: Request, res: Response) => {
+  try {
+    const { name, ticker, description, imageB64, imageName, imageType, devBuySol, w2BuySol, w3BuySol } = req.body;
+    if (!name || !ticker || !description) {
+      return res.status(400).json({ error: 'name, ticker, description required' });
+    }
+    if (!imageB64) {
+      return res.status(400).json({ error: 'logo image required' });
+    }
+    if (ticker.length > 8) {
+      return res.status(400).json({ error: 'ticker max 8 chars' });
+    }
+
+    // Save to coin_ideas table (pending review)
+    const { rows } = await query<any>(`
+      INSERT INTO coin_ideas (ticker, name, description, meme_angle, status, score)
+      VALUES ($1, $2, $3, $4, 'pending', 50)
+      RETURNING id
+    `, [
+      ticker.toUpperCase().slice(0, 8),
+      name.slice(0, 100),
+      description.slice(0, 500),
+      JSON.stringify({ imageB64, imageName, imageType, devBuySol, w2BuySol, w3BuySol }),
+    ]);
+
+    const ideaId = rows[0].id;
+
+    // Notify admin via Telegram
+    const botToken = process.env.TELEGRAM_BOT_TOKEN;
+    const adminId  = process.env.TELEGRAM_ADMIN_CHAT_ID;
+    if (botToken && adminId) {
+      const msg =
+        `🆕 *New Token Submission from Website*\n\n` +
+        `*${ticker.toUpperCase()}* — ${name}\n` +
+        `"${description.slice(0, 150)}..."\n\n` +
+        `Dev: ${devBuySol} SOL | W2: ${w2BuySol} SOL | W3: ${w3BuySol} SOL\n\n` +
+        `Launch: \`/auto_launch ${ideaId}\``;
+      fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: adminId, text: msg, parse_mode: 'Markdown' }),
+      }).catch(() => {});
+    }
+
+    console.info(`[launcher] New submission: ${ticker} — ${name} (id: ${ideaId})`);
+    res.json({ ok: true, id: ideaId, message: 'Submitted! Admin will review and launch shortly.' });
+
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 export default router;
