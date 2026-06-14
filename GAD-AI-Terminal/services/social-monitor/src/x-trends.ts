@@ -1,13 +1,14 @@
 /**
- * X (Twitter) Trend Scanner
+ * X (Twitter) Trend Scanner + GDELT/Google News fallback
  *
- * Searches Twitter API v2 for high-engagement crypto content,
- * detects narrative themes, and returns ranked opportunities.
+ * Primary: Twitter API v2 search (requires Bearer Token + Basic plan $100/mo)
+ * Fallback: trend_clusters table (populated by trend-engine using GDELT + Google News, FREE)
  *
- * Rate limit: max 1 search per 15 minutes (free tier respect).
+ * Rate limit: max 1 search per 15 minutes.
  */
 
 import axios from 'axios';
+import { query } from '@lib/db';
 
 const BEARER = process.env.TWITTER_BEARER_TOKEN ?? '';
 
@@ -115,12 +116,49 @@ export async function scanXTrends(): Promise<XTrend[]> {
     return trends;
 
   } catch (err: any) {
-    if (err.response?.status === 429) {
+    const status = err.response?.status;
+    if (status === 429) {
       console.warn('[social] X API rate limit — backing off 15min');
-      lastSearchAt = Date.now(); // prevent retry spam
+      lastSearchAt = Date.now();
+    } else if (status === 402 || status === 403) {
+      console.warn(`[social] X API requires paid plan (${status}) — falling back to trend_clusters`);
     } else {
       console.warn(`[social] X scan error: ${err.message}`);
     }
+    return fromTrendClusters();
+  }
+}
+
+/** Fallback: read recent trend_clusters (populated by trend-engine from GDELT + Google News) */
+async function fromTrendClusters(): Promise<XTrend[]> {
+  try {
+    const { rows } = await query<any>(`
+      SELECT id, main_title, meme_score, trend_score, final_score, total_mentions
+      FROM trend_clusters
+      WHERE final_score >= 55
+        AND created_at > now() - interval '2 hours'
+      ORDER BY final_score DESC
+      LIMIT 5
+    `);
+
+    return rows.map((r: any) => {
+      const title: string = r.main_title ?? '';
+      const { theme, keywords } = detectNarrative(title);
+      const engagement = Math.round(Number(r.total_mentions) * 3 + Number(r.final_score) * 2);
+      return {
+        theme,
+        keywords,
+        topTweet: title,
+        tweetUrl: '',
+        engagement,
+        retweets: Number(r.total_mentions) ?? 0,
+        likes: 0,
+        authorId: 'gdelt',
+        tweetId: String(r.id),
+        detectedAt: new Date(),
+      } as XTrend;
+    });
+  } catch {
     return [];
   }
 }
