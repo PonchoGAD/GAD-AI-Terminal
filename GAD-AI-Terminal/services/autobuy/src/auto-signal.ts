@@ -328,6 +328,41 @@ export async function processAutoSignals(walletAddress: string): Promise<void> {
   }
 }
 
+// ─── Market Regime Auto-Detection ────────────────────────────────────────────
+// Fear & Greed index from Alternative.me. Cached 30 min.
+// EXTREME_FEAR (<25): PAUSE all buys — memes don't pump in panic market
+// FEAR (25-45):       STRICT mode — require strong pc1h, small positions
+// NEUTRAL (45-60):    NORMAL mode — standard filters
+// GREED (60-80):      BULL mode — lower TP targets, larger positions allowed
+// EXTREME_GREED(>80): CAUTION — euphoria = top risk, tighten stops
+
+let cachedFearGreed = 50;
+let fgLastFetch = 0;
+
+export async function getFearGreed(): Promise<number> {
+  if (Date.now() - fgLastFetch < 30 * 60 * 1000) return cachedFearGreed;
+  try {
+    const r = await axios.get('https://api.alternative.me/fng/?limit=1', { timeout: 5000 });
+    const val = Number(r.data?.data?.[0]?.value ?? 50);
+    cachedFearGreed = val;
+    fgLastFetch = Date.now();
+    console.info(`[raydium-scan] 📊 Fear&Greed updated: ${val}`);
+  } catch { }
+  return cachedFearGreed;
+}
+
+// Returns market regime string based on F&G + manual override
+export async function getMarketRegime(): Promise<string> {
+  const override = (process.env.MARKET_REGIME ?? '').toUpperCase();
+  if (override && override !== 'AUTO') return override;
+  const fg = await getFearGreed();
+  if (fg < 25) return 'EXTREME_FEAR';
+  if (fg < 45) return 'FEAR';
+  if (fg < 60) return 'NEUTRAL';
+  if (fg < 80) return 'BULL';
+  return 'EUPHORIA';
+}
+
 // ─── Raydium Direct Scanner ────────────────────────────────────────────────────
 // Bypass scanner alerts — directly query DexScreener for Raydium/Jupiter pairs.
 // Raydium tokens score 40-44 on GAD (never reach 80 alert threshold),
@@ -378,50 +413,47 @@ export interface LiqTier {
   sellStages: Array<{ stage: number; multiplier: number; sellPct: number }>;
 }
 
-export function getLiqTier(liqUsd: number): LiqTier {
-  // TP targets must account for the "TP lag" problem: memecoins peak, the sell TX
-  // is submitted, but 5-10 seconds pass before on-chain confirmation. By then the
-  // price can revert 10-20% on thin pools. Setting TP at 1.15x means we trigger at
-  // the peak but execute below entry — confirmed loss pattern from June 2026 data.
+export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
+  // TP strategy by market regime:
+  // FEAR/EXTREME_FEAR: 1.20x TP (memes barely move, capture 15-20% and run)
+  // NEUTRAL:           1.30x TP (moderate targets, balanced)
+  // BULL/EUPHORIA:     1.50x TP (big moves, let winners run)
   //
-  // Fix: set TP high enough that even after 10-15% execution slippage + priority fees,
-  // the net received is still above entry.
-  //  0.05 SOL position: fees ~0.003 SOL (6%), sell slippage ~5%, need TP ≥ 1.12× breakeven.
-  //  Target 1.40× → captures at ~1.20-1.25× after reversal → net +15-20%.
-  //
-  // SIDEWAYS (default): conservative targets, higher hit-rate expected on quiet market.
-  // BULL: aggressive targets — memecoins make bigger moves, let winners run.
-  const regime = (process.env.MARKET_REGIME ?? 'SIDEWAYS').toUpperCase();
-  const isBull = regime === 'BULL' || regime === 'EUPHORIA';
+  // earlyTrailPct (3-5%): fires BEFORE TP — sells when peak drops this % from high.
+  // This is the mechanism that captured +7.9% in the best real trade (June 2026 data).
+  // It fires SOONER than TP, so TP is a backstop for coins that just blast up.
+  const r = regime.toUpperCase();
+  const isFear = r === 'FEAR' || r === 'EXTREME_FEAR';
+  const isBull = r === 'BULL' || r === 'EUPHORIA';
 
   if (liqUsd <= 80000) return {
     tier: 1, label: 't1',
-    timeLimitSec: 1800,    // 30 min inactivity timer
-    stopPct: 0.08,         // 8% stop — wider to survive early volatility on thin pools
-    trailPct: 0.12,
-    earlyTrailPct: 0.06,   // early trail: lock profits when peak drops 6% (fires ≥ entry+10%)
+    timeLimitSec: 1200,    // 20 min — thin pools move fast, don't hold stale positions
+    stopPct: isFear ? 0.10 : 0.08,   // wider stop in fear (more volatility noise)
+    trailPct: 0.10,
+    earlyTrailPct: isFear ? 0.03 : 0.04,   // tighter early trail = lock gains sooner
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.60 : 1.40, sellPct: 100 },
+      { stage: 1, multiplier: isBull ? 1.55 : isFear ? 1.18 : 1.30, sellPct: 100 },
     ],
   };
   if (liqUsd <= 250000) return {
     tier: 2, label: 't2',
-    timeLimitSec: 2700,    // 45 min
-    stopPct: 0.07,
-    trailPct: 0.10,
-    earlyTrailPct: 0.05,
+    timeLimitSec: 2400,    // 40 min
+    stopPct: isFear ? 0.09 : 0.07,
+    trailPct: 0.09,
+    earlyTrailPct: isFear ? 0.03 : 0.04,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.50 : 1.35, sellPct: 100 },
+      { stage: 1, multiplier: isBull ? 1.45 : isFear ? 1.15 : 1.28, sellPct: 100 },
     ],
   };
   return {
     tier: 3, label: 't3',
     timeLimitSec: 3600,    // 60 min — mid-caps need more time
-    stopPct: 0.06,
-    trailPct: 0.10,
-    earlyTrailPct: 0.04,
+    stopPct: isFear ? 0.08 : 0.06,
+    trailPct: 0.08,
+    earlyTrailPct: isFear ? 0.03 : 0.04,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.40 : 1.30, sellPct: 100 },
+      { stage: 1, multiplier: isBull ? 1.38 : isFear ? 1.12 : 1.25, sellPct: 100 },
     ],
   };
 }
@@ -694,6 +726,20 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
   if (now - lastRaydiumScan < RAYDIUM_SCAN_INTERVAL_MS) return;
   lastRaydiumScan = now;
 
+  // ── Market Regime Gate ──────────────────────────────────────────────────────
+  // EXTREME_FEAR (F&G < 25): memes don't pump in panic mode. Skip all new buys.
+  // Every trade we checked in this regime produced losses. Wait it out.
+  const regime = await getMarketRegime();
+  if (regime === 'EXTREME_FEAR') {
+    console.info(`[raydium-scan] 🚫 EXTREME_FEAR market (F&G=${cachedFearGreed}) — skipping new buys. Existing positions monitored.`);
+    return;
+  }
+
+  // FEAR regime: require stronger momentum to enter
+  const minPc1hOverride = regime === 'FEAR'
+    ? Math.max(RAYDIUM_MIN_PC1H, 15)   // need 15% 1h gain minimum in fear
+    : RAYDIUM_MIN_PC1H;
+
   const dailySpent = await getDailySpent();
   if (dailySpent >= DAILY_MAX_SOL) return;
 
@@ -708,7 +754,7 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     return;
   }
 
-  console.info(`[raydium-scan] 🔍 Scanning ${pairs.length} pairs | Active: ${activePositions}/${MAX_AUTO_POSITIONS} | Daily: ${dailySpent.toFixed(4)}/${DAILY_MAX_SOL} SOL`);
+  console.info(`[raydium-scan] 🔍 Scanning ${pairs.length} pairs [${regime} F&G:${cachedFearGreed}] | Active: ${activePositions}/${MAX_AUTO_POSITIONS} | Daily: ${dailySpent.toFixed(4)}/${DAILY_MAX_SOL} SOL`);
 
   // Deduplicate by mint AND by normalized symbol (prevent buying 3 "SpaceX" variants)
   const seenMints = new Set<string>();
@@ -768,8 +814,8 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       console.debug(`[raydium-scan] ✗mom  ${sym.padEnd(10)} pc5m:${pc5m.toFixed(1)}% liq:$${liq.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
       skipped.momentum++; continue;
     }
-    if (pc1h < RAYDIUM_MIN_PC1H || pc1h > RAYDIUM_MAX_PC1H) {
-      console.debug(`[raydium-scan] ✗mom  ${sym.padEnd(10)} pc1h:${pc1h.toFixed(1)}% liq:$${liq.toFixed(0)}`);
+    if (pc1h < minPc1hOverride || pc1h > RAYDIUM_MAX_PC1H) {
+      console.debug(`[raydium-scan] ✗mom  ${sym.padEnd(10)} pc1h:${pc1h.toFixed(1)}% liq:$${liq.toFixed(0)} [min:${minPc1hOverride}%]`);
       skipped.momentum++; continue;
     }
 
@@ -853,8 +899,8 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     try {
       const isFresh = ageSec < 6 * 3600;
       const ageTag = isFresh ? `fresh${Math.round(ageSec / 3600)}h` : `aged`;
-      const tier = getLiqTier(liq);
-      const label = `auto:raydium_scan:liq${Math.round(liq / 1000)}k:${ageTag}:${tier.label}`;
+      const tier = getLiqTier(liq, regime);
+      const label = `auto:raydium_scan:liq${Math.round(liq / 1000)}k:${ageTag}:${tier.label}:${regime.toLowerCase()}`;
       await query(
         `INSERT INTO autobuy_jobs
            (mint_address, label, amount_sol, slippage_bps, interval_seconds,

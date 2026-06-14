@@ -727,9 +727,9 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
       const pc5m    = Number(coin.pc5m    ?? 0);
       const bsRatio = sells5m > 0 ? buys5m / sells5m : buys5m;
 
-      // Min 20 buy txns in last 5m (real crowd interest, not just dev+bots)
-      if (buys5m < 20) {
-        console.debug(`[bonding-scan] ✗hot ${symbol} buys5m:${buys5m} (min 20)`);
+      // Min 15 buy txns in last 5m (real crowd interest, not just dev+bots)
+      if (buys5m < 15) {
+        console.debug(`[bonding-scan] ✗hot ${symbol} buys5m:${buys5m} (min 15)`);
         continue;
       }
       // Min $1500 vol in 5m (serious capital, not micro-trades)
