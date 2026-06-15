@@ -42,23 +42,26 @@ export async function buyToken(
 
     if (quote.dex === 'uniswap_v3') {
       const router = new ethers.Contract(ADDRESSES.UNISWAP_V3_ROUTER, UNISWAP_V3_ROUTER_ABI, wallet);
-      tx = await router.exactInputSingle(
-        {
-          tokenIn:           ADDRESSES.WETH,
-          tokenOut:          tokenAddress,
-          fee:               quote.fee,
-          recipient:         wallet.address,
-          amountIn:          ethAmountWei,
-          amountOutMinimum:  quote.amountOutMin,
-          sqrtPriceLimitX96: 0n,
-        },
-        { value: ethAmountWei, gasLimit: GAS_LIMIT_BUY }
-      );
+      const params = {
+        tokenIn:           ADDRESSES.WETH,
+        tokenOut:          tokenAddress,
+        fee:               quote.fee,
+        recipient:         wallet.address,
+        amountIn:          ethAmountWei,
+        amountOutMinimum:  quote.amountOutMin,
+        sqrtPriceLimitX96: 0n,
+      };
+      // Simulate first — catches reverts before wasting gas
+      await router.exactInputSingle.staticCall(params, { value: ethAmountWei });
+      tx = await router.exactInputSingle(params, { value: ethAmountWei, gasLimit: GAS_LIMIT_BUY });
     } else {
       const router = new ethers.Contract(ADDRESSES.AERODROME_ROUTER, AERODROME_ROUTER_ABI, wallet);
+      const routes = [{ from: ADDRESSES.WETH, to: tokenAddress, stable: false, factory: ADDRESSES.AERODROME_FACTORY }];
+      // Simulate first — Aerodrome reverts often on thin pools
+      await router.swapExactETHForTokens.staticCall(quote.amountOutMin, routes, wallet.address, deadline, { value: ethAmountWei });
       tx = await router.swapExactETHForTokens(
         quote.amountOutMin,
-        [{ from: ADDRESSES.WETH, to: tokenAddress, stable: false, factory: ADDRESSES.AERODROME_FACTORY }],
+        routes,
         wallet.address,
         deadline,
         { value: ethAmountWei, gasLimit: GAS_LIMIT_BUY }
@@ -75,7 +78,9 @@ export async function buyToken(
       fee_tier:   quote.fee,
     };
   } catch (e: any) {
-    return { ok: false, amount_in: ethAmountEth.toString(), amount_out: '0', dex: quote.dex, error: e.message };
+    // Decode revert reason if available
+    const reason = e.reason ?? e.shortMessage ?? e.message?.slice(0, 120) ?? 'unknown';
+    return { ok: false, amount_in: ethAmountEth.toString(), amount_out: '0', dex: quote.dex, error: reason };
   }
 }
 

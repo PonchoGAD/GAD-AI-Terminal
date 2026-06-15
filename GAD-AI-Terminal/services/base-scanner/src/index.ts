@@ -123,9 +123,21 @@ app.post('/base/buy', async (req, res) => {
   }
 });
 
+// ─── Buy failure blacklist — skip tokens that reverted recently ───────────────
+// Prevents repeated TX failures on bad tokens (e.g. CHARON tried 3× in 30 min)
+const buyFailBlacklist = new Map<string, number>(); // address → expiry timestamp
+const BUY_FAIL_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2h cooldown after buy failure
+
 // ─── Auto-buy hook (called by scanner on new signals) ─────────────────────────
 export async function handleNewToken(token: BaseToken): Promise<void> {
   if (!AUTO_BUY) return;
+
+  // Skip blacklisted tokens (recent buy failures)
+  const blacklistExpiry = buyFailBlacklist.get(token.contract_address);
+  if (blacklistExpiry && Date.now() < blacklistExpiry) {
+    console.debug(`[base-scanner] ⛔ ${token.symbol} blacklisted (buy failed recently) — skipping`);
+    return;
+  }
 
   const openCount = await query(
     `SELECT COUNT(*) as cnt FROM base_positions WHERE sold_at IS NULL AND is_active=true`
@@ -152,13 +164,14 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
     return;
   }
 
-  console.info(`[base-scanner] 🛒 Buying ${token.symbol} ${BUY_ETH} ETH | liq:$${token.liquidity_usd.toFixed(0)} score:${token.safe_score}`);
+  console.info(`[base-scanner] 🛒 Buying ${token.symbol} ${BUY_ETH} ETH | liq:$${token.liquidity_usd.toFixed(0)} score:${token.safe_score} dex:${token.dex_id}`);
 
-  const ethBalBefore = await getEthBalance().catch(() => 0);
   const result = await buyToken(token.contract_address, BUY_ETH);
 
   if (!result.ok) {
-    console.error(`[base-scanner] Buy failed ${token.symbol}: ${result.error}`);
+    // Blacklist this token for 2h — simulation or execution failed
+    buyFailBlacklist.set(token.contract_address, Date.now() + BUY_FAIL_COOLDOWN_MS);
+    console.error(`[base-scanner] ❌ Buy failed ${token.symbol} (${result.dex}): ${result.error} — blacklisted 2h`);
     return;
   }
 
