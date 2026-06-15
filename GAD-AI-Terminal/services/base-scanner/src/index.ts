@@ -3,6 +3,7 @@ import { query } from '@lib/db';
 import { getEthBalance, buyToken } from '@lib/base';
 import { runScanCycle, BaseToken } from './scanner';
 import { startMonitor, getPositionSummary } from './monitor';
+import { registerMoralisStream, handleMoralisWebhook } from './moralis-stream';
 
 const PORT      = Number(process.env.PORT         || '4005');
 const BUY_ETH   = Number(process.env.BASE_BUY_ETH || '0.005');
@@ -15,6 +16,12 @@ app.use(express.json());
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'base-scanner' }));
+
+// ─── Moralis Streams webhook ──────────────────────────────────────────────────
+app.post('/base/moralis-hook', (req, res) => {
+  handleMoralisWebhook(req.body);
+  res.sendStatus(200);
+});
 
 // ─── Status ──────────────────────────────────────────────────────────────────
 app.get('/base/status', async (_req, res) => {
@@ -218,3 +225,6 @@ async function runLoop(): Promise<void> {
 
 runLoop().catch(console.error);
 setInterval(() => runLoop().catch(console.error), SCAN_INTERVAL_MS);
+
+// Register Moralis stream (no-op if MORALIS_API_KEY not set)
+registerMoralisStream().catch(console.error);

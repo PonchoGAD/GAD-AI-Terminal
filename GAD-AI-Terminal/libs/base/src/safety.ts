@@ -19,8 +19,19 @@ export async function checkTokenSafety(address: string): Promise<TokenSafetyResu
   const flags: string[] = [];
   let score = 100;
 
+  // Run GoPlus + Token Sniffer in parallel (both non-blocking)
+  const [goplus, tsResult] = await Promise.all([
+    checkGoPlusHoneypot(address),
+    checkTokenSniffer(address),
+  ]);
+
+  // Apply Token Sniffer score (only when key is set)
+  if (tsResult.flags.length) {
+    flags.push(...tsResult.flags);
+    score = Math.min(score, tsResult.score);
+  }
+
   // GoPlus honeypot check runs first — fastest way to kill bad tokens
-  const goplus = await checkGoPlusHoneypot(address);
   if (goplus.is_honeypot)        { flags.push('HONEYPOT');         score -= 80; }
   if (goplus.buy_tax > 10)       { flags.push(`BUY_TAX_${Math.round(goplus.buy_tax)}PCT`);  score -= 30; }
   if (goplus.sell_tax > 10)      { flags.push(`SELL_TAX_${Math.round(goplus.sell_tax)}PCT`); score -= 40; }
@@ -64,6 +75,31 @@ interface GoPlusResult {
   is_blacklisted:boolean;
   is_mintable:   boolean;
   hidden_owner:  boolean;
+}
+
+// Token Sniffer API — activates when TOKEN_SNIFFER_API_KEY is set
+// Get key: tokensniffer.com → API → Subscribe ($29/mo)
+// Checks: rug similarity, honeypot, owner privileges, LP lock
+export async function checkTokenSniffer(address: string): Promise<{ score: number; flags: string[] }> {
+  const key = process.env.TOKEN_SNIFFER_API_KEY;
+  if (!key) return { score: 100, flags: [] };
+  try {
+    const r = await axios.get(
+      `https://tokensniffer.com/api/v2/tokens/8453/${address}?apikey=${key}&include_metrics=1`,
+      { timeout: 8000 }
+    );
+    const d = r.data;
+    const flags: string[] = [];
+    let deduction = 0;
+    if (d?.is_honeypot)             { flags.push('TS_HONEYPOT');     deduction += 80; }
+    if (d?.has_high_buy_fee)        { flags.push('TS_HIGH_BUY_FEE'); deduction += 30; }
+    if (d?.has_high_sell_fee)       { flags.push('TS_HIGH_SELL_FEE');deduction += 40; }
+    if (d?.has_blacklist)           { flags.push('TS_BLACKLIST');     deduction += 20; }
+    if (d?.similar_token?.score > 0.8) { flags.push('TS_COPY_TOKEN');deduction += 25; }
+    if (d?.lp_locked === false)     { flags.push('TS_LP_UNLOCKED');  deduction += 15; }
+    if (flags.length) console.debug(`[base-safety] TokenSniffer ${address.slice(0,8)}: ${flags.join(', ')}`);
+    return { score: Math.max(0, 100 - deduction), flags };
+  } catch { return { score: 100, flags: [] }; }
 }
 
 // GoPlus Security API — free, no API key, covers Base (chain_id=8453)
