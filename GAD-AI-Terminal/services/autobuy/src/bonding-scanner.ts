@@ -51,23 +51,24 @@ const BONDING_MIN_BUYERS     = Number(process.env.BONDING_MIN_BUYERS    || '50')
 const BONDING_WATCH_TIMEOUT_MS = Number(process.env.BONDING_WATCH_TIMEOUT_SEC || '1020') * 1000;
 
 // Time limit before force-exit (seconds).
-// 10 min hold — mover tokens can take 3-8 min to fully pump after initial signal.
-const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '90');
+// 30 min hold — mover tokens that become 100x winners need 10-60min to develop.
+// 120s/300s was killing us — forced exits before the pump developed.
+const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '1800');
 
-// Stop loss: 10% from entry. Movers either go up fast or dump — no reason to hold losers.
-const BONDING_STOP_PCT = Number(process.env.BONDING_STOP_PCT || '0.10');
+// Stop loss: 12% from entry. Tight enough to cut losers, wide enough for normal volatility.
+const BONDING_STOP_PCT = Number(process.env.BONDING_STOP_PCT || '0.12');
 
-// TP levels: aggressive early-exit strategy.
-// Sell majority (60%) at 1.5x to lock profit, trail the rest.
-// Bonding curve movers pump fast and dump fast — capture the spike, not the dream.
+// TP levels: let winners run — bonding curve 100x movers need time to develop.
+// Take some profit early (2x) but keep most riding with trail stop.
 const BONDING_TPS = [
-  { mult: 1.5, sellPct: 60 },  // lock 60% at 1.5x — first real profit
-  { mult: 2.5, sellPct: 30 },  // 30% more at 2.5x — if it keeps going
-  { mult: 5.0, sellPct: 10 },  // moon bag at 5x
+  { mult: 2.0,  sellPct: 35 },  // take 35% off at 2x — lock first real profit
+  { mult: 5.0,  sellPct: 30 },  // 30% more at 5x — meaningful milestone
+  { mult: 15.0, sellPct: 25 },  // 25% at 15x — moon territory
+  { mult: 50.0, sellPct: 10 },  // 10% moon bag at 50x
 ];
 
-// Moon bag trailing stop: sell remaining if price drops 15% from ATH
-const MOON_BAG_TRAIL_PCT = Number(process.env.MOON_BAG_TRAIL_PCT || '0.15');
+// Moon bag trailing stop: sell remaining if price drops 20% from ATH
+const MOON_BAG_TRAIL_PCT = Number(process.env.MOON_BAG_TRAIL_PCT || '0.20');
 
 // Dump detection: if sell volume > buy volume * this ratio → exit
 const BONDING_DUMP_RATIO = Number(process.env.BONDING_DUMP_RATIO || '2.5');
@@ -81,13 +82,14 @@ const SOLANA_RPC      = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.sola
 const BONDING_HOT_ENABLED     = process.env.BONDING_HOT_ENABLED === 'true';
 // Poll every 20s to catch early movers before the pump is over
 const BONDING_HOT_INTERVAL_MS = Number(process.env.BONDING_HOT_INTERVAL_SEC || '20') * 1000;
-// $10k+ mcap = enough pool depth to avoid 20-50% slippage on exit (0.015 SOL = 0.01% of pool)
-const BONDING_HOT_MIN_MCAP    = Number(process.env.BONDING_HOT_MIN_MCAP_USD || '10000');
-const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '25000');
-// Movers window: catch tokens 90 seconds to 8 minutes old.
-// Past initial sniper bots (first 60-90s), but before the pump is fully in.
+// $8k+ mcap = enough pool depth, but not so high that the pump already happened.
+// Max $60k = still on bonding curve (graduation at $69k). Tokens at $25-60k can still 3-5x.
+const BONDING_HOT_MIN_MCAP    = Number(process.env.BONDING_HOT_MIN_MCAP_USD || '8000');
+const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '60000');
+// Movers window: catch tokens 1 minute to 30 minutes old.
+// Tokens need >60s to filter out initial sniper bots. Past 30min the easy gains are taken.
 const BONDING_HOT_MIN_AGE_SEC = Number(process.env.BONDING_HOT_MIN_AGE_SEC || '60');    // 1 min
-const BONDING_HOT_MAX_AGE_SEC = Number(process.env.BONDING_HOT_MAX_AGE_SEC || '300');  //  5 min
+const BONDING_HOT_MAX_AGE_SEC = Number(process.env.BONDING_HOT_MAX_AGE_SEC || '1800'); // 30 min
 
 // NEW token poller — catches tokens 1-14 min old before they become HOT
 // Earlier stage = higher risk, smaller position, tighter limits
@@ -904,19 +906,20 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
       const bsRatio = sells5m > 0 ? buys5m / sells5m : buys5m;
 
       // Need real buy transactions in last 5m
-      if (buys5m < 5) {
-        console.debug(`[bonding-scan] ✗mover ${symbol} buys5m:${buys5m} (min 5)`);
+      if (buys5m < 3) {
+        console.debug(`[bonding-scan] ✗mover ${symbol} buys5m:${buys5m} (min 3)`);
         continue;
       }
-      // Need some real volume ($500+) — weeds out micro-trades
-      if (vol5m < 500) {
-        console.debug(`[bonding-scan] ✗mover ${symbol} vol5m:$${vol5m.toFixed(0)} (min $500)`);
+      // Need some real volume ($200+) — weeds out single-wallet micro-trades
+      if (vol5m < 200) {
+        console.debug(`[bonding-scan] ✗mover ${symbol} vol5m:$${vol5m.toFixed(0)} (min $200)`);
         continue;
       }
-      // MOVERS: price moving SHARPLY upward (10-25%). Under 10% = not a mover yet.
-      // Over 25% = DexScreener lag means the pump is already over.
-      if (pc5m < 10 || pc5m > 25) {
-        console.debug(`[bonding-scan] ✗mover ${symbol} pc5m:${pc5m.toFixed(1)}% (need 10-25%)`);
+      // MOVERS: any upward price movement (5%+). No upper cap — tokens at +100% in 5m
+      // are BETTER candidates (real momentum), not worse. The old 25% cap was blocking
+      // the biggest movers (JAMESON rejected at 162-190% was a 100x opportunity).
+      if (pc5m < 5) {
+        console.debug(`[bonding-scan] ✗mover ${symbol} pc5m:${pc5m.toFixed(1)}% (min 5%)`);
         continue;
       }
       // Buyers must outnumber sellers (momentum confirmation)
