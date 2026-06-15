@@ -690,18 +690,22 @@ async function onTradeEvent(
 // These are 15min-4h old tokens with recent trading activity — past initial rug risk.
 // Wallet 1 handles brand-new launches via WebSocket. Wallet 2 handles HOT entries.
 
-// Min Fear & Greed to allow HOT/MOVERS buys — don't burn money buying $500-$6k tokens in FEAR
-const BONDING_HOT_MIN_FNG = Number(process.env.BONDING_HOT_MIN_FNG || '40');
+// Min Fear & Greed to allow HOT/MOVERS buys.
+// F&G 13-45 = FEAR = contrarian buy zone (same threshold as Raydium autobuy).
+// F&G < 13 = EXTREME_FEAR = black swan / capitulation — stop all new entries.
+const BONDING_HOT_MIN_FNG = Number(process.env.BONDING_HOT_MIN_FNG || '13');
 
 async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): Promise<void> {
   if (!BONDING_HOT_ENABLED) return;
 
-  // Market regime gate — MOVERS strategy requires NEUTRAL market (F&G >= 40)
-  // In FEAR (F&G < 40), sub-$25k mcap bonding curve tokens have near-zero survival rate
+  // Market regime gate — block only EXTREME_FEAR (F&G < 13 = true capitulation)
+  // F&G 13-45 = contrarian buy zone — small mcap tokens on bonding curve can still pump
+  let fngForLog = 0;
   try {
     const fng = await getFearGreed();
+    fngForLog = fng;
     if (fng < BONDING_HOT_MIN_FNG) {
-      console.debug(`[bonding-scan] HOT gate: F&G=${fng} < ${BONDING_HOT_MIN_FNG} (FEAR) — skipping MOVERS buys`);
+      console.info(`[bonding-scan] HOT gate: F&G=${fng} < ${BONDING_HOT_MIN_FNG} (EXTREME_FEAR) — all MOVER buys frozen`);
       return;
     }
   } catch { /* fail-open: if F&G check fails, allow trading */ }
@@ -750,6 +754,11 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
       }
     }
   } catch { /* fail-open */ }
+
+  const totalCandidates = pairCandidates.length;
+  let moversQualified = 0;
+
+  console.info(`[bonding-scan] HOT poll: ${totalCandidates} candidates F&G:${fngForLog} pos:${positions2.size}/${BONDING_MAX_POSITIONS_W2}`);
 
   const coins: any[] = pairCandidates.map(p => {
     const dex = (p.dexId ?? '').toLowerCase();
@@ -838,6 +847,7 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
         continue;
       }
 
+      moversQualified++;
       const dexPool = coin.dexPool ?? 'pump';
       console.info(
         `[bonding-scan] 🚀 MOVER ${symbol} mcap:$${mcapUsd.toFixed(0)} ` +
