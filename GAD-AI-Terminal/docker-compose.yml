@@ -235,5 +235,45 @@ services:
         condition: service_healthy
       api:
         condition: service_started
+  bsc-scanner:
+    build:
+      context: .
+      dockerfile: services/bsc-scanner/Dockerfile
+    container_name: gad-ai-bsc-scanner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      PORT: "4006"
+      BSC_AUTO_BUY: "${BSC_AUTO_BUY:-false}"
+      BSC_BUY_BNB: "${BSC_BUY_BNB:-0.01}"
+      BSC_MAX_POSITIONS: "${BSC_MAX_POSITIONS:-2}"
+      BSC_DAILY_MAX_BNB: "${BSC_DAILY_MAX_BNB:-0.05}"
+      BSC_SCAN_INTERVAL_SEC: "30"
+      BSC_MIN_LIQUIDITY_USD: "${BSC_MIN_LIQUIDITY_USD:-10000}"
+      BSC_MAX_LIQUIDITY_USD: "${BSC_MAX_LIQUIDITY_USD:-300000}"
+      BSC_MIN_PC1H: "${BSC_MIN_PC1H:-8}"
+      BSC_MAX_PC1H: "${BSC_MAX_PC1H:-55}"
+      BSC_MAX_PC1H_FRESH: "${BSC_MAX_PC1H_FRESH:-300}"
+      BSC_MIN_PC5M: "${BSC_MIN_PC5M:-2}"
+      BSC_MIN_VOL_LIQ_RATIO: "${BSC_MIN_VOL_LIQ_RATIO:-0.18}"
+      BSC_MAX_BUY_SELL_RATIO: "${BSC_MAX_BUY_SELL_RATIO:-2.3}"
+      BSC_MAX_AGE_SEC: "${BSC_MAX_AGE_SEC:-86400}"
+      BSC_MIN_SAFE_SCORE: "${BSC_MIN_SAFE_SCORE:-40}"
+      BSC_MAX_BUY_TAX: "${BSC_MAX_BUY_TAX:-5}"
+      BSC_MAX_SELL_TAX: "${BSC_MAX_SELL_TAX:-5}"
+      BSC_MAX_TOP_HOLDER_PCT: "${BSC_MAX_TOP_HOLDER_PCT:-30}"
+      BSC_STOP_LOSS_PCT: "${BSC_STOP_LOSS_PCT:-5}"
+      BSC_TRAIL_PCT: "${BSC_TRAIL_PCT:-7}"
+      BSC_EARLY_TRAIL_PCT: "${BSC_EARLY_TRAIL_PCT:-3}"
+      BSC_TIME_LIMIT_SEC: "${BSC_TIME_LIMIT_SEC:-180}"
+    ports:
+      - "4006:4006"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
 volumes:
   postgres-data:

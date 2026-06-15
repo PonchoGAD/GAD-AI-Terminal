@@ -177,7 +177,7 @@ bot.onText(/\/start/, async (msg) => {
   send(msg.chat.id,
     `🤖 *GAD AI Terminal*\n\nGM, ${name}! Real-time Solana alpha.\n\n${tierLine}\n\n` +
     `*📊 Analytics (Starter+):*\n/trending /new /highscore /highrisk\n/analyze /signals /whales /tokenscore\n\n` +
-    `*🤖 Bot Control (PRO):*\n/bot — Solana bot PnL\n/futures — futures trading\n/basestatus — Base Network\n/autobuy /portfolio\n\n` +
+    `*🤖 Bot Control (PRO):*\n/bot — Solana bot PnL\n/futures — futures trading\n/basestatus — Base Network\n/bscstatus — BSC / Four.meme\n/autobuy /portfolio\n\n` +
     `*🔑 Free:*\n/subscribe /status /wallet /help`,
     {
       reply_markup: {
@@ -231,6 +231,11 @@ bot.onText(/\/help/, (msg) => {
     `/basepositions — open ETH positions\n` +
     `/basetokens — discovered Base tokens\n` +
     `/basetrades — Base trade history\n\n` +
+    `*BSC / Four.meme (PRO):*\n` +
+    `/bscstatus — BSC scanner status\n` +
+    `/bscpositions — open BNB positions\n` +
+    `/bsctokens — discovered BSC tokens\n` +
+    `/bsctrades — BSC trade history\n\n` +
     `💎 *PRO (1 SOL / 30 days) — extra:*\n` +
     `/bot — Solana bot PnL & status\n` +
     `/autobuy list|add|stop — manage bot\n` +
@@ -1302,6 +1307,109 @@ bot.onText(/^\/basetokens(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
     await send(chatId, lines.join('\n'));
   } catch (e: any) {
     await send(chatId, `❌ Base tokens error: ${e.message}`);
+  }
+}));
+
+// ─── BSC (BNB Smart Chain) commands ──────────────────────────────────────────
+
+const BSC_SCANNER_URL = process.env.BSC_SCANNER_URL ?? 'http://bsc-scanner:4006';
+
+async function bscGet<T = any>(path: string): Promise<T> {
+  const axios = (await import('axios')).default;
+  const r = await axios.get(`${BSC_SCANNER_URL}${path}`, { timeout: 8_000 });
+  if (!r.data?.ok) throw new Error(r.data?.error ?? 'BSC API error');
+  return r.data as T;
+}
+
+// /bscstatus — PRO: BSC scanner status
+bot.onText(/^\/bscstatus(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const d = await bscGet<any>('/bsc/status');
+    const today = d.data ?? d;
+    const autoBuy = today.auto_buy ? '✅ ON' : '❌ OFF';
+    const lines = [
+      `🟡 *BSC / Four.meme STATUS*`,
+      ``,
+      `*Auto-Buy:* ${autoBuy}`,
+      `*Open positions:* ${today.open_positions ?? 0}`,
+      `*Daily BNB in:* ${Number(today.total_bnb_in ?? 0).toFixed(4)} BNB`,
+      `*Daily BNB out:* ${Number(today.total_bnb_out ?? 0).toFixed(4)} BNB`,
+      ``,
+      `*Wallet:* \`${today.wallet ?? 'not set'}\``,
+      ``,
+      `/bscpositions — open positions`,
+      `/bsctrades — trade history`,
+      `/bsctokens — discovered tokens`,
+    ];
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ BSC scanner: ${e.message}\nIs bsc-scanner running?`);
+  }
+}));
+
+// /bscpositions — PRO: open BSC positions
+bot.onText(/^\/bscpositions(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const d = await bscGet<any>('/bsc/positions?limit=5');
+    const positions: any[] = d.data ?? [];
+    if (!positions.length) return send(chatId, '🟡 No open BSC positions.');
+    const lines = [`🟡 *OPEN BSC POSITIONS* (${positions.length})`, ``];
+    for (const p of positions) {
+      const holdMin = Math.floor((Date.now() - new Date(p.bought_at).getTime()) / 60000);
+      lines.push(`• *${p.symbol}* — ${Number(p.amount_bnb).toFixed(4)} BNB`);
+      lines.push(`  tax:${Number(p.buy_tax).toFixed(1)}/${Number(p.sell_tax).toFixed(1)}% | hold:${holdMin}min`);
+      lines.push(`  \`${p.contract_address}\``);
+    }
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ BSC positions error: ${e.message}`);
+  }
+}));
+
+// /bsctrades — PRO: BSC trade history
+bot.onText(/^\/bsctrades(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const d = await bscGet<any>('/bsc/trades?limit=8');
+    const trades: any[] = d.data ?? [];
+    if (!trades.length) return send(chatId, '🟡 No BSC trades yet.');
+    const lines = [`🟡 *BSC TRADES (last ${trades.length})*`, ``];
+    for (const t of trades) {
+      const bnbIn  = Number(t.amount_bnb ?? 0);
+      const bnbOut = Number(t.total_sold_bnb ?? 0);
+      const mult   = bnbIn > 0 ? bnbOut / bnbIn : 0;
+      const pnlStr = bnbOut > 0 ? `${mult.toFixed(2)}x → +${(bnbOut - bnbIn).toFixed(4)} BNB` : 'unsold';
+      const icon   = mult >= 1 ? '✅' : '❌';
+      lines.push(`${icon} *${t.symbol}* ${pnlStr} [${t.sell_reason ?? '?'}]`);
+    }
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ BSC trades error: ${e.message}`);
+  }
+}));
+
+// /bsctokens — PRO: recently discovered BSC tokens
+bot.onText(/^\/bsctokens(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const d = await bscGet<any>('/bsc/tokens?limit=8');
+    const tokens: any[] = d.data ?? [];
+    if (!tokens.length) return send(chatId, '🟡 No BSC tokens discovered yet.');
+    const lines = [`🟡 *DISCOVERED BSC TOKENS*`, ``];
+    for (const t of tokens) {
+      const honeypotStr = t.is_honeypot ? ' 🚨HP' : '';
+      lines.push(`• *${t.symbol}*${honeypotStr} — liq $${Number(t.liquidity_usd).toFixed(0)} | +${Number(t.price_change_1h).toFixed(1)}%/1h | score:${t.safe_score} tax:${Number(t.buy_tax).toFixed(1)}/${Number(t.sell_tax).toFixed(1)}%`);
+      lines.push(`  \`${t.contract_address}\``);
+    }
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ BSC tokens error: ${e.message}`);
   }
 }));
 
