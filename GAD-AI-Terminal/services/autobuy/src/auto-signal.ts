@@ -800,9 +800,9 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       skipped.liq++; continue;
     }
 
-    // ── Gate 2: Age — reject unknown-age tokens (too risky, could be ancient) ──
-    if (ageSec < 0 || ageSec < RAYDIUM_MIN_AGE_SEC || ageSec > RAYDIUM_MAX_AGE_SEC) {
-      console.debug(`[raydium-scan] ✗age  ${sym.padEnd(10)} age:${ageSec < 0 ? 'unknown' : (ageSec/3600).toFixed(1)+'h'} liq:$${liq.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
+    // ── Gate 2: Age — allow unknown-age (ageSec=-1); momentum filters screen stale tokens ──
+    if (ageSec >= 0 && (ageSec < RAYDIUM_MIN_AGE_SEC || ageSec > RAYDIUM_MAX_AGE_SEC)) {
+      console.debug(`[raydium-scan] ✗age  ${sym.padEnd(10)} age:${(ageSec/3600).toFixed(1)}h liq:$${liq.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
       skipped.age++; continue;
     }
 

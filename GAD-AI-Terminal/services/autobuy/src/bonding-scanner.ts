@@ -1140,8 +1140,8 @@ async function pollGraduationHunterTokens(keypair: Keypair, connection: Connecti
       } catch { /* skip */ }
     }
 
+    let gMcap = 0, gVol = 0, gAge = 0, gMom = 0;
     console.debug(`[bonding-scan] GRAD poll: ${candidates.length} candidates from DexScreener`);
-    let gradFiltered = 0;
     for (const p of candidates) {
       const mint: string = p.baseToken?.address ?? '';
       if (!mint) continue;
@@ -1150,24 +1150,22 @@ async function pollGraduationHunterTokens(keypair: Keypair, connection: Connecti
       if (positions2.size >= BONDING_MAX_POSITIONS) break;
 
       const mcapUsd = Number(p.fdv ?? p.marketCap ?? 0);
-      if (mcapUsd < GRAD_HUNTER_MIN_MCAP || mcapUsd > GRAD_HUNTER_MAX_MCAP) { gradFiltered++; continue; }
+      if (mcapUsd < GRAD_HUNTER_MIN_MCAP || mcapUsd > GRAD_HUNTER_MAX_MCAP) { gMcap++; continue; }
 
-      // Must have recent trade volume (not a stale listing)
       const vol5m  = Number(p.volume?.m5 ?? 0);
-      if (vol5m < 100) { gradFiltered++; continue; }
+      if (vol5m < 100) { gVol++; continue; }
 
       const createdAt = p.pairCreatedAt ? Number(p.pairCreatedAt) : 0;
       const ageSec = createdAt > 0 ? (Date.now() - createdAt) / 1000 : 0;
-      if (ageSec > 6 * 3600) { gradFiltered++; continue; }
+      if (ageSec > 6 * 3600) { gAge++; continue; }
 
       const pc5m   = Number(p.priceChange?.m5 ?? 0);
       const buys5m = Number(p.txns?.m5?.buys ?? 0);
       const sells5m = Number(p.txns?.m5?.sells ?? 0);
 
-      if (pc5m <= 0) { gradFiltered++; continue; }
-      if (buys5m < 3) { gradFiltered++; continue; }
+      if (pc5m <= 0 || buys5m < 3) { gMom++; continue; }
       const bsRatio = sells5m > 0 ? buys5m / sells5m : buys5m;
-      if (bsRatio < 1.2) { gradFiltered++; continue; }
+      if (bsRatio < 1.2) { gMom++; continue; }
 
       const symbol = (p.baseToken?.symbol ?? mint.slice(0, 4)).toUpperCase();
       const name   = p.baseToken?.name ?? symbol;
@@ -1235,8 +1233,8 @@ async function pollGraduationHunterTokens(keypair: Keypair, connection: Connecti
 
       await new Promise(res => setTimeout(res, 2000));
     }
-    if (gradFiltered > 0) {
-      console.debug(`[bonding-scan] GRAD filtered: ${gradFiltered} rejected (mcap/vol/age/momentum)`);
+    if (gMcap + gVol + gAge + gMom > 0) {
+      console.info(`[bonding-scan] GRAD filtered: mcap=${gMcap} vol=${gVol} age=${gAge} mom=${gMom} (range $${GRAD_HUNTER_MIN_MCAP/1000}k-$${GRAD_HUNTER_MAX_MCAP/1000}k)`);
     }
   } catch (err: any) {
     console.debug(`[bonding-scan] GRAD poll error: ${err.message?.slice(0, 60)}`);
