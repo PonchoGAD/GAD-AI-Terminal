@@ -32,6 +32,8 @@ const PUMPFUN_API    = 'https://frontend-api.pump.fun';
 const BONDING_BUY_SOL        = Number(process.env.BONDING_BUY_SOL       || '0.02');
 const BONDING_MAX_SOL_DAILY  = Number(process.env.BONDING_MAX_SOL_DAILY || '0.2');
 const BONDING_MAX_POSITIONS  = Number(process.env.BONDING_MAX_POSITIONS || '3');
+// W2 (HOT/MOVER/GRAD) position limit — 1 concurrent trade to control capital risk
+const BONDING_MAX_POSITIONS_W2 = Number(process.env.BONDING_MAX_POSITIONS_W2 || '1');
 
 // Dev must have bought at least this much SOL at launch (skin in the game)
 const BONDING_MIN_DEV_BUY    = Number(process.env.BONDING_MIN_DEV_BUY   || '0.3');
@@ -776,7 +778,7 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
       if (recentMints.has(mint) || candidateTokens.has(mint)) continue;
       if (positions.has(mint) || positions2.has(mint)) continue;
       if (!checkDailyBudget2(BONDING_BUY_SOL)) break;
-      if (positions2.size >= BONDING_MAX_POSITIONS) break;
+      if (positions2.size >= BONDING_MAX_POSITIONS_W2) break;
 
       // Movers range: enough mcap for liquidity (avoid slippage), not yet fully pumped
       const mcapUsd = Number(coin.usd_market_cap ?? 0);
@@ -899,7 +901,39 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
         if (!p) return;
         console.info(`[bonding-scan] ⏱ TIME_LIMIT HOT ${p.symbol} w2 — selling 100%`);
         positions2.delete(mint);
-        await sellOnBondingCurve(mint, 100, keypair, connection, p.dexPool ?? 'pump');
+        const sellPool = p.dexPool ?? 'pump';
+        const pumpResult = await sellOnBondingCurve(mint, 100, keypair, connection, sellPool);
+        // Jupiter fallback if bonding curve returned 0 SOL (token may have graduated to PumpSwap)
+        if (!pumpResult.success || (pumpResult.solReceived ?? 0) === 0) {
+          console.warn(`[bonding-scan] ⏱ MOVER ${p.symbol} bonding sell = 0 SOL — trying Jupiter fallback`);
+          try {
+            const kp = getKeypairFromEnv();
+            const conn = getConnection();
+            if (kp && conn) {
+              const tokenAccounts = await conn.getParsedTokenAccountsByOwner(
+                keypair.publicKey, { mint: new PublicKey(mint) }
+              );
+              const rawAmount = BigInt(
+                (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
+              );
+              if (rawAmount > 0n) {
+                const jupResult = await executeAutoSell(
+                  { mintAddress: mint, tokenAmount: rawAmount, slippageBps: 1000 },
+                  conn, kp
+                );
+                if (jupResult.success) {
+                  await query(
+                    `UPDATE autobuy_jobs SET total_sold_sol=COALESCE(total_sold_sol,0)+$1, active=false WHERE mint_address=$2 AND label LIKE 'auto:bonding%' AND active=true`,
+                    [jupResult.solReceived ?? 0, mint]
+                  ).catch(() => {});
+                  console.info(`[bonding-scan] ✅ MOVER Jupiter fallback SOLD ${p.symbol} → ${(jupResult.solReceived ?? 0).toFixed(5)} SOL`);
+                }
+              }
+            }
+          } catch (jupErr: any) {
+            console.warn(`[bonding-scan] MOVER Jupiter fallback error: ${jupErr.message?.slice(0, 60)}`);
+          }
+        }
       }, BONDING_TIME_LIMIT_SEC * 1000);
 
       await new Promise(res => setTimeout(res, 2000)); // rate-limit between HOT entries
@@ -976,7 +1010,7 @@ async function pollNewPumpfunTokens(keypair: Keypair, connection: Connection): P
       if (recentMints.has(mint) || candidateTokens.has(mint)) continue;
       if (positions.has(mint) || positions2.has(mint)) continue;
       if (!checkDailyBudget2(BONDING_NEW_BUY_SOL)) break;
-      if (positions2.size >= BONDING_MAX_POSITIONS) break;
+      if (positions2.size >= BONDING_MAX_POSITIONS_W2) break;
 
       const mcapUsd = Number(coin.usd_market_cap ?? 0);
       if (mcapUsd < BONDING_NEW_MIN_MCAP || mcapUsd > BONDING_NEW_MAX_MCAP) continue;
@@ -1182,7 +1216,7 @@ async function pollGraduationHunterTokens(keypair: Keypair, connection: Connecti
       if (!mint) continue;
       if (recentMints.has(mint) || positions.has(mint) || positions2.has(mint)) continue;
       if (!checkDailyBudget2(GRAD_HUNTER_BUY_SOL)) break;
-      if (positions2.size >= BONDING_MAX_POSITIONS) break;
+      if (positions2.size >= BONDING_MAX_POSITIONS_W2) break;
 
       const mcapUsd = Number(p.fdv ?? p.marketCap ?? 0);
       if (mcapUsd < GRAD_HUNTER_MIN_MCAP || mcapUsd > GRAD_HUNTER_MAX_MCAP) { gMcap++; continue; }
@@ -1373,7 +1407,7 @@ async function pollPumpswapTokens(keypair: Keypair, connection: Connection): Pro
       if (!mint) continue;
       if (recentMints.has(mint) || positions.has(mint) || positions2.has(mint)) continue;
       if (!checkDailyBudget2(PUMPSWAP_BUY_SOL)) break;
-      if (positions2.size >= BONDING_MAX_POSITIONS) break;
+      if (positions2.size >= BONDING_MAX_POSITIONS_W2) break;
 
       const liq = Number(p.liquidity?.usd ?? 0);
       if (liq < PUMPSWAP_MIN_LIQ || liq > PUMPSWAP_MAX_LIQ) { psLiq++; continue; }
@@ -1464,6 +1498,8 @@ async function pollPumpswapTokens(keypair: Keypair, connection: Connection): Pro
 }
 
 // ─── Recover positions from DB after restart ──────────────────────────────────
+// CRITICAL: HOT/MOVER/GRAD positions are bought with W2 keypair.
+// Must check W2's wallet — not just W1's — or positions are wrongly closed.
 
 async function recoverOrphanedPositions(keypair: Keypair, connection: Connection): Promise<void> {
   try {
@@ -1479,37 +1515,68 @@ async function recoverOrphanedPositions(keypair: Keypair, connection: Connection
 
     const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 
+    // Batch-fetch token balances for BOTH wallets once (not per-row) for efficiency
+    const balW1 = new Map<string, number>();
+    const balW2 = new Map<string, number>();
+
+    try {
+      const acc1 = await connection.getParsedTokenAccountsByOwner(keypair.publicKey, { programId: TOKEN_PROGRAM_ID });
+      for (const { account } of acc1.value) {
+        const info = account.data.parsed?.info;
+        if (info?.mint) balW1.set(info.mint, Number(info.tokenAmount?.uiAmount ?? 0));
+      }
+    } catch { /* fail-open */ }
+
+    if (keypairInstance2) {
+      try {
+        const acc2 = await connection.getParsedTokenAccountsByOwner(keypairInstance2.publicKey, { programId: TOKEN_PROGRAM_ID });
+        for (const { account } of acc2.value) {
+          const info = account.data.parsed?.info;
+          if (info?.mint) balW2.set(info.mint, Number(info.tokenAmount?.uiAmount ?? 0));
+        }
+      } catch { /* fail-open */ }
+    }
+
     for (const row of rows) {
       const mint = row.mint_address;
       const boughtAt = new Date(row.bought_at).getTime();
       const timeLimitSec = Number(row.time_limit_seconds) || BONDING_TIME_LIMIT_SEC;
       const elapsed = (Date.now() - boughtAt) / 1000;
 
-      let tokenBalance = 0;
-      try {
-        const accounts = await connection.getParsedTokenAccountsByOwner(keypair.publicKey, { programId: TOKEN_PROGRAM_ID });
-        for (const { account } of accounts.value) {
-          const info = account.data.parsed?.info;
-          if (info?.mint === mint) {
-            tokenBalance = Number(info.tokenAmount?.uiAmount ?? 0);
-            break;
-          }
-        }
-      } catch { /* fail-open */ }
+      // Determine which wallet holds this token
+      const inW1 = (balW1.get(mint) ?? 0) > 0;
+      const inW2 = keypairInstance2 ? (balW2.get(mint) ?? 0) > 0 : false;
 
-      if (tokenBalance <= 0) {
+      if (!inW1 && !inW2) {
         await query(`UPDATE autobuy_jobs SET active=false WHERE mint_address=$1 AND label LIKE 'auto:bonding%' AND active=true`, [mint]).catch(() => {});
-        console.info(`[bonding-scan] ✅ ${mint.slice(0, 8)} already sold — closed`);
+        console.info(`[bonding-scan] ✅ ${mint.slice(0, 8)} already sold (not in W1 or W2 wallet) — closed`);
         continue;
       }
 
+      // W2 positions: mover/grad/new/pumpswap labels
+      const isW2Label = /auto:bonding:(mover|grad|new|pumpswap):/.test(row.label);
+      const useW2 = (inW2 && keypairInstance2) || (isW2Label && keypairInstance2 && !inW1);
+      const recoveryKeypair = useW2 ? keypairInstance2! : keypair;
+      const posMap = useW2 ? positions2 : positions;
+
       const labelParts = row.label.split(':');
-      const symbol = labelParts[2] ?? mint.slice(0, 4);
+      // Label format: auto:bonding:<type>:<symbol>:...
+      const symbol = labelParts[3] ?? labelParts[2] ?? mint.slice(0, 4);
       const mcapMatch = row.label.match(/mcap(\d+)sol/);
       const entryMcapSol = mcapMatch ? Number(mcapMatch[1]) : 0;
-      const remainingMs = Math.max(5000, (timeLimitSec - elapsed) * 1000);
 
-      positions.set(mint, {
+      // If already past time limit, sell immediately (add 10s grace)
+      const remainingMs = Math.max(10_000, (timeLimitSec - elapsed) * 1000);
+      const isOverdue = elapsed > timeLimitSec;
+
+      // Determine strategy-specific TP levels and stop from label
+      let tpLevels = BONDING_TPS;
+      let stopPct   = BONDING_STOP_PCT;
+      let dexPool   = 'pump';
+      if (row.label.includes(':grad:'))     { tpLevels = GRAD_TPS;    stopPct = GRAD_HUNTER_STOP_PCT; }
+      if (row.label.includes(':pumpswap:')) { tpLevels = PUMPSWAP_TPS; stopPct = PUMPSWAP_STOP_PCT; dexPool = 'pumpswap'; }
+
+      posMap.set(mint, {
         mint, symbol, name: symbol,
         buyTx: '', buyTime: boughtAt,
         buySol: Number(row.amount_sol),
@@ -1518,22 +1585,61 @@ async function recoverOrphanedPositions(keypair: Keypair, connection: Connection
         uniqueBuyers: new Set(),
         recentBuySol: 0, recentSellSol: 0,
         windowResetAt: Date.now() + 90_000,
+        dexPool,
+        tpLevels,
+        stopPct,
       });
       recentMints.add(mint);
 
-      console.info(`[bonding-scan] ♻️  Restored ${symbol} elapsed:${elapsed.toFixed(0)}s remaining:${(remainingMs / 1000).toFixed(0)}s`);
+      const walletLabel = useW2 ? 'W2' : 'W1';
+      if (isOverdue) {
+        console.info(`[bonding-scan] ⏰ OVERDUE ${symbol} (${walletLabel}) elapsed:${elapsed.toFixed(0)}s — selling in 10s`);
+      } else {
+        console.info(`[bonding-scan] ♻️  Restored ${symbol} (${walletLabel}) elapsed:${elapsed.toFixed(0)}s remaining:${(remainingMs / 1000).toFixed(0)}s`);
+      }
 
       setTimeout(async () => {
-        const pos = positions.get(mint);
+        const pos = posMap.get(mint);
         if (!pos) return;
-        console.info(`[bonding-scan] ⏱ TIME_LIMIT (recovered) ${pos.symbol} — selling 100%`);
-        await sellOnBondingCurve(mint, 100, keypair, connection);
-        positions.delete(mint);
+        console.info(`[bonding-scan] ⏱ TIME_LIMIT (recovered) ${pos.symbol} (${walletLabel}) — selling 100%`);
+        posMap.delete(mint);
+        const sellResult = await sellOnBondingCurve(mint, 100, recoveryKeypair, connection, dexPool);
+        // Jupiter fallback if bonding curve sell returned 0 SOL (token may have graduated)
+        if (!sellResult.success || (sellResult.solReceived ?? 0) === 0) {
+          try {
+            const kp = getKeypairFromEnv();
+            const conn = getConnection();
+            if (kp && conn) {
+              const tokenAccounts = await conn.getParsedTokenAccountsByOwner(
+                recoveryKeypair.publicKey, { mint: new PublicKey(mint) }
+              );
+              const rawAmount = BigInt(
+                (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
+              );
+              if (rawAmount > 0n) {
+                const jupResult = await executeAutoSell(
+                  { mintAddress: mint, tokenAmount: rawAmount, slippageBps: 1000 },
+                  conn, kp
+                );
+                if (jupResult.success) {
+                  await query(
+                    `UPDATE autobuy_jobs SET total_sold_sol=COALESCE(total_sold_sol,0)+$1, active=false WHERE mint_address=$2 AND label LIKE 'auto:bonding%' AND active=true`,
+                    [jupResult.solReceived ?? 0, mint]
+                  ).catch(() => {});
+                  console.info(`[bonding-scan] ✅ Recovered ${symbol} Jupiter fallback → ${(jupResult.solReceived ?? 0).toFixed(5)} SOL`);
+                }
+              }
+            }
+          } catch (jupErr: any) {
+            console.warn(`[bonding-scan] Recovered ${symbol} Jupiter fallback error: ${jupErr.message?.slice(0, 60)}`);
+          }
+        }
       }, remainingMs);
     }
 
-    if (positions.size > 0 && wsInstance?.readyState === WebSocket.OPEN) {
-      wsInstance.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [...positions.keys()] }));
+    const allMints = [...positions.keys(), ...positions2.keys()];
+    if (allMints.length > 0 && wsInstance?.readyState === WebSocket.OPEN) {
+      wsInstance.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: allMints }));
     }
   } catch (err: any) {
     console.warn(`[bonding-scan] recoverOrphanedPositions error: ${err.message?.slice(0, 80)}`);
