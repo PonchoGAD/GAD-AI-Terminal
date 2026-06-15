@@ -103,14 +103,15 @@ const BONDING_NEW_STOP_PCT     = Number(process.env.BONDING_NEW_STOP_PCT     || 
 const GRAD_HUNTER_ENABLED     = process.env.GRAD_HUNTER_ENABLED === 'true';
 const GRAD_HUNTER_INTERVAL_MS = Number(process.env.GRAD_HUNTER_INTERVAL_SEC  || '30') * 1000;
 const GRAD_HUNTER_BUY_SOL     = Number(process.env.GRAD_HUNTER_BUY_SOL       || '0.015');
-const GRAD_HUNTER_MIN_MCAP    = Number(process.env.GRAD_HUNTER_MIN_MCAP_USD  || '40000');
+const GRAD_HUNTER_MIN_MCAP    = Number(process.env.GRAD_HUNTER_MIN_MCAP_USD  || '25000');
 const GRAD_HUNTER_MAX_MCAP    = Number(process.env.GRAD_HUNTER_MAX_MCAP_USD  || '65000');
 const GRAD_HUNTER_TIME_LIMIT  = Number(process.env.GRAD_HUNTER_TIME_LIMIT_SEC || '1800'); // 30 min
 const GRAD_HUNTER_STOP_PCT    = Number(process.env.GRAD_HUNTER_STOP_PCT       || '0.10');
-// TP: capture graduation pop (5-60% from $40k-65k → $69k+)
+// TP: capture graduation pop ($25k → $69k = 2.76x max, $40k → $69k = 1.73x)
+// At $25k entry: sell 40% at +50% (on the way up), rest at +120% (near graduation)
 const GRAD_TPS = [
-  { mult: 1.15, sellPct: 50 },  // book half at +15%
-  { mult: 1.40, sellPct: 50 },  // exit rest at +40%
+  { mult: 1.50, sellPct: 40 },  // lock 40% at +50%
+  { mult: 2.20, sellPct: 60 },  // exit rest at +120% (approaching graduation)
 ];
 
 // ─── PumpSwap Trader — graduated tokens on real AMM pool ─────────────────────
@@ -1125,7 +1126,7 @@ async function pollGraduationHunterTokens(keypair: Keypair, connection: Connecti
     const seen = new Set<string>();
     const candidates: any[] = [];
 
-    for (const q of ['sol meme', 'sol pump new', 'pumpfun sol']) {
+    for (const q of ['pumpfun sol', 'pump.fun bonding', 'sol bonding curve', 'pump sol new', 'sol meme pump']) {
       try {
         const r = await axios.get(`${DEXSCREENER}/search?q=${encodeURIComponent(q)}`, { timeout: 5_000 });
         for (const p of (r.data?.pairs ?? []) as any[]) {

@@ -51,8 +51,8 @@ const MAX_PRICE_CHANGE_1H = Number(process.env.MAX_PRICE_CHANGE_1H || '150');
 // Time limit for positions (seconds) — sell 95% if no activity
 const TIME_LIMIT_SECONDS = Number(process.env.TIME_LIMIT_SECONDS || '1800');
 
-// Jupiter track: established DEXes with real liquidity pools
-const JUPITER_DEX_IDS = ['raydium', 'orca', 'meteora', 'lifinity', 'saber', 'aldrin'];
+// Jupiter track: established DEXes + PumpSwap (pump.fun graduates go here now)
+const JUPITER_DEX_IDS = ['raydium', 'orca', 'meteora', 'lifinity', 'saber', 'aldrin', 'pumpswap'];
 // PumpPortal track: pump.fun ecosystem DEXes — routed via pool:"auto"
 const PUMP_DEX_IDS = ['pumpfun', 'pumpswap', 'meteoradbc', 'fluxbeam'];
 const PUMP_PORTAL_ENABLED = process.env.PUMP_PORTAL_ENABLED === 'true';
@@ -641,8 +641,9 @@ async function fetchRaydiumPairs(): Promise<any[]> {
   }
 
   // Source 4: DexScreener search queries — fresh active Solana tokens right now
-  // Mix of narrative + freshness queries to catch new launches with momentum
-  const SEARCH_QUERIES = ['sol gem', 'sol meme', 'sol ai', 'raydium sol', 'new sol', 'sol dog', 'sol cat', 'sol pepe'];
+  // PumpSwap and graduation-focused queries to catch recently graduated pump.fun tokens.
+  // Avoid narrative keywords (dog/cat/pepe) — those return ancient established tokens.
+  const SEARCH_QUERIES = ['pumpswap sol', 'pump graduate', 'new raydium sol', 'sol gem new', 'raydium launch', 'sol meme new', 'pumpswap new', 'sol new token'];
   for (const q of SEARCH_QUERIES) {
     try {
       const sr = await axios.get(
@@ -711,6 +712,33 @@ async function fetchRaydiumPairs(): Promise<any[]> {
       }
     } catch (e: any) {
       console.debug(`[raydium-scan] Birdeye trending error: ${e.message?.slice(0, 50)}`);
+    }
+  }
+
+  // Source 6: Dedicated PumpSwap graduates — freshly graduated pump.fun tokens on PumpSwap AMM.
+  // These are 1-48h old with real liquidity and strong community momentum post-graduation.
+  // Jupiter routes through PumpSwap natively, so buy+sell work the same as Raydium.
+  for (const psQuery of ['pumpswap', 'graduated pumpswap', 'pump fun graduated']) {
+    try {
+      const psR = await axios.get(
+        `${DEXSCREENER_BASE}/search?q=${encodeURIComponent(psQuery)}`,
+        { timeout: 6_000 }
+      );
+      const pairs: any[] = psR.data?.pairs ?? [];
+      let added = 0;
+      for (const p of pairs) {
+        if (p.chainId !== 'solana') continue;
+        if ((p.dexId?.toLowerCase() ?? '') !== 'pumpswap') continue;
+        const mint = p.baseToken?.address;
+        if (!mint || seen.has(mint)) continue;
+        seen.add(mint);
+        results.push(p);
+        added++;
+      }
+      if (added > 0) console.debug(`[raydium-scan] PumpSwap graduates "${psQuery}": ${added} pairs`);
+      await new Promise(r => setTimeout(r, 300));
+    } catch (e: any) {
+      console.debug(`[raydium-scan] PumpSwap source error: ${(e as any).message?.slice(0, 40)}`);
     }
   }
 
