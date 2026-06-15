@@ -6,7 +6,10 @@ import axios from 'axios';
 // To get your key: moralis.io → Admin → Web3 APIs → Copy API Key
 
 const MORALIS_API_KEY  = process.env.MORALIS_API_KEY ?? '';
-const MORALIS_BASE_URL = 'https://api.moralis.io';
+// Moralis Streams REST API (api.moralis.io was deprecated — now api.moralis.com)
+const MORALIS_BASE_URL = 'https://api.moralis.com';
+// Moralis Web3 Data API — use for token metadata, holder data, etc.
+export const MORALIS_DATA_URL = 'https://deep-index.moralis.io/api/v2.2';
 // Stream webhook URL — must be publicly accessible on VPS
 const WEBHOOK_URL      = process.env.MORALIS_WEBHOOK_URL ?? `http://${process.env.VPS_IP || '65.21.159.255'}:4005/base/moralis-hook`;
 

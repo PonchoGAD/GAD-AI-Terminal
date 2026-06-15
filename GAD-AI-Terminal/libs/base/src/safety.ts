@@ -155,6 +155,20 @@ async function checkOwnershipRenounced(address: string): Promise<boolean> {
 }
 
 async function getTop10HoldersPct(address: string): Promise<number> {
+  const MORALIS_API_KEY = process.env.MORALIS_API_KEY ?? '';
+  // Prefer Moralis (no Basescan key needed) — free tier covers this
+  if (MORALIS_API_KEY) {
+    try {
+      const r = await axios.get(
+        `https://deep-index.moralis.io/api/v2.2/erc20/${address}/top-holders?chain=base&limit=10`,
+        { headers: { 'X-API-Key': MORALIS_API_KEY }, timeout: 6000 }
+      );
+      const holders: any[] = r.data?.result ?? [];
+      if (!holders.length) return 0;
+      const total = holders.reduce((s: number, h: any) => s + Number(h.percentage_relative_to_total_supply ?? 0), 0);
+      return total; // Moralis already gives % of total supply
+    } catch { /* fallthrough to Basescan */ }
+  }
   if (!BASESCAN_API) return 0;
   try {
     const [holdersRes, tokenRes] = await Promise.all([
