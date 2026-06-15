@@ -180,6 +180,16 @@ if (AUTO_BUY) {
   console.info(`[bsc-scanner] Auto-buy DISABLED (BSC_AUTO_BUY=false) — scan only`);
 }
 
+// Log wallet balance on startup
+getBnbBalance()
+  .then(bal => {
+    console.info(`[bsc-scanner] 💰 Wallet ${WALLET} — Balance: ${bal.toFixed(4)} BNB`);
+    if (AUTO_BUY && bal < BUY_BNB * 1.1) {
+      console.warn(`[bsc-scanner] ⚠️  Insufficient BNB! Need ${(BUY_BNB * 1.1).toFixed(4)} BNB for trading. Auto-buy will be skipped until funded.`);
+    }
+  })
+  .catch(e => console.warn(`[bsc-scanner] Could not check BNB balance: ${e.message}`));
+
 const SCAN_INTERVAL = Number(process.env.BSC_SCAN_INTERVAL_SEC || '30') * 1000;
 
 async function runLoop(): Promise<void> {

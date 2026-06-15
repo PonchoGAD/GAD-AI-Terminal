@@ -33,6 +33,7 @@ exports.ERC20_ABI = [
     'function transfer(address to, uint256 amount) returns (bool)',
 ];
 // Pool fee tiers for Uniswap V3
+// ULTRA (1%) is most common for new meme tokens; HIGH/MEDIUM/LOW for established pairs
 exports.FEE_TIERS = {
     LOW: 100, // 0.01%
     MEDIUM: 500, // 0.05%

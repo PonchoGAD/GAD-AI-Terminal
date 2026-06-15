@@ -45,20 +45,29 @@ export interface BscToken {
 
 // ─── Four.meme ───────────────────────────────────────────────────────────────
 // Four.meme is the main BSC memecoin launchpad (pump.fun equivalent)
+// API routes confirmed working as of 2026-06
 async function fetchFourMeme(): Promise<BscToken[]> {
   const tokens: BscToken[] = [];
+  // Four.meme uses meme-api prefix (not /api/)
   const endpoints = [
-    'https://four.meme/api/v1/token/list?status=new&limit=30',
-    'https://four.meme/api/v1/token/hot',
+    { url: 'https://four.meme/meme-api/v1/private/token/queryToken', method: 'post' as const,
+      data: { pageIndex: 1, pageSize: 30, status: 0 } },  // status 0 = new/active
+    { url: 'https://four.meme/meme-api/v1/private/token/hot', method: 'get' as const, data: null },
   ];
 
-  for (const url of endpoints) {
+  for (const ep of endpoints) {
     try {
-      const r = await axios.get(url, {
-        timeout: 8_000,
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
-      });
-      const items: any[] = r.data?.data ?? r.data?.list ?? r.data ?? [];
+      const r = ep.method === 'post'
+        ? await axios.post(ep.url, ep.data, {
+            timeout: 8_000,
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          })
+        : await axios.get(ep.url, {
+            timeout: 8_000,
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
+          });
+
+      const items: any[] = r.data?.data?.rows ?? r.data?.data ?? r.data?.list ?? r.data ?? [];
       if (!Array.isArray(items)) continue;
 
       for (const t of items) {
@@ -66,8 +75,9 @@ async function fetchFourMeme(): Promise<BscToken[]> {
         if (!addr || addr.length !== 42) continue;
 
         const createdTs = t.createTime ?? t.created_at ?? 0;
-        const ageSec = createdTs > 0 ? (Date.now() / 1000 - createdTs) : 0;
+        const ageSec = createdTs > 0 ? (Date.now() / 1000 - createdTs / 1000) : 0;  // createTime is ms
 
+        const liq = Math.max(0, Number(t.liquidity ?? t.liquidityUsd ?? t.tvl ?? 0));
         tokens.push({
           contract_address: addr,
           symbol:           t.symbol ?? 'UNKNOWN',
@@ -75,14 +85,14 @@ async function fetchFourMeme(): Promise<BscToken[]> {
           pair_address:     t.pairAddress  ?? t.pool ?? '',
           dex_id:           'four_meme',
           source:           'four_meme',
-          liquidity_usd:    Number(t.liquidity ?? t.liquidityUsd ?? 0),
-          volume_1h:        Number(t.volume1h  ?? t.volume?.h1 ?? 0),
-          volume_24h:       Number(t.volume24h ?? t.volume?.h24 ?? 0),
+          liquidity_usd:    liq,
+          volume_1h:        Math.max(0, Number(t.volume1h  ?? t.volume?.h1 ?? 0)),
+          volume_24h:       Math.max(0, Number(t.volume24h ?? t.volume?.h24 ?? 0)),
           price_change_1h:  Number(t.priceChange1h ?? t.change1h ?? 0),
           price_change_5m:  Number(t.priceChange5m ?? t.change5m ?? 0),
           price_bnb:        Number(t.priceNative ?? t.price ?? 0),
-          mcap_usd:         Number(t.marketCap ?? t.mcap ?? 0),
-          age_sec:          ageSec,
+          mcap_usd:         Math.max(0, Number(t.marketCap ?? t.mcap ?? 0)),
+          age_sec:          Math.max(0, ageSec),
           buy_sell_ratio:   Number(t.buys ?? 1) / Math.max(1, Number(t.sells ?? 1)),
           txns_h1_buys:     Number(t.buys1h ?? t.buys ?? 0),
           is_honeypot:      false,
@@ -93,7 +103,7 @@ async function fetchFourMeme(): Promise<BscToken[]> {
         });
       }
     } catch (e: any) {
-      console.debug(`[bsc-scan] Four.meme fetch failed (${url}): ${e.message?.slice(0, 60)}`);
+      console.debug(`[bsc-scan] Four.meme fetch failed (${ep.url}): ${e.message?.slice(0, 60)}`);
     }
   }
   return tokens;
@@ -111,14 +121,14 @@ function mapDexPair(p: any): BscToken | null {
     pair_address:     p.pairAddress ?? '',
     dex_id:           p.dexId ?? 'unknown',
     source:           'dexscreener',
-    liquidity_usd:    Number(p.liquidity?.usd    ?? 0),
-    volume_1h:        Number(p.volume?.h1        ?? 0),
-    volume_24h:       Number(p.volume?.h24       ?? 0),
+    liquidity_usd:    Math.max(0, Number(p.liquidity?.usd    ?? 0)),  // guard negative (drained pools)
+    volume_1h:        Math.max(0, Number(p.volume?.h1        ?? 0)),
+    volume_24h:       Math.max(0, Number(p.volume?.h24       ?? 0)),
     price_change_1h:  Number(p.priceChange?.h1   ?? 0),
     price_change_5m:  Number(p.priceChange?.m5   ?? 0),
     price_bnb:        Number(p.priceNative       ?? 0),
-    mcap_usd:         Number(p.fdv ?? p.marketCap ?? 0),
-    age_sec:          createdAt,
+    mcap_usd:         Math.max(0, Number(p.fdv ?? p.marketCap ?? 0)),
+    age_sec:          Math.max(0, createdAt),
     buy_sell_ratio:   Number(p.txns?.h1?.buys ?? 1) / Math.max(1, Number(p.txns?.h1?.sells ?? 1)),
     txns_h1_buys:     Number(p.txns?.h1?.buys ?? 0),
     is_honeypot:      false,
@@ -133,14 +143,48 @@ async function fetchDexScreenerBsc(): Promise<BscToken[]> {
   const tokens: BscToken[] = [];
   const seen = new Set<string>();
 
-  // Search queries covering BSC meme categories
-  const queries = ['bsc new', 'bsc meme', 'four.meme', 'bsc ai', 'bsc dog'];
+  // 1. Boosted tokens on BSC — paid promotions = dev has skin in the game
+  try {
+    const boostR = await axios.get('https://api.dexscreener.com/token-boosts/latest/v1', { timeout: 6_000 });
+    const bscBoosted = (Array.isArray(boostR.data) ? boostR.data : []) as any[];
+    const bscAddrs = bscBoosted
+      .filter((b: any) => b.chainId === 'bsc' && b.tokenAddress)
+      .map((b: any) => b.tokenAddress)
+      .filter((a: string) => !seen.has(a.toLowerCase()))
+      .slice(0, 15);
+    if (bscAddrs.length) {
+      bscAddrs.forEach((a: string) => seen.add(a.toLowerCase()));
+      const pr = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${bscAddrs.join(',')}`, { timeout: 6_000 });
+      for (const p of (pr.data?.pairs ?? []) as any[]) {
+        if (p.chainId !== 'bsc') continue;
+        const t = mapDexPair(p);
+        if (t && !seen.has(t.contract_address)) { seen.add(t.contract_address); tokens.push(t); }
+      }
+    }
+  } catch { }
+
+  // 2. Latest token profiles on BSC
+  try {
+    const profR = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
+    const bscMints: string[] = ((Array.isArray(profR.data) ? profR.data : []) as any[])
+      .filter((p: any) => p.chainId === 'bsc' && p.tokenAddress && !seen.has(p.tokenAddress.toLowerCase()))
+      .map((p: any) => { seen.add(p.tokenAddress.toLowerCase()); return p.tokenAddress; })
+      .slice(0, 15);
+    if (bscMints.length) {
+      const pr = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${bscMints.join(',')}`, { timeout: 6_000 });
+      for (const p of (pr.data?.pairs ?? []) as any[]) {
+        if (p.chainId !== 'bsc') continue;
+        const t = mapDexPair(p);
+        if (t && !seen.has(t.contract_address)) { seen.add(t.contract_address); tokens.push(t); }
+      }
+    }
+  } catch { }
+
+  // 3. Targeted keyword searches — specific meme categories that pump on BSC
+  const queries = ['fourmeme pump', 'bnb meme 2025', 'pancakeswap gem', 'bsc ai agent', 'bnb dog cat'];
   for (const q of queries) {
     try {
-      const r = await axios.get(
-        `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`,
-        { timeout: 6_000 }
-      );
+      const r = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`, { timeout: 5_000 });
       for (const p of (r.data?.pairs ?? []) as any[]) {
         if (p.chainId !== 'bsc') continue;
         const addr = p.baseToken?.address?.toLowerCase();
@@ -149,29 +193,9 @@ async function fetchDexScreenerBsc(): Promise<BscToken[]> {
         const t = mapDexPair(p);
         if (t) tokens.push(t);
       }
-      await new Promise(r => setTimeout(r, 400));
+      await new Promise(r => setTimeout(r, 300));
     } catch { continue; }
   }
-
-  // Also fetch latest token profiles on BSC
-  try {
-    const profR = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
-    const bscMints: string[] = ((Array.isArray(profR.data) ? profR.data : []) as any[])
-      .filter((p: any) => p.chainId === 'bsc' && p.tokenAddress && !seen.has(p.tokenAddress.toLowerCase()))
-      .map((p: any) => { seen.add(p.tokenAddress.toLowerCase()); return p.tokenAddress; })
-      .slice(0, 15);
-    if (bscMints.length > 0) {
-      const pr = await axios.get(
-        `https://api.dexscreener.com/latest/dex/tokens/${bscMints.join(',')}`,
-        { timeout: 6_000 }
-      );
-      for (const p of (pr.data?.pairs ?? []) as any[]) {
-        if (p.chainId !== 'bsc') continue;
-        const t = mapDexPair(p);
-        if (t && !seen.has(t.contract_address)) { seen.add(t.contract_address); tokens.push(t); }
-      }
-    }
-  } catch { }
 
   return tokens;
 }

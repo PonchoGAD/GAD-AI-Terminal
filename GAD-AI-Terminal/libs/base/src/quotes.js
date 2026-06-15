@@ -15,21 +15,22 @@ const contracts_1 = require("./contracts");
 // causing real TX failures even when staticCall simulation passes.
 const ONLY_UNISWAP_V3 = process.env.BASE_ONLY_UNISWAP_V3 === 'true';
 // Get best buy quote: ETH → token
+// Always tries V3 first, then Aerodrome.
+// ONLY_UNISWAP_V3 only applies to SELL (stored-dex override in monitor.ts), NOT buy.
+// Reason: most fresh Base tokens are on Uniswap V4 → no V3 pool → Aerodrome needed for entry.
+// K-invariant issue only happens on SELL mismatch (buy Aerodrome, sell V3).
 async function getBestBuyQuote(tokenAddress, ethAmountWei, slippagePct = 3) {
-    // Try Uniswap V3 first (preferred: reliable, no transfer-fee issues)
+    // 1. Try Uniswap V3 (preferred)
     const uniQuote = await getUniswapV3Quote(tokenAddress, ethAmountWei, 'buy').catch(() => null);
     if (uniQuote) {
         const slippageFactor = BigInt(Math.floor((100 - slippagePct) * 100));
         uniQuote.amountOutMin = (uniQuote.amountOut * slippageFactor) / 10000n;
         return uniQuote;
     }
-    // Skip Aerodrome if BASE_ONLY_UNISWAP_V3=true (safer: no transfer-fee K-invariant reverts)
-    if (ONLY_UNISWAP_V3) {
-        throw new Error('No Uniswap V3 pool found and BASE_ONLY_UNISWAP_V3=true — skipping Aerodrome');
-    }
-    // Fallback: Aerodrome (use 10% slippage — Aerodrome pools often have higher price impact)
+    // 2. Fallback: Aerodrome (volatile pool, works for V4 tokens)
+    // Use 12% slippage — Aerodrome pools have higher price impact on thin liquidity
     const aeroQuote = await getAerodromeQuote(tokenAddress, ethAmountWei);
-    const slippageFactor = BigInt(Math.floor((100 - Math.max(slippagePct, 10)) * 100));
+    const slippageFactor = BigInt(Math.floor((100 - Math.max(slippagePct, 12)) * 100));
     aeroQuote.amountOutMin = (aeroQuote.amountOut * slippageFactor) / 10000n;
     return aeroQuote;
 }
