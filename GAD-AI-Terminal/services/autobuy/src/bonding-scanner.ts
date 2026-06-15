@@ -249,7 +249,7 @@ async function sellOnBondingCurve(
         PUMPPORTAL_BUY,
         { publicKey: keypair.publicKey.toBase58(), action: 'sell', mint,
           amount: `${pct}%`, denominatedInSol: 'false', slippage, priorityFee: 0.005, pool },
-        { responseType: 'arraybuffer', timeout: 15_000 }
+        { responseType: 'arraybuffer', timeout: 7_000 }
       );
       const txBytes = new Uint8Array(resp.data as ArrayBuffer);
       if (txBytes.length < 50) {
@@ -343,19 +343,62 @@ const STOP_CONFIRMS_REQUIRED = 2;
 const DS_POLL_INTERVAL_MS = 10_000;
 const lastWsEventAt = new Map<string, number>();
 
-async function getDSMcapSol(mint: string): Promise<number> {
+interface DSPositionData {
+  mcapSol:  number;
+  buys5m:   number;
+  sells5m:  number;
+  pc5m:     number;
+  liqUsd:   number;
+}
+
+async function getDSPositionData(mint: string): Promise<DSPositionData> {
+  const empty: DSPositionData = { mcapSol: 0, buys5m: 0, sells5m: 0, pc5m: 0, liqUsd: 0 };
   try {
     const r = await axios.get(
       `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
       { timeout: 5_000 }
     );
     const pairs: any[] = r.data?.pairs ?? [];
-    if (!pairs.length) return 0;
+    if (!pairs.length) return empty;
     const best = pairs.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
-    if (best.marketCap) return Number(best.marketCap) / (Number(best.priceUsd ?? 1) / Number(best.priceNative ?? 1));
-    return Number(best.fdv ?? 0) / Number(best.priceUsd ?? 1) * Number(best.priceNative ?? 0);
+    let mcapSol = 0;
+    if (best.marketCap) mcapSol = Number(best.marketCap) / (Number(best.priceUsd ?? 1) / Number(best.priceNative ?? 1));
+    else mcapSol = Number(best.fdv ?? 0) / Number(best.priceUsd ?? 1) * Number(best.priceNative ?? 0);
+    return {
+      mcapSol,
+      buys5m:  Number(best.txns?.m5?.buys  ?? 0),
+      sells5m: Number(best.txns?.m5?.sells ?? 0),
+      pc5m:    Number(best.priceChange?.m5 ?? 0),
+      liqUsd:  Number(best.liquidity?.usd  ?? 0),
+    };
   } catch {
-    return 0;
+    return empty;
+  }
+}
+
+async function getDSMcapSol(mint: string): Promise<number> {
+  return (await getDSPositionData(mint)).mcapSol;
+}
+
+// Returns % of supply held by the single largest holder (dev/whale rug indicator)
+// Uses Helius getTokenLargestAccounts — fast, no extra API key needed
+async function checkTopHolder(mint: string): Promise<number> {
+  try {
+    const rpc = SOLANA_RPC;
+    const resp = await axios.post(rpc, {
+      jsonrpc: '2.0', id: 1,
+      method: 'getTokenLargestAccounts',
+      params: [mint, { commitment: 'confirmed' }],
+    }, { timeout: 3_000 });
+    const accounts: any[] = resp.data?.result?.value ?? [];
+    if (accounts.length < 2) return 0;
+    // accounts[0] is the largest. amounts are in token base units (ui_amount is human-readable)
+    const top = Number(accounts[0].uiAmount ?? accounts[0].amount ?? 0);
+    const total = accounts.reduce((s: number, a: any) => s + Number(a.uiAmount ?? a.amount ?? 0), 0);
+    if (total <= 0) return 0;
+    return (top / total) * 100;
+  } catch {
+    return 0; // Helius unavailable → allow buy (fail-open)
   }
 }
 
@@ -366,14 +409,31 @@ async function pollBondingPositionsMap(
     const lastEvent = lastWsEventAt.get(mint) ?? 0;
     if (Date.now() - lastEvent < 60_000 && lastEvent > 0) continue;
 
-    const mcapSol = await getDSMcapSol(mint);
+    const data = await getDSPositionData(mint);
+    const { mcapSol, buys5m, sells5m, pc5m, liqUsd } = data;
     if (!mcapSol || mcapSol < 0.01) continue;
 
     pos.currentMcapSol = mcapSol;
     pos.peakMcapSol = Math.max(pos.peakMcapSol, mcapSol);
     const mult = pos.entryMcapSol > 0 ? mcapSol / pos.entryMcapSol : 1;
 
-    console.info(`[bonding-scan] 🔍 POLL ${pos.symbol} ${mult.toFixed(2)}x`);
+    // Dump detection: if sellers outnumber buyers 2:1 AND price actively falling → emergency exit
+    // Saves us from holding through a full dump to stop-loss
+    const pool = pos.dexPool ?? 'pump';
+    if (sells5m > 0 && sells5m > buys5m * 2 && pc5m < -5) {
+      console.info(
+        `[bonding-scan] 🚨 DUMP ${pos.symbol} sells5m:${sells5m} buys5m:${buys5m} pc5m:${pc5m.toFixed(1)}% ` +
+        `liq:$${liqUsd.toFixed(0)} — emergency exit`
+      );
+      posMap.delete(mint);
+      await sellOnBondingCurve(mint, 100, keypair, connection, pool);
+      continue;
+    }
+
+    console.info(
+      `[bonding-scan] 🔍 POLL ${pos.symbol} ${mult.toFixed(2)}x` +
+      ` buys:${buys5m} sells:${sells5m} pc5m:${pc5m.toFixed(1)}%`
+    );
     await checkPositionExits(mint, pos, mcapSol, mult, keypair, connection, 'poll', posMap);
     if (wsInstance?.readyState === WebSocket.OPEN) {
       wsInstance.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
@@ -764,6 +824,21 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
     }
   } catch { /* fail-open */ }
 
+  try {
+    // Also check DexScreener trending Solana pairs — catches early movers before search index
+    const trendR = await axios.get(`${DEXSCREENER}/trending`, { timeout: 5_000 });
+    const trendPairs: any[] = (trendR.data ?? []).flat ? [].concat(...(trendR.data ?? [])) : (trendR.data?.pairs ?? []);
+    for (const p of trendPairs) {
+      if ((p.chainId ?? p.chain) !== 'solana') continue;
+      const dex = (p.dexId ?? '').toLowerCase();
+      if (!['pumpfun', 'pumpswap'].includes(dex)) continue;
+      const m = p.baseToken?.address;
+      if (!m || seenDs.has(m)) continue;
+      seenDs.add(m);
+      pairCandidates.push(p);
+    }
+  } catch { /* fail-open */ }
+
   const totalCandidates = pairCandidates.length;
   let moversQualified = 0;
 
@@ -858,11 +933,20 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
 
       moversQualified++;
       const dexPool = coin.dexPool ?? 'pump';
+
+      // Whale check: if one wallet holds > 50% of supply → skip (dev dump risk)
+      const whaleRisk = await checkTopHolder(mint);
+      if (whaleRisk > 50) {
+        console.info(`[bonding-scan] 🐋 SKIP MOVER ${symbol} top holder: ${whaleRisk.toFixed(0)}% (>50% = rug risk)`);
+        continue;
+      }
+
+      const whaleLabel = whaleRisk > 0 ? ` top_holder:${whaleRisk.toFixed(0)}%` : '';
       console.info(
         `[bonding-scan] 🚀 MOVER ${symbol} mcap:$${mcapUsd.toFixed(0)} ` +
         `buys5m:${buys5m} ratio:${bsRatio.toFixed(1)}x ` +
         `vol5m:$${vol5m.toFixed(0)} pc5m:+${pc5m.toFixed(1)}% ` +
-        `age:${(tokenAgeSec / 60).toFixed(1)}min pool:${dexPool} — entering`
+        `age:${(tokenAgeSec / 60).toFixed(1)}min pool:${dexPool}${whaleLabel} — entering`
       );
 
       recentMints.add(mint);
