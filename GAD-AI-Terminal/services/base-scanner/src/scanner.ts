@@ -2,16 +2,20 @@ import axios from 'axios';
 import { query } from '@lib/db';
 import { checkTokenSafety } from '@lib/base';
 
-// ─── Config ──────────────────────────────────────────────────────────────────
-const MIN_LIQ       = Number(process.env.BASE_MIN_LIQUIDITY_USD  || '15000');
-const MAX_LIQ       = Number(process.env.BASE_MAX_LIQUIDITY_USD  || '500000');
-const MIN_PC1H      = Number(process.env.BASE_MIN_PC1H           || '8');
-const MAX_PC1H      = Number(process.env.BASE_MAX_PC1H           || '60');
-const MIN_PC5M      = Number(process.env.BASE_MIN_PC5M           || '2');
-const MIN_VOL_LIQ   = Number(process.env.BASE_MIN_VOL_LIQ_RATIO  || '0.20');
-const MAX_BS_RATIO  = Number(process.env.BASE_MAX_BUY_SELL_RATIO  || '2.5');
-const MAX_AGE_SEC   = Number(process.env.BASE_MAX_AGE_SEC        || '86400');
-const MIN_HOLDERS   = Number(process.env.BASE_MIN_HOLDERS        || '100');
+// ─── Config ─────────────────────────────────────────────────────────────────
+// Adapted from Raydium scanner thresholds (58% WR in FEAR market):
+// - pc1h min 5% (Raydium: 5%), vol/liq 15% (Raydium: 15%), B/S ≤3.0 (Raydium: 3.5)
+// - Age ≤6h: Base memes die fast — fresh entries outperform aged ones
+// - Liq $10k-$200k: Base has less TVL than Solana, upper bound lower
+const MIN_LIQ       = Number(process.env.BASE_MIN_LIQUIDITY_USD  || '10000');
+const MAX_LIQ       = Number(process.env.BASE_MAX_LIQUIDITY_USD  || '200000');
+const MIN_PC1H      = Number(process.env.BASE_MIN_PC1H           || '5');
+const MAX_PC1H      = Number(process.env.BASE_MAX_PC1H           || '80');
+const MIN_PC5M      = Number(process.env.BASE_MIN_PC5M           || '1');
+const MIN_VOL_LIQ   = Number(process.env.BASE_MIN_VOL_LIQ_RATIO  || '0.15');
+const MAX_BS_RATIO  = Number(process.env.BASE_MAX_BUY_SELL_RATIO  || '3.0');
+const MAX_AGE_SEC   = Number(process.env.BASE_MAX_AGE_SEC        || '21600'); // 6h — Base memes move fast
+const MIN_SAFE_SCORE = Number(process.env.BASE_MIN_SAFE_SCORE    || '35');
 const SCAN_INTERVAL = Number(process.env.BASE_SCAN_INTERVAL_SEC  || '30') * 1000;
 
 export interface BaseToken {
@@ -156,10 +160,10 @@ function passesFilter(t: BaseToken): string | null {
   if (t.price_change_1h < MIN_PC1H)         return `pc1h:${t.price_change_1h.toFixed(1)}% < ${MIN_PC1H}%`;
   if (t.price_change_1h > MAX_PC1H)         return `pc1h:${t.price_change_1h.toFixed(1)}% > ${MAX_PC1H}%`;
   if (t.price_change_5m < MIN_PC5M)         return `pc5m:${t.price_change_5m.toFixed(1)}% < ${MIN_PC5M}%`;
-  if (t.volume_1h / Math.max(1, t.liquidity_usd) < MIN_VOL_LIQ) return `vol/liq low`;
+  if (t.volume_1h / Math.max(1, t.liquidity_usd) < MIN_VOL_LIQ) return `vol/liq:${(t.volume_1h / Math.max(1, t.liquidity_usd) * 100).toFixed(0)}% < ${MIN_VOL_LIQ * 100}%`;
   if (t.buy_sell_ratio > MAX_BS_RATIO)      return `bs:${t.buy_sell_ratio.toFixed(1)} > ${MAX_BS_RATIO}`;
-  if (t.age_sec > MAX_AGE_SEC)              return `age:${Math.floor(t.age_sec / 3600)}h > ${MAX_AGE_SEC / 3600}h`;
-  if (t.safe_score < 30)                    return `score:${t.safe_score} too low`;
+  if (t.age_sec > MAX_AGE_SEC)              return `age:${(t.age_sec / 3600).toFixed(1)}h > ${MAX_AGE_SEC / 3600}h`;
+  if (t.safe_score < MIN_SAFE_SCORE)        return `score:${t.safe_score} < ${MIN_SAFE_SCORE}`;
   return null;
 }
 

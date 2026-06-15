@@ -4,19 +4,24 @@ import { sellToken, getTokenBalance, getEthBalance } from '@lib/base';
 import axios from 'axios';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const STOP_LOSS_PCT    = Number(process.env.BASE_STOP_LOSS_PCT     || '10');   // 10%
-const TRAIL_PCT        = Number(process.env.BASE_TRAIL_PCT         || '8');    // 8% trail
-const TIME_LIMIT_SEC   = Number(process.env.BASE_TIME_LIMIT_SEC    || '3600'); // 1h max hold
-const POLL_INTERVAL_MS = Number(process.env.BASE_POLL_INTERVAL_MS  || '10000'); // 10s
-const BUY_ETH          = Number(process.env.BASE_BUY_ETH           || '0.005');
+// Adapted from Raydium/Phantom strategy that achieves 58%+ WR in FEAR market:
+// - Early trail at +3% protects against quick reversals (Raydium EARLY_TRAIL_PCT=4)
+// - Stop at 8% matches Raydium (was 10%)
+// - Trail at 12% matches Raydium (was 8%)
+// - TP1 at 1.25x (FEAR-conservative like Raydium 1.18-1.30x) → sell 80%
+// - Time limit 2h (Base memes slower to develop than Solana bonding curve)
+const STOP_LOSS_PCT    = Number(process.env.BASE_STOP_LOSS_PCT     || '8');    // 8% (Raydium parity)
+const TRAIL_PCT        = Number(process.env.BASE_TRAIL_PCT         || '12');   // 12% (Raydium parity)
+const EARLY_TRAIL_PCT  = Number(process.env.BASE_EARLY_TRAIL_PCT   || '3');    // activates trail before TP1
+const TIME_LIMIT_SEC   = Number(process.env.BASE_TIME_LIMIT_SEC    || '7200'); // 2h
+const POLL_INTERVAL_MS = Number(process.env.BASE_POLL_INTERVAL_MS  || '10000');
+const BUY_ETH          = Number(process.env.BASE_BUY_ETH           || '0.001');
 
-// TP levels: multiplier of entry → % of position to sell
+// TP levels — Raydium-style: capture most profit early, trail the rest
+// Conservative targets fit current FEAR market (F&G=20)
 const BASE_TPS = [
-  { mult: 1.3, sellPct: 30 },
-  { mult: 1.8, sellPct: 25 },
-  { mult: 2.5, sellPct: 20 },
-  { mult: 4.0, sellPct: 15 },
-  { mult: 7.0, sellPct: 10 },
+  { mult: 1.25, sellPct: 80 },   // lock 80% at +25% — Raydium FEAR mode equivalent
+  { mult: 2.00, sellPct: 20 },   // close rest at 2x
 ];
 
 interface Position {
@@ -101,7 +106,6 @@ async function sellPosition(pos: Position, reason: string, sellPct: number, slip
     );
     await updateDailyStats(pos, ethReceived);
   } else {
-    // Partial sell — update token_amount remaining, advance tp_index
     const remainingPct = 100 - sellPct;
     const newAmount = (tokenBalance * BigInt(remainingPct)) / 100n;
     await query(
@@ -136,20 +140,26 @@ async function pollPosition(pos: Position): Promise<void> {
   const ageSec = (Date.now() - new Date(pos.bought_at).getTime()) / 1000;
   const stopPrice = pos.entry_price_eth * (1 - STOP_LOSS_PCT / 100);
 
-  // Time limit — forced exit, accept any price
+  // Time limit — forced exit
   if (ageSec > TIME_LIMIT_SEC) {
     await sellPosition(pos, 'TIME_LIMIT', 100, 0);
     return;
   }
 
-  // Stop loss — forced exit, accept any price
+  // Stop loss — forced exit
   if (currentPrice <= stopPrice) {
     await sellPosition(pos, 'STOP_LOSS', 100, 0);
     return;
   }
 
-  // Trailing stop (only above entry) — forced exit, accept any price
-  if (mult > 1.05) {
+  // Trailing stop logic
+  // Early trail (Raydium EARLY_TRAIL_PCT): activates even before TP1 if price moved +EARLY_TRAIL_PCT%
+  // This prevents giving back small gains on reversals
+  const earlyTrailActive = mult > (1 + EARLY_TRAIL_PCT / 100);
+  // Regular trail: activates after first TP (tp_index > 0)
+  const trailActive = earlyTrailActive || (pos.tp_index > 0 && mult > 1.01);
+
+  if (trailActive) {
     const newHigh = Math.max(pos.trail_high, currentPrice);
     const trailStop = newHigh * (1 - TRAIL_PCT / 100);
 
@@ -158,8 +168,9 @@ async function pollPosition(pos: Position): Promise<void> {
       pos = { ...pos, trail_high: newHigh };
     }
 
-    if (currentPrice <= trailStop && pos.tp_index > 0) {
-      await sellPosition(pos, 'TRAIL_STOP', 100, 0);
+    if (currentPrice <= trailStop) {
+      const reason = earlyTrailActive && pos.tp_index === 0 ? 'EARLY_TRAIL' : 'TRAIL_STOP';
+      await sellPosition(pos, reason, 100, 0);
       return;
     }
   }
@@ -169,8 +180,10 @@ async function pollPosition(pos: Position): Promise<void> {
   if (nextTp && mult >= nextTp.mult) {
     const isLast = pos.tp_index >= BASE_TPS.length - 1;
     await sellPosition(pos, `TP${pos.tp_index + 1}@${nextTp.mult}x`, isLast ? 100 : nextTp.sellPct, 3);
-    if (!isLast) console.info(`[base-monitor] ${pos.symbol} TP${pos.tp_index + 1} hit — holding ${100 - nextTp.sellPct}%`);
+    if (!isLast) console.info(`[base-monitor] ${pos.symbol} TP${pos.tp_index + 1} hit — holding ${100 - nextTp.sellPct}% with ${TRAIL_PCT}% trail`);
   }
+
+  console.debug(`[base-monitor] ${pos.symbol} ${mult.toFixed(3)}x [stop:${(STOP_LOSS_PCT)}% trail:${pos.trail_high > 0 ? `${(pos.trail_high * (1 - TRAIL_PCT / 100) / pos.entry_price_eth * 100 - 100).toFixed(0)}%` : 'inactive'}]`);
 }
 
 let monitorRunning = false;
@@ -194,7 +207,11 @@ async function monitorLoop(): Promise<void> {
 }
 
 export function startMonitor(): void {
-  console.info(`[base-monitor] Starting — poll ${POLL_INTERVAL_MS / 1000}s | stop ${STOP_LOSS_PCT}% | trail ${TRAIL_PCT}% | timelimit ${TIME_LIMIT_SEC}s`);
+  console.info(
+    `[base-monitor] Starting — poll:${POLL_INTERVAL_MS / 1000}s | ` +
+    `stop:${STOP_LOSS_PCT}% | trail:${TRAIL_PCT}% (early@+${EARLY_TRAIL_PCT}%) | ` +
+    `TP:${BASE_TPS.map(t => `${t.mult}x→${t.sellPct}%`).join('/')} | time:${TIME_LIMIT_SEC / 3600}h`
+  );
   setInterval(() => monitorLoop().catch(console.error), POLL_INTERVAL_MS);
 }
 
