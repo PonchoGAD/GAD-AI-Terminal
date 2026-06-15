@@ -4,41 +4,85 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getBestBuyQuote = getBestBuyQuote;
+exports.getBestSellQuote = getBestSellQuote;
 exports.getTokenPriceEth = getTokenPriceEth;
 const ethers_1 = require("ethers");
 const axios_1 = __importDefault(require("axios"));
 const provider_1 = require("./provider");
 const contracts_1 = require("./contracts");
+// When true: only use Uniswap V3 for auto-buy — skip Aerodrome entirely.
+// Aerodrome can revert on tokens with transfer fees (K invariant broken),
+// causing real TX failures even when staticCall simulation passes.
+const ONLY_UNISWAP_V3 = process.env.BASE_ONLY_UNISWAP_V3 === 'true';
 // Get best buy quote: ETH → token
 async function getBestBuyQuote(tokenAddress, ethAmountWei, slippagePct = 3) {
-    const [uniQuote, aeroQuote] = await Promise.allSettled([
-        getUniswapV3Quote(tokenAddress, ethAmountWei),
-        getAerodromeQuote(tokenAddress, ethAmountWei),
-    ]);
-    const quotes = [];
-    if (uniQuote.status === 'fulfilled')
-        quotes.push(uniQuote.value);
-    if (aeroQuote.status === 'fulfilled')
-        quotes.push(aeroQuote.value);
-    if (!quotes.length)
-        throw new Error('No DEX quotes available for ' + tokenAddress);
-    // Pick best (highest amountOut)
-    const best = quotes.sort((a, b) => (b.amountOut > a.amountOut ? 1 : -1))[0];
-    const slippageFactor = BigInt(Math.floor((100 - slippagePct) * 100));
-    best.amountOutMin = (best.amountOut * slippageFactor) / 10000n;
-    return best;
+    // Try Uniswap V3 first (preferred: reliable, no transfer-fee issues)
+    const uniQuote = await getUniswapV3Quote(tokenAddress, ethAmountWei, 'buy').catch(() => null);
+    if (uniQuote) {
+        const slippageFactor = BigInt(Math.floor((100 - slippagePct) * 100));
+        uniQuote.amountOutMin = (uniQuote.amountOut * slippageFactor) / 10000n;
+        return uniQuote;
+    }
+    // Skip Aerodrome if BASE_ONLY_UNISWAP_V3=true (safer: no transfer-fee K-invariant reverts)
+    if (ONLY_UNISWAP_V3) {
+        throw new Error('No Uniswap V3 pool found and BASE_ONLY_UNISWAP_V3=true — skipping Aerodrome');
+    }
+    // Fallback: Aerodrome (use 10% slippage — Aerodrome pools often have higher price impact)
+    const aeroQuote = await getAerodromeQuote(tokenAddress, ethAmountWei);
+    const slippageFactor = BigInt(Math.floor((100 - Math.max(slippagePct, 10)) * 100));
+    aeroQuote.amountOutMin = (aeroQuote.amountOut * slippageFactor) / 10000n;
+    return aeroQuote;
 }
-// Uniswap V3 quote via Quoter V2
-async function getUniswapV3Quote(tokenAddress, ethAmountWei) {
+// Get sell quote: token → ETH (with slippage protection for TP sells)
+// Returns minEthWei = 0n if no quote found (caller should treat as "accept any")
+async function getBestSellQuote(tokenAddress, tokenAmountWei, slippagePct = 3) {
     const provider = (0, provider_1.getProvider)();
     const quoter = new ethers_1.ethers.Contract(contracts_1.ADDRESSES.UNISWAP_V3_QUOTER, contracts_1.UNISWAP_V3_QUOTER_ABI, provider);
-    // Try common fee tiers in order of likelihood for new tokens
-    for (const fee of [contracts_1.FEE_TIERS.HIGH, contracts_1.FEE_TIERS.MEDIUM, contracts_1.FEE_TIERS.LOW]) {
+    const slippageFactor = BigInt(Math.floor((100 - slippagePct) * 100));
+    // Try Uniswap V3 (token → WETH) — same fee tier order as buy
+    for (const fee of [contracts_1.FEE_TIERS.ULTRA, contracts_1.FEE_TIERS.HIGH, contracts_1.FEE_TIERS.MEDIUM, contracts_1.FEE_TIERS.LOW]) {
         try {
             const result = await quoter.quoteExactInputSingle.staticCall({
-                tokenIn: contracts_1.ADDRESSES.WETH,
-                tokenOut: tokenAddress,
-                amountIn: ethAmountWei,
+                tokenIn: tokenAddress,
+                tokenOut: contracts_1.ADDRESSES.WETH,
+                amountIn: tokenAmountWei,
+                fee,
+                sqrtPriceLimitX96: 0n,
+            });
+            const expectedEthWei = result[0];
+            return { minEthWei: (expectedEthWei * slippageFactor) / 10000n, expectedEthWei };
+        }
+        catch {
+            continue;
+        }
+    }
+    // Fallback: Aerodrome sell quote
+    try {
+        const router = new ethers_1.ethers.Contract(contracts_1.ADDRESSES.AERODROME_ROUTER, contracts_1.AERODROME_ROUTER_ABI, provider);
+        const routes = [{ from: tokenAddress, to: contracts_1.ADDRESSES.WETH, stable: false, factory: contracts_1.ADDRESSES.AERODROME_FACTORY }];
+        const amounts = await router.getAmountsOut(tokenAmountWei, routes);
+        if (amounts && amounts.length >= 2) {
+            const expectedEthWei = amounts[amounts.length - 1];
+            return { minEthWei: (expectedEthWei * slippageFactor) / 10000n, expectedEthWei };
+        }
+    }
+    catch { }
+    return { minEthWei: 0n, expectedEthWei: 0n };
+}
+// Uniswap V3 quote via Quoter V2
+// direction: 'buy' = ETH→token, 'sell' = token→ETH
+async function getUniswapV3Quote(tokenAddress, amountInWei, direction = 'buy') {
+    const provider = (0, provider_1.getProvider)();
+    const quoter = new ethers_1.ethers.Contract(contracts_1.ADDRESSES.UNISWAP_V3_QUOTER, contracts_1.UNISWAP_V3_QUOTER_ABI, provider);
+    const tokenIn = direction === 'buy' ? contracts_1.ADDRESSES.WETH : tokenAddress;
+    const tokenOut = direction === 'buy' ? tokenAddress : contracts_1.ADDRESSES.WETH;
+    // Try ULTRA first — most new meme tokens on Base use 1% pools
+    for (const fee of [contracts_1.FEE_TIERS.ULTRA, contracts_1.FEE_TIERS.HIGH, contracts_1.FEE_TIERS.MEDIUM, contracts_1.FEE_TIERS.LOW]) {
+        try {
+            const result = await quoter.quoteExactInputSingle.staticCall({
+                tokenIn,
+                tokenOut,
+                amountIn: amountInWei,
                 fee,
                 sqrtPriceLimitX96: 0n,
             });
