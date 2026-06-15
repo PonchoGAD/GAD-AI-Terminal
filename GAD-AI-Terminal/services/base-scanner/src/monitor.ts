@@ -57,7 +57,9 @@ async function getCurrentPriceEth(contractAddress: string): Promise<number> {
   } catch { return 0; }
 }
 
-async function sellPosition(pos: Position, reason: string, sellPct: number): Promise<void> {
+// slippagePct=0 for forced exits (stop/trail/time) — accept any price, must exit
+// slippagePct=3 for TP sells — enforce min ETH out to guard against MEV sandwiches
+async function sellPosition(pos: Position, reason: string, sellPct: number, slippagePct = 0): Promise<void> {
   const tokenBalance = await getTokenBalance(pos.contract_address).catch(() => 0n);
   if (tokenBalance === 0n) {
     console.warn(`[base-monitor] ${pos.symbol} no token balance — marking inactive`);
@@ -76,6 +78,7 @@ async function sellPosition(pos: Position, reason: string, sellPct: number): Pro
     amountToSell,
     pos.dex as 'uniswap_v3' | 'aerodrome',
     pos.fee_tier,
+    slippagePct,
   );
 
   if (!result.ok) {
@@ -133,19 +136,19 @@ async function pollPosition(pos: Position): Promise<void> {
   const ageSec = (Date.now() - new Date(pos.bought_at).getTime()) / 1000;
   const stopPrice = pos.entry_price_eth * (1 - STOP_LOSS_PCT / 100);
 
-  // Time limit
+  // Time limit — forced exit, accept any price
   if (ageSec > TIME_LIMIT_SEC) {
-    await sellPosition(pos, 'TIME_LIMIT', 100);
+    await sellPosition(pos, 'TIME_LIMIT', 100, 0);
     return;
   }
 
-  // Stop loss
+  // Stop loss — forced exit, accept any price
   if (currentPrice <= stopPrice) {
-    await sellPosition(pos, 'STOP_LOSS', 100);
+    await sellPosition(pos, 'STOP_LOSS', 100, 0);
     return;
   }
 
-  // Trailing stop (only above entry)
+  // Trailing stop (only above entry) — forced exit, accept any price
   if (mult > 1.05) {
     const newHigh = Math.max(pos.trail_high, currentPrice);
     const trailStop = newHigh * (1 - TRAIL_PCT / 100);
@@ -156,16 +159,16 @@ async function pollPosition(pos: Position): Promise<void> {
     }
 
     if (currentPrice <= trailStop && pos.tp_index > 0) {
-      await sellPosition(pos, 'TRAIL_STOP', 100);
+      await sellPosition(pos, 'TRAIL_STOP', 100, 0);
       return;
     }
   }
 
-  // TP levels
+  // TP levels — use 3% slippage protection against MEV sandwiches
   const nextTp = BASE_TPS[pos.tp_index];
   if (nextTp && mult >= nextTp.mult) {
     const isLast = pos.tp_index >= BASE_TPS.length - 1;
-    await sellPosition(pos, `TP${pos.tp_index + 1}@${nextTp.mult}x`, isLast ? 100 : nextTp.sellPct);
+    await sellPosition(pos, `TP${pos.tp_index + 1}@${nextTp.mult}x`, isLast ? 100 : nextTp.sellPct, 3);
     if (!isLast) console.info(`[base-monitor] ${pos.symbol} TP${pos.tp_index + 1} hit — holding ${100 - nextTp.sellPct}%`);
   }
 }

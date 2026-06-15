@@ -1,18 +1,22 @@
 import { ethers } from 'ethers';
 import { getWallet, getProvider } from './provider';
 import { ADDRESSES, UNISWAP_V3_ROUTER_ABI, AERODROME_ROUTER_ABI, ERC20_ABI } from './contracts';
-import { getBestBuyQuote, QuoteResult } from './quotes';
+import { getBestBuyQuote, getBestSellQuote, QuoteResult } from './quotes';
 
 const MAX_SLIPPAGE_PCT = Number(process.env.BASE_MAX_SLIPPAGE_PCT || '3');
 const GAS_LIMIT_BUY    = BigInt(process.env.BASE_GAS_LIMIT_BUY  || '350000');
 const GAS_LIMIT_SELL   = BigInt(process.env.BASE_GAS_LIMIT_SELL || '300000');
 
+// keccak256("Withdrawal(address,uint256)") — WETH unwrap event emitted during token→ETH swaps
+const WETH_WITHDRAWAL_TOPIC = ethers.id('Withdrawal(address,uint256)');
+
 export interface TradeResult {
   ok:           boolean;
   tx_hash?:     string;
-  amount_in:    string;  // ETH in
-  amount_out:   string;  // tokens out (or ETH out for sell)
+  amount_in:    string;  // ETH in (buy) or tokens in (sell)
+  amount_out:   string;  // tokens out (buy) or ETH out (sell)
   dex:          string;
+  fee_tier?:    number;  // Uniswap V3 fee tier used (0 for Aerodrome)
   error?:       string;
 }
 
@@ -61,13 +65,14 @@ export async function buyToken(
       );
     }
 
-    const receipt = await tx.wait(1);
+    await tx.wait(1);
     return {
       ok:         true,
       tx_hash:    tx.hash,
       amount_in:  ethAmountEth.toString(),
       amount_out: quote.amountOut.toString(),
       dex:        quote.dex,
+      fee_tier:   quote.fee,
     };
   } catch (e: any) {
     return { ok: false, amount_in: ethAmountEth.toString(), amount_out: '0', dex: quote.dex, error: e.message };
@@ -75,23 +80,30 @@ export async function buyToken(
 }
 
 // Sell token for ETH
+// slippagePct=0 → amountOutMin=0n (use for stop-loss/time-limit: must exit at any price)
+// slippagePct>0 → get sell quote and enforce min ETH out (use for TP sells: MEV protection)
 export async function sellToken(
   tokenAddress: string,
   tokenAmountWei: bigint,
   dex: 'uniswap_v3' | 'aerodrome',
   feeTier = 3000,
-  slippagePct = MAX_SLIPPAGE_PCT
+  slippagePct = 0
 ): Promise<TradeResult> {
-  const wallet   = getWallet();
-  const provider = getProvider();
+  const wallet = getWallet();
 
   // Ensure allowance
   await ensureAllowance(tokenAddress, dex === 'uniswap_v3' ? ADDRESSES.UNISWAP_V3_ROUTER : ADDRESSES.AERODROME_ROUTER, tokenAmountWei);
 
+  // Compute amountOutMin for slippage protection on TP sells
+  let amountOutMin = 0n;
+  if (slippagePct > 0) {
+    const sellQuote = await getBestSellQuote(tokenAddress, tokenAmountWei, slippagePct).catch(() => ({ minEthWei: 0n, expectedEthWei: 0n }));
+    amountOutMin = sellQuote.minEthWei;
+  }
+
   try {
     let tx: ethers.TransactionResponse;
     const deadline = BigInt(Math.floor(Date.now() / 1000) + 120);
-    const amountOutMin = 0n; // Accept any ETH out (stop-loss sell)
 
     if (dex === 'uniswap_v3') {
       const router = new ethers.Contract(ADDRESSES.UNISWAP_V3_ROUTER, UNISWAP_V3_ROUTER_ABI, wallet);
@@ -120,8 +132,8 @@ export async function sellToken(
     }
 
     const receipt = await tx.wait(1);
-    // Parse ETH received from Transfer events or parse logs
-    const ethReceived = await getEthFromReceipt(receipt, wallet.address);
+    // Parse ETH received from WETH Withdrawal event in receipt
+    const ethReceived = getEthFromReceipt(receipt);
 
     return {
       ok:         true,
@@ -129,6 +141,7 @@ export async function sellToken(
       amount_in:  tokenAmountWei.toString(),
       amount_out: ethers.formatEther(ethReceived),
       dex,
+      fee_tier:   feeTier,
     };
   } catch (e: any) {
     return { ok: false, amount_in: tokenAmountWei.toString(), amount_out: '0', dex, error: e.message };
@@ -145,20 +158,29 @@ async function ensureAllowance(tokenAddress: string, spender: string, amount: bi
   }
 }
 
-async function getEthFromReceipt(receipt: ethers.TransactionReceipt | null, walletAddress: string): Promise<bigint> {
+// Parse ETH received from WETH Withdrawal(address indexed src, uint256 wad) events.
+// Uniswap V3 router unwraps WETH → ETH and emits Withdrawal from the WETH contract.
+// monitor.ts also uses balance delta as primary source; this is used for logging in TradeResult.
+function getEthFromReceipt(receipt: ethers.TransactionReceipt | null): bigint {
   if (!receipt) return 0n;
-  // WETH Withdrawal event: 0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c from weth = 0x4200...0006
-  const WETH_WITHDRAWAL = '0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7fcf532c';
-  // Approximate: estimate from tx value change or just return 0 and let caller recheck balance
-  // For simplicity, re-check balance delta
-  return 0n; // Caller should check wallet balance delta
+  let total = 0n;
+  for (const log of receipt.logs) {
+    if (
+      log.address.toLowerCase() === ADDRESSES.WETH.toLowerCase() &&
+      log.topics[0] === WETH_WITHDRAWAL_TOPIC
+    ) {
+      // data = wad (uint256 ETH amount in wei)
+      try { total += BigInt(log.data); } catch { }
+    }
+  }
+  return total;
 }
 
 // Get token balance of wallet
 export async function getTokenBalance(tokenAddress: string): Promise<bigint> {
-  const wallet  = getWallet();
+  const wallet   = getWallet();
   const provider = getProvider();
-  const token   = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
+  const token    = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
   return await token.balanceOf(wallet.address);
 }
 

@@ -177,7 +177,7 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
       result.amount_out,
       token.price_eth,
       result.dex,
-      3000, // default fee tier
+      result.fee_tier ?? 3000,
       result.tx_hash,
     ]
   );
