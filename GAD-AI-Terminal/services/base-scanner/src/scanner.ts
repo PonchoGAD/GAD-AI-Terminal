@@ -7,15 +7,19 @@ import { checkTokenSafety } from '@lib/base';
 // - pc1h min 5% (Raydium: 5%), vol/liq 15% (Raydium: 15%), B/S ≤3.0 (Raydium: 3.5)
 // - Age ≤6h: Base memes die fast — fresh entries outperform aged ones
 // - Liq $10k-$200k: Base has less TVL than Solana, upper bound lower
-const MIN_LIQ       = Number(process.env.BASE_MIN_LIQUIDITY_USD  || '10000');
-const MAX_LIQ       = Number(process.env.BASE_MAX_LIQUIDITY_USD  || '200000');
-const MIN_PC1H      = Number(process.env.BASE_MIN_PC1H           || '5');
-const MAX_PC1H      = Number(process.env.BASE_MAX_PC1H           || '80');
-const MIN_PC5M      = Number(process.env.BASE_MIN_PC5M           || '1');
-const MIN_VOL_LIQ   = Number(process.env.BASE_MIN_VOL_LIQ_RATIO  || '0.15');
-const MAX_BS_RATIO  = Number(process.env.BASE_MAX_BUY_SELL_RATIO  || '3.0');
-const MAX_AGE_SEC   = Number(process.env.BASE_MAX_AGE_SEC        || '21600'); // 6h — Base memes move fast
-const MIN_SAFE_SCORE = Number(process.env.BASE_MIN_SAFE_SCORE    || '35');
+const MIN_LIQ        = Number(process.env.BASE_MIN_LIQUIDITY_USD  || '10000');
+const MAX_LIQ        = Number(process.env.BASE_MAX_LIQUIDITY_USD  || '200000');
+const MIN_PC1H       = Number(process.env.BASE_MIN_PC1H           || '5');
+const MAX_PC1H       = Number(process.env.BASE_MAX_PC1H           || '80');
+// Fresh launches (< 1h) routinely spike 100-400% in the first hour — don't cap them
+const MAX_PC1H_FRESH = Number(process.env.BASE_MAX_PC1H_FRESH     || '400');
+const FRESH_AGE_SEC  = Number(process.env.BASE_FRESH_AGE_SEC      || '3600'); // 1h = "fresh launch"
+const MIN_PC5M       = Number(process.env.BASE_MIN_PC5M           || '1');
+const MIN_VOL_LIQ    = Number(process.env.BASE_MIN_VOL_LIQ_RATIO  || '0.15');
+const MAX_BS_RATIO   = Number(process.env.BASE_MAX_BUY_SELL_RATIO  || '3.0');
+const MAX_AGE_SEC    = Number(process.env.BASE_MAX_AGE_SEC        || '21600'); // 6h — Base memes move fast
+const MIN_SAFE_SCORE = Number(process.env.BASE_MIN_SAFE_SCORE     || '35');
+const MIN_BUYS_H1    = Number(process.env.BASE_MIN_BUYS_H1        || '5');    // min unique buys in last hour
 const SCAN_INTERVAL = Number(process.env.BASE_SCAN_INTERVAL_SEC  || '30') * 1000;
 
 export interface BaseToken {
@@ -34,6 +38,7 @@ export interface BaseToken {
   holders:          number;
   age_sec:          number;
   buy_sell_ratio:   number;
+  txns_h1_buys:     number; // unique buy count in last 1h — filters dead/fake volume
   is_verified:      boolean;
   lp_locked:        boolean;
   safe_score:       number;
@@ -107,6 +112,7 @@ function mapDexPair(p: any): BaseToken | null {
     holders:          0,
     age_sec:          createdAt,
     buy_sell_ratio:   Number(p.txns?.h1?.buys ?? 1) / Math.max(1, Number(p.txns?.h1?.sells ?? 1)),
+    txns_h1_buys:     Number(p.txns?.h1?.buys ?? 0),
     is_verified:      false,
     lp_locked:        false,
     safe_score:       50,
@@ -144,6 +150,7 @@ async function fetchGeckoTerminal(): Promise<BaseToken[]> {
         holders:          0,
         age_sec:          createdAt,
         buy_sell_ratio:   Number(attrs.transactions?.h1?.buys ?? 1) / Math.max(1, Number(attrs.transactions?.h1?.sells ?? 1)),
+        txns_h1_buys:     Number(attrs.transactions?.h1?.buys ?? 0),
         is_verified:      false,
         lp_locked:        false,
         safe_score:       50,
@@ -158,10 +165,13 @@ function passesFilter(t: BaseToken): string | null {
   if (t.liquidity_usd < MIN_LIQ)            return `liq:$${t.liquidity_usd.toFixed(0)} < $${MIN_LIQ}`;
   if (t.liquidity_usd > MAX_LIQ)            return `liq:$${t.liquidity_usd.toFixed(0)} > $${MAX_LIQ}`;
   if (t.price_change_1h < MIN_PC1H)         return `pc1h:${t.price_change_1h.toFixed(1)}% < ${MIN_PC1H}%`;
-  if (t.price_change_1h > MAX_PC1H)         return `pc1h:${t.price_change_1h.toFixed(1)}% > ${MAX_PC1H}%`;
+  // Fresh launches (< FRESH_AGE_SEC) use higher cap — first-hour spikes are normal on Base
+  const maxPc1h = t.age_sec < FRESH_AGE_SEC ? MAX_PC1H_FRESH : MAX_PC1H;
+  if (t.price_change_1h > maxPc1h)          return `pc1h:${t.price_change_1h.toFixed(1)}% > ${maxPc1h}% (age:${(t.age_sec/60).toFixed(0)}min)`;
   if (t.price_change_5m < MIN_PC5M)         return `pc5m:${t.price_change_5m.toFixed(1)}% < ${MIN_PC5M}%`;
   if (t.volume_1h / Math.max(1, t.liquidity_usd) < MIN_VOL_LIQ) return `vol/liq:${(t.volume_1h / Math.max(1, t.liquidity_usd) * 100).toFixed(0)}% < ${MIN_VOL_LIQ * 100}%`;
   if (t.buy_sell_ratio > MAX_BS_RATIO)      return `bs:${t.buy_sell_ratio.toFixed(1)} > ${MAX_BS_RATIO}`;
+  if (t.txns_h1_buys < MIN_BUYS_H1)        return `buys1h:${t.txns_h1_buys} < ${MIN_BUYS_H1}`;
   if (t.age_sec > MAX_AGE_SEC)              return `age:${(t.age_sec / 3600).toFixed(1)}h > ${MAX_AGE_SEC / 3600}h`;
   if (t.safe_score < MIN_SAFE_SCORE)        return `score:${t.safe_score} < ${MIN_SAFE_SCORE}`;
   return null;

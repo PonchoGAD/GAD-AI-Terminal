@@ -62,6 +62,8 @@ async function getCurrentPriceEth(contractAddress: string): Promise<number> {
   } catch { return 0; }
 }
 
+const ONLY_UNISWAP_V3 = process.env.BASE_ONLY_UNISWAP_V3 === 'true';
+
 // slippagePct=0 for forced exits (stop/trail/time) — accept any price, must exit
 // slippagePct=3 for TP sells — enforce min ETH out to guard against MEV sandwiches
 async function sellPosition(pos: Position, reason: string, sellPct: number, slippagePct = 0): Promise<void> {
@@ -78,10 +80,12 @@ async function sellPosition(pos: Position, reason: string, sellPct: number, slip
 
   const ethBalBefore = await getEthBalance();
 
+  // When BASE_ONLY_UNISWAP_V3=true, always sell via Uni V3 regardless of how the position was opened
+  const sellDex = ONLY_UNISWAP_V3 ? 'uniswap_v3' : (pos.dex as 'uniswap_v3' | 'aerodrome');
   const result = await sellToken(
     pos.contract_address,
     amountToSell,
-    pos.dex as 'uniswap_v3' | 'aerodrome',
+    sellDex,
     pos.fee_tier,
     slippagePct,
   );
