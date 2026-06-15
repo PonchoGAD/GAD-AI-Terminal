@@ -102,20 +102,22 @@ const BONDING_NEW_TIME_LIMIT   = Number(process.env.BONDING_NEW_TIME_LIMIT_SEC |
 const BONDING_NEW_STOP_PCT     = Number(process.env.BONDING_NEW_STOP_PCT     || '0.08'); // 8% stop
 
 // ─── Graduation Hunter — pump.fun tokens close to $69k graduation ─────────────
-// Pre-graduation pump: community rushes to push mcap over $69k → token graduates to Raydium.
-// Entry at $40k-65k gives a 5-70% gain on graduation. Uses bonding curve sell (pool='pump').
+// Strategy (v2): exit FAST while still on bonding curve (before graduation closes it).
+// Time limit 10 min: bonding curve stays open → PumpPortal sell works reliably.
+// TP at +18% sell 100%: quick scalp, no waiting for graduation pop.
+// Stop at 8%: tight, matches MOVER risk profile.
 const GRAD_HUNTER_ENABLED     = process.env.GRAD_HUNTER_ENABLED === 'true';
 const GRAD_HUNTER_INTERVAL_MS = Number(process.env.GRAD_HUNTER_INTERVAL_SEC  || '30') * 1000;
 const GRAD_HUNTER_BUY_SOL     = Number(process.env.GRAD_HUNTER_BUY_SOL       || '0.015');
 const GRAD_HUNTER_MIN_MCAP    = Number(process.env.GRAD_HUNTER_MIN_MCAP_USD  || '25000');
-const GRAD_HUNTER_MAX_MCAP    = Number(process.env.GRAD_HUNTER_MAX_MCAP_USD  || '65000');
-const GRAD_HUNTER_TIME_LIMIT  = Number(process.env.GRAD_HUNTER_TIME_LIMIT_SEC || '1800'); // 30 min
-const GRAD_HUNTER_STOP_PCT    = Number(process.env.GRAD_HUNTER_STOP_PCT       || '0.15'); // 15% — gives room for dips on freshly-graduated tokens
-// TP: capture graduation pop ($25k → $69k = 2.76x max, $40k → $69k = 1.73x)
-// At $25k entry: sell 40% at +50% (on the way up), rest at +120% (near graduation)
+const GRAD_HUNTER_MAX_MCAP    = Number(process.env.GRAD_HUNTER_MAX_MCAP_USD  || '63000'); // <63k: bonding curve still open
+const GRAD_HUNTER_TIME_LIMIT  = Number(process.env.GRAD_HUNTER_TIME_LIMIT_SEC || '600');  // 10 min — exit before graduation
+const GRAD_HUNTER_STOP_PCT    = Number(process.env.GRAD_HUNTER_STOP_PCT       || '0.08'); // 8% tight stop
+// TP: fast scalp on the final push to graduation — sell all at +18%
+// Rationale: pre-grad tokens spike +15-30% as community races to push past $69k.
+// Selling 100% at first sign of profit ensures we exit while still on bonding curve.
 const GRAD_TPS = [
-  { mult: 1.50, sellPct: 40 },  // lock 40% at +50%
-  { mult: 2.20, sellPct: 60 },  // exit rest at +120% (approaching graduation)
+  { mult: 1.18, sellPct: 100 }, // sell all at +18% — still on bonding curve
 ];
 
 // ─── PumpSwap Trader — graduated tokens on real AMM pool ─────────────────────
@@ -903,35 +905,41 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
         positions2.delete(mint);
         const sellPool = p.dexPool ?? 'pump';
         const pumpResult = await sellOnBondingCurve(mint, 100, keypair, connection, sellPool);
-        // Jupiter fallback if bonding curve returned 0 SOL (token may have graduated to PumpSwap)
+        // If bonding curve returned 0 SOL — try pumpswap, then Jupiter with W2 keypair
         if (!pumpResult.success || (pumpResult.solReceived ?? 0) === 0) {
-          console.warn(`[bonding-scan] ⏱ MOVER ${p.symbol} bonding sell = 0 SOL — trying Jupiter fallback`);
-          try {
-            const kp = getKeypairFromEnv();
-            const conn = getConnection();
-            if (kp && conn) {
-              const tokenAccounts = await conn.getParsedTokenAccountsByOwner(
-                keypair.publicKey, { mint: new PublicKey(mint) }
-              );
-              const rawAmount = BigInt(
-                (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
-              );
-              if (rawAmount > 0n) {
-                const jupResult = await executeAutoSell(
-                  { mintAddress: mint, tokenAmount: rawAmount, slippageBps: 1000 },
-                  conn, kp
+          // Attempt 2: pumpswap pool
+          console.warn(`[bonding-scan] ⏱ MOVER ${p.symbol} pump sell = 0 — trying pumpswap pool`);
+          const psResult = await sellOnBondingCurve(mint, 100, keypair, connection, 'pumpswap');
+
+          if (!psResult.success || (psResult.solReceived ?? 0) === 0) {
+            // Attempt 3: Jupiter with W2 keypair (NOT getKeypairFromEnv which returns W1)
+            console.warn(`[bonding-scan] ⏱ MOVER ${p.symbol} pumpswap = 0 — trying Jupiter (W2 keypair)`);
+            try {
+              const conn = getConnection();
+              if (conn) {
+                const tokenAccounts = await conn.getParsedTokenAccountsByOwner(
+                  keypair.publicKey, { mint: new PublicKey(mint) }
                 );
-                if (jupResult.success) {
-                  await query(
-                    `UPDATE autobuy_jobs SET total_sold_sol=COALESCE(total_sold_sol,0)+$1, active=false WHERE mint_address=$2 AND label LIKE 'auto:bonding%' AND active=true`,
-                    [jupResult.solReceived ?? 0, mint]
-                  ).catch(() => {});
-                  console.info(`[bonding-scan] ✅ MOVER Jupiter fallback SOLD ${p.symbol} → ${(jupResult.solReceived ?? 0).toFixed(5)} SOL`);
+                const rawAmount = BigInt(
+                  (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
+                );
+                if (rawAmount > 0n) {
+                  const jupResult = await executeAutoSell(
+                    { mintAddress: mint, tokenAmount: rawAmount, slippageBps: 1000 },
+                    conn, keypair  // FIX: keypair = W2, not getKeypairFromEnv() = W1
+                  );
+                  if (jupResult.success) {
+                    await query(
+                      `UPDATE autobuy_jobs SET total_sold_sol=COALESCE(total_sold_sol,0)+$1, active=false WHERE mint_address=$2 AND label LIKE 'auto:bonding%' AND active=true`,
+                      [jupResult.solReceived ?? 0, mint]
+                    ).catch(() => {});
+                    console.info(`[bonding-scan] ✅ MOVER Jupiter SOLD ${p.symbol} → ${(jupResult.solReceived ?? 0).toFixed(5)} SOL`);
+                  }
                 }
               }
+            } catch (jupErr: any) {
+              console.warn(`[bonding-scan] MOVER Jupiter error: ${jupErr.message?.slice(0, 60)}`);
             }
-          } catch (jupErr: any) {
-            console.warn(`[bonding-scan] MOVER Jupiter fallback error: ${jupErr.message?.slice(0, 60)}`);
           }
         }
       }, BONDING_TIME_LIMIT_SEC * 1000);
@@ -1298,42 +1306,50 @@ async function pollGraduationHunterTokens(keypair: Keypair, connection: Connecti
         console.info(`[bonding-scan] ⏱ TIME_LIMIT GRAD ${pos.symbol} — selling 100%`);
         positions2.delete(mint);
 
-        // Attempt 1: sell on bonding curve via PumpPortal
+        // Attempt 1: sell on bonding curve (still open at 10 min since we exit before graduation)
         const pumpResult = await sellOnBondingCurve(mint, 100, keypair, connection, 'pump');
 
-        // If bonding curve returned 0 SOL, token likely graduated to PumpSwap → try Jupiter
         if (!pumpResult.success || (pumpResult.solReceived ?? 0) === 0) {
-          console.warn(`[bonding-scan] ⏱ GRAD ${pos.symbol} bonding sell = 0 SOL — trying Jupiter fallback (may have graduated to PumpSwap)`);
-          try {
-            const kp = getKeypairFromEnv();
-            const conn = getConnection();
-            if (kp && conn) {
-              // Get on-chain balance
-              const tokenAccounts = await conn.getParsedTokenAccountsByOwner(
-                kp.publicKey, { mint: new PublicKey(mint) }
-              );
-              const rawAmount = BigInt(
-                (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
-              );
-              if (rawAmount > 0n) {
-                const jupResult = await executeAutoSell(
-                  { mintAddress: mint, tokenAmount: rawAmount, slippageBps: 1000 },
-                  conn, kp
+          // Attempt 2: try pumpswap pool (token may have just graduated)
+          console.warn(`[bonding-scan] ⏱ GRAD ${pos.symbol} pump sell = 0 — trying pumpswap pool`);
+          const psResult = await sellOnBondingCurve(mint, 100, keypair, connection, 'pumpswap');
+
+          if (!psResult.success || (psResult.solReceived ?? 0) === 0) {
+            // Attempt 3: Jupiter with CORRECT keypair (W2 = keypair, not W1)
+            console.warn(`[bonding-scan] ⏱ GRAD ${pos.symbol} pumpswap = 0 — trying Jupiter (W2 keypair)`);
+            try {
+              const conn = getConnection();
+              if (conn) {
+                const tokenAccounts = await conn.getParsedTokenAccountsByOwner(
+                  keypair.publicKey, { mint: new PublicKey(mint) }
                 );
-                if (jupResult.success && (jupResult.solReceived ?? 0) > 0) {
-                  await query(
-                    `UPDATE autobuy_jobs SET total_sold_sol = COALESCE(total_sold_sol, 0) + $1, active = false
-                     WHERE mint_address = $2 AND label LIKE 'auto:bonding:grad%' AND active = true`,
-                    [jupResult.solReceived, mint]
-                  ).catch(() => {});
-                  console.info(`[bonding-scan] ✅ GRAD Jupiter fallback SOLD ${pos.symbol} → ${jupResult.solReceived?.toFixed(5)} SOL`);
-                } else {
-                  console.error(`[bonding-scan] ❌ GRAD all sell attempts failed for ${pos.symbol}`);
+                const rawAmount = BigInt(
+                  (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
+                );
+                if (rawAmount > 0n) {
+                  const jupResult = await executeAutoSell(
+                    { mintAddress: mint, tokenAmount: rawAmount, slippageBps: 1000 },
+                    conn, keypair  // FIX: use keypair (W2), not getKeypairFromEnv() (W1)
+                  );
+                  if (jupResult.success && (jupResult.solReceived ?? 0) > 0) {
+                    await query(
+                      `UPDATE autobuy_jobs SET total_sold_sol = COALESCE(total_sold_sol, 0) + $1, active = false
+                       WHERE mint_address = $2 AND label LIKE 'auto:bonding:grad%' AND active = true`,
+                      [jupResult.solReceived, mint]
+                    ).catch(() => {});
+                    console.info(`[bonding-scan] ✅ GRAD Jupiter SOLD ${pos.symbol} → ${jupResult.solReceived?.toFixed(5)} SOL`);
+                  } else {
+                    console.error(`[bonding-scan] ❌ GRAD all 3 sell attempts failed for ${pos.symbol}`);
+                    await query(
+                      `UPDATE autobuy_jobs SET active=false WHERE mint_address=$1 AND label LIKE 'auto:bonding:grad%' AND active=true`,
+                      [mint]
+                    ).catch(() => {});
+                  }
                 }
               }
+            } catch (jupErr: any) {
+              console.warn(`[bonding-scan] GRAD Jupiter error: ${jupErr.message?.slice(0, 80)}`);
             }
-          } catch (jupErr: any) {
-            console.warn(`[bonding-scan] GRAD Jupiter fallback error: ${jupErr.message?.slice(0, 80)}`);
           }
         }
       }, GRAD_HUNTER_TIME_LIMIT * 1000);
@@ -1604,34 +1620,47 @@ async function recoverOrphanedPositions(keypair: Keypair, connection: Connection
         console.info(`[bonding-scan] ⏱ TIME_LIMIT (recovered) ${pos.symbol} (${walletLabel}) — selling 100%`);
         posMap.delete(mint);
         const sellResult = await sellOnBondingCurve(mint, 100, recoveryKeypair, connection, dexPool);
-        // Jupiter fallback if bonding curve sell returned 0 SOL (token may have graduated)
+        // Attempt 2: try alternate pool (graduated tokens switch pump→pumpswap)
         if (!sellResult.success || (sellResult.solReceived ?? 0) === 0) {
-          try {
-            const kp = getKeypairFromEnv();
-            const conn = getConnection();
-            if (kp && conn) {
-              const tokenAccounts = await conn.getParsedTokenAccountsByOwner(
-                recoveryKeypair.publicKey, { mint: new PublicKey(mint) }
-              );
-              const rawAmount = BigInt(
-                (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
-              );
-              if (rawAmount > 0n) {
-                const jupResult = await executeAutoSell(
-                  { mintAddress: mint, tokenAmount: rawAmount, slippageBps: 1000 },
-                  conn, kp
+          const altPool = dexPool === 'pump' ? 'pumpswap' : 'pump';
+          console.warn(`[bonding-scan] ⏱ Recovered ${symbol} ${dexPool} sell=0 — trying ${altPool}`);
+          const altResult = await sellOnBondingCurve(mint, 100, recoveryKeypair, connection, altPool);
+
+          // Attempt 3: Jupiter with CORRECT keypair (recoveryKeypair = actual holder, not W1)
+          if (!altResult.success || (altResult.solReceived ?? 0) === 0) {
+            console.warn(`[bonding-scan] ⏱ Recovered ${symbol} both pools=0 — trying Jupiter (${walletLabel} keypair)`);
+            try {
+              const conn = getConnection();
+              if (conn) {
+                const tokenAccounts = await conn.getParsedTokenAccountsByOwner(
+                  recoveryKeypair.publicKey, { mint: new PublicKey(mint) }
                 );
-                if (jupResult.success) {
-                  await query(
-                    `UPDATE autobuy_jobs SET total_sold_sol=COALESCE(total_sold_sol,0)+$1, active=false WHERE mint_address=$2 AND label LIKE 'auto:bonding%' AND active=true`,
-                    [jupResult.solReceived ?? 0, mint]
-                  ).catch(() => {});
-                  console.info(`[bonding-scan] ✅ Recovered ${symbol} Jupiter fallback → ${(jupResult.solReceived ?? 0).toFixed(5)} SOL`);
+                const rawAmount = BigInt(
+                  (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
+                );
+                if (rawAmount > 0n) {
+                  const jupResult = await executeAutoSell(
+                    { mintAddress: mint, tokenAmount: rawAmount, slippageBps: 1000 },
+                    conn, recoveryKeypair  // FIX: use recoveryKeypair (W1 or W2), not getKeypairFromEnv() (always W1)
+                  );
+                  if (jupResult.success) {
+                    await query(
+                      `UPDATE autobuy_jobs SET total_sold_sol=COALESCE(total_sold_sol,0)+$1, active=false WHERE mint_address=$2 AND label LIKE 'auto:bonding%' AND active=true`,
+                      [jupResult.solReceived ?? 0, mint]
+                    ).catch(() => {});
+                    console.info(`[bonding-scan] ✅ Recovered ${symbol} Jupiter SOLD → ${(jupResult.solReceived ?? 0).toFixed(5)} SOL`);
+                  } else {
+                    console.error(`[bonding-scan] ❌ Recovered ${symbol} all 3 sell attempts failed — closing position`);
+                    await query(
+                      `UPDATE autobuy_jobs SET active=false WHERE mint_address=$1 AND label LIKE 'auto:bonding%' AND active=true`,
+                      [mint]
+                    ).catch(() => {});
+                  }
                 }
               }
+            } catch (jupErr: any) {
+              console.warn(`[bonding-scan] Recovered ${symbol} Jupiter error: ${jupErr.message?.slice(0, 60)}`);
             }
-          } catch (jupErr: any) {
-            console.warn(`[bonding-scan] Recovered ${symbol} Jupiter fallback error: ${jupErr.message?.slice(0, 60)}`);
           }
         }
       }, remainingMs);
