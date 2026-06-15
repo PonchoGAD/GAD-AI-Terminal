@@ -328,6 +328,7 @@ interface BondingPosition {
   dexPool?: string;      // 'pump' = bonding curve | 'pumpswap' = graduated PumpSwap
   tpLevels?: Array<{ mult: number; sellPct: number }>;  // per-strategy TP, defaults to BONDING_TPS
   stopPct?: number;      // per-strategy stop-loss, defaults to BONDING_STOP_PCT
+  isSelling?: boolean;   // concurrent sell guard — prevents multiple simultaneous sell attempts
 }
 
 const positions = new Map<string, BondingPosition>();
@@ -457,6 +458,12 @@ async function checkPositionExits(
   keypair: Keypair, connection: Connection, source: string,
   posMap: Map<string, BondingPosition> = positions
 ): Promise<void> {
+  // Concurrent sell guard — one sell at a time per position
+  if (pos.isSelling) {
+    console.debug(`[bonding-scan] ${pos.symbol} sell already in progress — skipping [${source}]`);
+    return;
+  }
+
   const pool      = pos.dexPool ?? 'pump';
   const tpLevels  = pos.tpLevels ?? BONDING_TPS;
   const stopPct   = pos.stopPct  ?? BONDING_STOP_PCT;
@@ -472,7 +479,12 @@ async function checkPositionExits(
     stopLossConfirms.delete(mint);
     console.info(`[bonding-scan] 🔴 STOP ${pos.symbol} ${mult.toFixed(2)}x [${source}] — confirmed ${STOP_CONFIRMS_REQUIRED}x — selling 100%`);
     posMap.delete(mint);
-    await sellOnBondingCurve(mint, 100, keypair, connection, pool);
+    pos.isSelling = true;
+    const stopResult = await sellOnBondingCurve(mint, 100, keypair, connection, pool);
+    if (!stopResult.success && pool === 'pump') {
+      console.warn(`[bonding-scan] 🔴 STOP ${pos.symbol} pump=0 — trying pumpswap (graduated?)`);
+      await sellOnBondingCurve(mint, 100, keypair, connection, 'pumpswap');
+    }
     return;
   }
   // Price recovered above stop — reset confirmation counter
@@ -484,7 +496,12 @@ async function checkPositionExits(
     if (currentFromPeak <= 1 - MOON_BAG_TRAIL_PCT) {
       console.info(`[bonding-scan] 🌙 TRAIL ${pos.symbol} peak:${pos.peakMcapSol.toFixed(0)} now:${mcapSol.toFixed(0)} — selling moon bag`);
       posMap.delete(mint);
-      await sellOnBondingCurve(mint, 100, keypair, connection, pool);
+      pos.isSelling = true;
+      const trailResult = await sellOnBondingCurve(mint, 100, keypair, connection, pool);
+      if (!trailResult.success && pool === 'pump') {
+        console.warn(`[bonding-scan] 🌙 TRAIL ${pos.symbol} pump=0 — trying pumpswap (graduated?)`);
+        await sellOnBondingCurve(mint, 100, keypair, connection, 'pumpswap');
+      }
     }
     return;
   }
@@ -494,7 +511,14 @@ async function checkPositionExits(
     const tp = tpLevels[pos.tpIndex];
     if (mult >= tp.mult) {
       console.info(`[bonding-scan] 🎯 TP${pos.tpIndex + 1} ${pos.symbol} ${mult.toFixed(2)}x — selling ${tp.sellPct}% [${source}]`);
-      await sellOnBondingCurve(mint, tp.sellPct, keypair, connection, pool);
+      pos.isSelling = true;
+      const tpResult = await sellOnBondingCurve(mint, tp.sellPct, keypair, connection, pool);
+      // If pump sell failed — token may have graduated to PumpSwap
+      if (!tpResult.success && pool === 'pump') {
+        console.warn(`[bonding-scan] 🎯 TP${pos.tpIndex + 1} ${pos.symbol} pump=0 — trying pumpswap (graduated?)`);
+        await sellOnBondingCurve(mint, tp.sellPct, keypair, connection, 'pumpswap');
+      }
+      pos.isSelling = false;
       pos.tpIndex++;
       if (pos.tpIndex >= tpLevels.length) {
         pos.allTpsDone = true;
@@ -1855,7 +1879,14 @@ export function startBondingScanner(): void {
     console.info(`[bonding-scan] Daily spent (W2) restored: ${bonding2DailySpent.toFixed(4)} SOL`);
   }).catch(() => {});
 
-  recoverOrphanedPositions(baseKeypair, connectionInstance).catch(() => {});
+  recoverOrphanedPositions(baseKeypair, connectionInstance).catch(err => {
+    // DB may be in recovery mode on startup — retry in 30s
+    const msg = err?.message ?? String(err);
+    if (msg.includes('recovery mode') || msg.includes('starting up')) {
+      console.warn(`[bonding-scan] DB in recovery mode — retrying orphan recovery in 30s`);
+      setTimeout(() => recoverOrphanedPositions(baseKeypair, connectionInstance!).catch(() => {}), 30_000);
+    }
+  });
   setInterval(() => pollBondingPositions(baseKeypair, connectionInstance!).catch(() => {}), DS_POLL_INTERVAL_MS);
 
   // HOT token poll — use wallet 2 if available, otherwise wallet 1

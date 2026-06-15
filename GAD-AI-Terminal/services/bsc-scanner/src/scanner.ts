@@ -5,19 +5,19 @@ import { checkBscTokenSafety, checkBscTopHolder } from '@lib/bsc';
 // ─── Config ─────────────────────────────────────────────────────────────────
 const MIN_LIQ        = Number(process.env.BSC_MIN_LIQUIDITY_USD  || '10000');
 const MAX_LIQ        = Number(process.env.BSC_MAX_LIQUIDITY_USD  || '300000');
-const MIN_PC1H       = Number(process.env.BSC_MIN_PC1H           || '8');
-const MAX_PC1H       = Number(process.env.BSC_MAX_PC1H           || '55');
-const MAX_PC1H_FRESH = Number(process.env.BSC_MAX_PC1H_FRESH     || '300');  // fresh <1h: allow up to 300%
+const MIN_PC1H       = Number(process.env.BSC_MIN_PC1H           || '3');    // was 8% — too strict, BSC memes move slower
+const MAX_PC1H       = Number(process.env.BSC_MAX_PC1H           || '80');
+const MAX_PC1H_FRESH = Number(process.env.BSC_MAX_PC1H_FRESH     || '400');  // fresh <1h: allow up to 400%
 const FRESH_AGE_SEC  = Number(process.env.BSC_FRESH_AGE_SEC      || '3600');
-const MIN_PC5M       = Number(process.env.BSC_MIN_PC5M           || '2');
-const MIN_VOL_LIQ    = Number(process.env.BSC_MIN_VOL_LIQ_RATIO  || '0.18');
-const MAX_BS_RATIO   = Number(process.env.BSC_MAX_BUY_SELL_RATIO || '2.3');
+const MIN_PC5M       = Number(process.env.BSC_MIN_PC5M           || '1');    // was 2%
+const MIN_VOL_LIQ    = Number(process.env.BSC_MIN_VOL_LIQ_RATIO  || '0.10'); // was 0.18 — lower for BSC
+const MAX_BS_RATIO   = Number(process.env.BSC_MAX_BUY_SELL_RATIO || '2.5');
 const MAX_AGE_SEC    = Number(process.env.BSC_MAX_AGE_SEC        || '86400');  // 24h
 const MIN_SAFE_SCORE = Number(process.env.BSC_MIN_SAFE_SCORE     || '40');
 const MAX_BUY_TAX    = Number(process.env.BSC_MAX_BUY_TAX        || '5');     // BSC: >5% buy tax = risky
 const MAX_SELL_TAX   = Number(process.env.BSC_MAX_SELL_TAX       || '5');     // BSC: >5% sell tax = honeypot risk
 const MAX_TOP_HOLDER = Number(process.env.BSC_MAX_TOP_HOLDER_PCT || '30');    // dev holding >30% = rug risk
-const MIN_BUYS_H1    = Number(process.env.BSC_MIN_BUYS_H1        || '10');    // min unique buys in 1h
+const MIN_BUYS_H1    = Number(process.env.BSC_MIN_BUYS_H1        || '5');     // was 10 — lower for fresh tokens
 
 export interface BscToken {
   contract_address: string;
@@ -180,8 +180,8 @@ async function fetchDexScreenerBsc(): Promise<BscToken[]> {
     }
   } catch { }
 
-  // 3. Targeted keyword searches — specific meme categories that pump on BSC
-  const queries = ['fourmeme pump', 'bnb meme 2025', 'pancakeswap gem', 'bsc ai agent', 'bnb dog cat'];
+  // 3. Targeted keyword searches — fresh BSC memes and recent launches
+  const queries = ['bsc new launch', 'bnb meme pump', 'fourmeme bnb', 'bsc gem new', 'bnb cat dog', 'bsc ai meme'];
   for (const q of queries) {
     try {
       const r = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`, { timeout: 5_000 });
