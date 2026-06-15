@@ -106,7 +106,7 @@ const GRAD_HUNTER_BUY_SOL     = Number(process.env.GRAD_HUNTER_BUY_SOL       || 
 const GRAD_HUNTER_MIN_MCAP    = Number(process.env.GRAD_HUNTER_MIN_MCAP_USD  || '25000');
 const GRAD_HUNTER_MAX_MCAP    = Number(process.env.GRAD_HUNTER_MAX_MCAP_USD  || '65000');
 const GRAD_HUNTER_TIME_LIMIT  = Number(process.env.GRAD_HUNTER_TIME_LIMIT_SEC || '1800'); // 30 min
-const GRAD_HUNTER_STOP_PCT    = Number(process.env.GRAD_HUNTER_STOP_PCT       || '0.10');
+const GRAD_HUNTER_STOP_PCT    = Number(process.env.GRAD_HUNTER_STOP_PCT       || '0.15'); // 15% — gives room for dips on freshly-graduated tokens
 // TP: capture graduation pop ($25k → $69k = 2.76x max, $40k → $69k = 1.73x)
 // At $25k entry: sell 40% at +50% (on the way up), rest at +120% (near graduation)
 const GRAD_TPS = [
@@ -313,6 +313,11 @@ const positions = new Map<string, BondingPosition>();
 // Wallet 2 positions (HOT token trades)
 const positions2 = new Map<string, BondingPosition>();
 
+// Stop-loss confirmation counters — require 2 consecutive below-stop readings before firing
+// Prevents single-candle stop hunts (one bad DexScreener reading triggers permanent sell)
+const stopLossConfirms = new Map<string, number>();
+const STOP_CONFIRMS_REQUIRED = 2;
+
 // ─── DexScreener polling watchdog ────────────────────────────────────────────
 
 // Poll positions every 10s so we don't miss a fast bonding curve peak
@@ -375,13 +380,22 @@ async function checkPositionExits(
   const tpLevels  = pos.tpLevels ?? BONDING_TPS;
   const stopPct   = pos.stopPct  ?? BONDING_STOP_PCT;
 
-  // Stop-loss
+  // Stop-loss (requires 2 consecutive below-stop readings to prevent stop-hunt sells)
   if (mult <= 1 - stopPct) {
-    console.info(`[bonding-scan] 🔴 STOP ${pos.symbol} ${mult.toFixed(2)}x [${source}] — selling 100%`);
+    const confirms = (stopLossConfirms.get(mint) ?? 0) + 1;
+    if (confirms < STOP_CONFIRMS_REQUIRED) {
+      stopLossConfirms.set(mint, confirms);
+      console.info(`[bonding-scan] ⚠️ STOP WARNING ${pos.symbol} ${mult.toFixed(2)}x [${source}] (${confirms}/${STOP_CONFIRMS_REQUIRED}) — waiting for confirmation`);
+      return;
+    }
+    stopLossConfirms.delete(mint);
+    console.info(`[bonding-scan] 🔴 STOP ${pos.symbol} ${mult.toFixed(2)}x [${source}] — confirmed ${STOP_CONFIRMS_REQUIRED}x — selling 100%`);
     posMap.delete(mint);
     await sellOnBondingCurve(mint, 100, keypair, connection, pool);
     return;
   }
+  // Price recovered above stop — reset confirmation counter
+  if (stopLossConfirms.has(mint)) stopLossConfirms.delete(mint);
 
   // Moon-bag trailing stop
   if (pos.allTpsDone) {

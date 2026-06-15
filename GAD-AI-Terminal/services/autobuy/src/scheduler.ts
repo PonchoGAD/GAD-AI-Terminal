@@ -130,6 +130,10 @@ const peakPriceMap = new Map<string, number>();
 // Peak price tracking for early trail (pre-TP1) — separate from post-TP1 trail
 const earlyPeakMap = new Map<string, number>();
 
+// Moon bag floor prices — set when stage 1 (90%) TP fires (jobId → TP floor price SOL/tok)
+// If price drops back to this floor, sell 70% of moon bag. Remaining 30% rides trailing stop.
+const moonbagFloorMap = new Map<string, number>();
+
 // Stop-loss confirmation counter — require N consecutive readings below stop before firing.
 // Prevents stop-hunts: whales briefly dip price below stop then immediately recover.
 // Set to 1 for immediate stop (memecoins can drop 20% in 30s if we wait for 2 confirms).
@@ -381,6 +385,75 @@ async function claimAndSell(
   return 'fail';
 }
 
+// ─── Moon bag partial sell (does NOT close job — 30% remainder rides trailing stop) ─────────
+
+async function sellMoonbagFloor(
+  mint: string,
+  jobId: string,
+  sellPct: number,
+  connection: ReturnType<typeof getConnection>,
+  keypair: ReturnType<typeof getKeypairFromEnv>,
+  isJupiterOnlyHint = false
+): Promise<'success' | 'fail'> {
+  if (!keypair) return 'fail';
+  const isJupiterOnly = isJupiterOnlyHint && !mint.endsWith('pump');
+
+  let onChainBalance: bigint;
+  try {
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+      keypair.publicKey, { mint: new PublicKey(mint) }
+    );
+    onChainBalance = BigInt(
+      (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
+    );
+  } catch {
+    return 'fail';
+  }
+
+  if (onChainBalance <= 0n) {
+    await query(`UPDATE autobuy_jobs SET active = false WHERE id = $1`, [jobId]);
+    return 'success';
+  }
+
+  const tokensToSell = BigInt(Math.floor(Number(onChainBalance) * sellPct / 100));
+  if (tokensToSell <= 0n) return 'fail';
+
+  let sellResult = await executeAutoSell(
+    { mintAddress: mint, tokenAmount: tokensToSell, slippageBps: AUTOSELL_SLIPPAGE_BPS },
+    connection, keypair
+  );
+  if (!sellResult.success) {
+    await new Promise(r => setTimeout(r, 2000));
+    sellResult = await executeAutoSell(
+      { mintAddress: mint, tokenAmount: tokensToSell, slippageBps: AUTOSELL_SLIPPAGE_RETRY_BPS },
+      connection, keypair
+    );
+  }
+
+  if (sellResult.success) {
+    await query(
+      `UPDATE autobuy_jobs SET total_sold_sol = total_sold_sol + $1, last_activity_at = now() WHERE id = $2`,
+      [sellResult.solReceived, jobId]
+    );
+    console.info(`[autosell] 🌙 Moon bag floor SOLD ${sellPct}% → ${sellResult.solReceived?.toFixed(5)} SOL (30% remainder rides trailing stop)`);
+    return 'success';
+  }
+
+  if (!isJupiterOnly) {
+    const ppResult = await sellViaPumpPortal(mint, sellPct, keypair, connection);
+    if (ppResult.success && (ppResult.solReceived ?? 0) > 0) {
+      await query(
+        `UPDATE autobuy_jobs SET total_sold_sol = total_sold_sol + $1, last_activity_at = now() WHERE id = $2`,
+        [ppResult.solReceived ?? 0, jobId]
+      );
+      console.info(`[autosell] 🌙 Moon bag floor SOLD via PumpPortal ${mint.slice(0,8)} → ${ppResult.solReceived?.toFixed(5)} SOL`);
+      return 'success';
+    }
+  }
+
+  return 'fail';
+}
+
 // ─── Sell cycle ───────────────────────────────────────────────────────────────
 
 async function checkAndExecuteSells(walletAddress: string) {
@@ -541,6 +614,26 @@ async function checkAndExecuteSells(walletAddress: string) {
       }
     }
 
+    // ── Moon bag floor stop (after TP: sell 70% if price drops back to TP level) ─
+    // Stage 1 sells 90% at TP. moonbagFloorMap records the TP price. If price drops
+    // back below that floor, we sell 70% of the remaining 10% (= 7% of original position).
+    // The last 30% of moon bag (= 3% of original) continues under trailing stop / time limit.
+    const moonbagFloor = moonbagFloorMap.get(refStage.autobuy_job_id);
+    if (moonbagFloor && refStage.sell_stage_reached >= 1 && currentPriceSol < moonbagFloor * 0.99) {
+      console.warn(
+        `[autosell] 🌙 MOON BAG FLOOR hit ${mint.slice(0,8)} — ` +
+        `price ${currentPriceSol.toExponential(4)} < floor ${moonbagFloor.toExponential(4)} — selling 70% of moon bag`
+      );
+      const result = await sellMoonbagFloor(
+        mint, refStage.autobuy_job_id, 70, connection, keypair,
+        !refStage.label?.includes(':pumpportal')
+      );
+      if (result === 'success') {
+        moonbagFloorMap.delete(refStage.autobuy_job_id);
+      }
+      continue;
+    }
+
     // ── Stop-loss check (with stop-hunt protection) ───────────────────────────
     if (STOP_LOSS_PCT > 0) {
       // Fresh tokens get slightly wider stop (10% vs 8%) to survive initial volatility.
@@ -644,6 +737,12 @@ async function checkAndExecuteSells(walletAddress: string) {
 
     // ── Normal staged sell check ──────────────────────────────────────────────
     for (const stage of mintStages.sort((a, b) => a.stage_number - b.stage_number)) {
+      // Skip moon bag placeholder stage (trigger_mult=9999) — managed by floor/trail separately
+      if (stage.trigger_mult >= 50) {
+        console.debug(`[autosell] 🌙 ${mint.slice(0,8)} moon bag stage pending — floor/trail watches it`);
+        break;
+      }
+
       const targetPrice = Number(stage.entry_price_sol) * stage.trigger_mult;
 
       if (currentPriceSol < targetPrice) {
@@ -720,6 +819,14 @@ async function checkAndExecuteSells(walletAddress: string) {
           `${tokensToSell} tok → ${sellResult.solReceived?.toFixed(4)} SOL ` +
           `tx:${sellResult.txSignature}`
         );
+
+        // After stage 1 (90% TP), record floor for moon bag protection
+        // stage 2 (multiplier=9999) is the moon bag placeholder — skip normal path for it
+        if (stage.stage_number === 1 && stage.sell_percent >= 85 && stage.trigger_mult < 50 && refEntry > 0) {
+          const tpFloor = refEntry * stage.trigger_mult;
+          moonbagFloorMap.set(stage.autobuy_job_id, tpFloor);
+          console.info(`[autosell] 🌙 Moon bag active — floor set at ${tpFloor.toExponential(4)} SOL/tok for ${mint.slice(0,8)} (10% rides, floor at TP price)`);
+        }
 
         // Auto-close job when last sell stage executes (100% sell_percent or no pending stages left)
         if (stage.sell_percent >= 100) {

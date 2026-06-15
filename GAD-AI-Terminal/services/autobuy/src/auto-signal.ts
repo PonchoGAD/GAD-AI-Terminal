@@ -433,7 +433,8 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
     trailPct: 0.10,
     earlyTrailPct: isFear ? 0.03 : 0.04,   // tighter early trail = lock gains sooner
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.55 : isFear ? 1.18 : 1.30, sellPct: 100 },
+      { stage: 1, multiplier: isBull ? 1.55 : isFear ? 1.18 : 1.30, sellPct: 90 },
+      { stage: 2, multiplier: 9999, sellPct: 100 },  // moon bag placeholder — managed by floor/trail
     ],
   };
   if (liqUsd <= 250000) return {
@@ -443,7 +444,8 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
     trailPct: 0.09,
     earlyTrailPct: isFear ? 0.03 : 0.04,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.45 : isFear ? 1.15 : 1.28, sellPct: 100 },
+      { stage: 1, multiplier: isBull ? 1.45 : isFear ? 1.15 : 1.28, sellPct: 90 },
+      { stage: 2, multiplier: 9999, sellPct: 100 },  // moon bag placeholder
     ],
   };
   return {
@@ -453,7 +455,8 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
     trailPct: 0.08,
     earlyTrailPct: isFear ? 0.03 : 0.04,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.38 : isFear ? 1.12 : 1.25, sellPct: 100 },
+      { stage: 1, multiplier: isBull ? 1.38 : isFear ? 1.12 : 1.25, sellPct: 90 },
+      { stage: 2, multiplier: 9999, sellPct: 100 },  // moon bag placeholder
     ],
   };
 }
