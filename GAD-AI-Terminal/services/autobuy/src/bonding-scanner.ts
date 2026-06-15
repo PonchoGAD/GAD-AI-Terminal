@@ -19,6 +19,8 @@ import axios from 'axios';
 import { Keypair, Connection, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { query } from '@lib/db';
+import { getFearGreed } from './auto-signal';
+import { executeAutoSell, getKeypairFromEnv, getConnection } from '@lib/autobuy';
 
 const PUMPPORTAL_WS  = 'wss://pumpportal.fun/api/data';
 const PUMPPORTAL_BUY = 'https://pumpportal.fun/api/trade-local';
@@ -253,7 +255,11 @@ async function sellOnBondingCurve(
     await connection.confirmTransaction(txSignature, 'confirmed');
     const balAfter = await connection.getBalance(keypair.publicKey).catch(() => 0);
     const solReceived = Math.max(0, (balAfter - balBefore) / 1e9);
-    console.info(`[bonding-scan] 💰 Sold ${pct}% of ${mint.slice(0, 8)} → ${solReceived.toFixed(5)} SOL`);
+    if (solReceived === 0) {
+      console.warn(`[bonding-scan] ⚠️ Sell TX confirmed but 0 SOL received for ${mint.slice(0, 8)} — bonding curve may be graduated/empty`);
+    } else {
+      console.info(`[bonding-scan] 💰 Sold ${pct}% of ${mint.slice(0, 8)} → ${solReceived.toFixed(5)} SOL`);
+    }
 
     // Accumulate total_sold_sol on EVERY sell (partial TPs + final)
     // pct >= 95 → close position (active=false); partial sells keep active=true
@@ -680,8 +686,22 @@ async function onTradeEvent(
 // These are 15min-4h old tokens with recent trading activity — past initial rug risk.
 // Wallet 1 handles brand-new launches via WebSocket. Wallet 2 handles HOT entries.
 
+// Min Fear & Greed to allow HOT/MOVERS buys — don't burn money buying $500-$6k tokens in FEAR
+const BONDING_HOT_MIN_FNG = Number(process.env.BONDING_HOT_MIN_FNG || '40');
+
 async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): Promise<void> {
   if (!BONDING_HOT_ENABLED) return;
+
+  // Market regime gate — MOVERS strategy requires NEUTRAL market (F&G >= 40)
+  // In FEAR (F&G < 40), sub-$25k mcap bonding curve tokens have near-zero survival rate
+  try {
+    const fng = await getFearGreed();
+    if (fng < BONDING_HOT_MIN_FNG) {
+      console.debug(`[bonding-scan] HOT gate: F&G=${fng} < ${BONDING_HOT_MIN_FNG} (FEAR) — skipping MOVERS buys`);
+      return;
+    }
+  } catch { /* fail-open: if F&G check fails, allow trading */ }
+
   try {
   // pump.fun API is Cloudflare-protected from VPS IPs (530 error).
   // Use DexScreener search filtered to pumpfun/pumpswap DEX instead.
@@ -1243,7 +1263,45 @@ async function pollGraduationHunterTokens(keypair: Keypair, connection: Connecti
         if (!pos) return;
         console.info(`[bonding-scan] ⏱ TIME_LIMIT GRAD ${pos.symbol} — selling 100%`);
         positions2.delete(mint);
-        await sellOnBondingCurve(mint, 100, keypair, connection, 'pump');
+
+        // Attempt 1: sell on bonding curve via PumpPortal
+        const pumpResult = await sellOnBondingCurve(mint, 100, keypair, connection, 'pump');
+
+        // If bonding curve returned 0 SOL, token likely graduated to PumpSwap → try Jupiter
+        if (!pumpResult.success || (pumpResult.solReceived ?? 0) === 0) {
+          console.warn(`[bonding-scan] ⏱ GRAD ${pos.symbol} bonding sell = 0 SOL — trying Jupiter fallback (may have graduated to PumpSwap)`);
+          try {
+            const kp = getKeypairFromEnv();
+            const conn = getConnection();
+            if (kp && conn) {
+              // Get on-chain balance
+              const tokenAccounts = await conn.getParsedTokenAccountsByOwner(
+                kp.publicKey, { mint: new PublicKey(mint) }
+              );
+              const rawAmount = BigInt(
+                (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
+              );
+              if (rawAmount > 0n) {
+                const jupResult = await executeAutoSell(
+                  { mintAddress: mint, tokenAmount: rawAmount, slippageBps: 1000 },
+                  conn, kp
+                );
+                if (jupResult.success && (jupResult.solReceived ?? 0) > 0) {
+                  await query(
+                    `UPDATE autobuy_jobs SET total_sold_sol = COALESCE(total_sold_sol, 0) + $1, active = false
+                     WHERE mint_address = $2 AND label LIKE 'auto:bonding:grad%' AND active = true`,
+                    [jupResult.solReceived, mint]
+                  ).catch(() => {});
+                  console.info(`[bonding-scan] ✅ GRAD Jupiter fallback SOLD ${pos.symbol} → ${jupResult.solReceived?.toFixed(5)} SOL`);
+                } else {
+                  console.error(`[bonding-scan] ❌ GRAD all sell attempts failed for ${pos.symbol}`);
+                }
+              }
+            }
+          } catch (jupErr: any) {
+            console.warn(`[bonding-scan] GRAD Jupiter fallback error: ${jupErr.message?.slice(0, 80)}`);
+          }
+        }
       }, GRAD_HUNTER_TIME_LIMIT * 1000);
 
       await new Promise(res => setTimeout(res, 2000));
