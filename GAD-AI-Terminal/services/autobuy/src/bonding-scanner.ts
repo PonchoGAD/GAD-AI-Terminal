@@ -30,7 +30,7 @@ const PUMPFUN_API    = 'https://frontend-api.pump.fun';
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const BONDING_BUY_SOL        = Number(process.env.BONDING_BUY_SOL       || '0.02');
-const BONDING_MAX_SOL_DAILY  = Number(process.env.BONDING_MAX_SOL_DAILY || '0.2');
+const BONDING_MAX_SOL_DAILY  = Number(process.env.BONDING_MAX_SOL_DAILY || '0.05');
 const BONDING_MAX_POSITIONS  = Number(process.env.BONDING_MAX_POSITIONS || '3');
 // W2 (HOT/MOVER/GRAD) position limit — 1 concurrent trade to control capital risk
 const BONDING_MAX_POSITIONS_W2 = Number(process.env.BONDING_MAX_POSITIONS_W2 || '1');
@@ -52,7 +52,7 @@ const BONDING_WATCH_TIMEOUT_MS = Number(process.env.BONDING_WATCH_TIMEOUT_SEC ||
 
 // Time limit before force-exit (seconds).
 // 10 min hold — mover tokens can take 3-8 min to fully pump after initial signal.
-const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '600');
+const BONDING_TIME_LIMIT_SEC = Number(process.env.BONDING_TIME_LIMIT_SEC || '90');
 
 // Stop loss: 10% from entry. Movers either go up fast or dump — no reason to hold losers.
 const BONDING_STOP_PCT = Number(process.env.BONDING_STOP_PCT || '0.10');
@@ -87,7 +87,7 @@ const BONDING_HOT_MAX_MCAP    = Number(process.env.BONDING_HOT_MAX_MCAP_USD || '
 // Movers window: catch tokens 90 seconds to 8 minutes old.
 // Past initial sniper bots (first 60-90s), but before the pump is fully in.
 const BONDING_HOT_MIN_AGE_SEC = Number(process.env.BONDING_HOT_MIN_AGE_SEC || '60');    // 1 min
-const BONDING_HOT_MAX_AGE_SEC = Number(process.env.BONDING_HOT_MAX_AGE_SEC || '1200'); // 20 min
+const BONDING_HOT_MAX_AGE_SEC = Number(process.env.BONDING_HOT_MAX_AGE_SEC || '300');  //  5 min
 
 // NEW token poller — catches tokens 1-14 min old before they become HOT
 // Earlier stage = higher risk, smaller position, tighter limits
@@ -240,46 +240,55 @@ async function sellOnBondingCurve(
   mint: string, pct: number, keypair: Keypair, connection: Connection,
   pool: string = 'pump'
 ): Promise<{ success: boolean; solReceived?: number }> {
-  try {
-    const balBefore = await connection.getBalance(keypair.publicKey).catch(() => 0);
-    const resp = await axios.post(
-      PUMPPORTAL_BUY,
-      { publicKey: keypair.publicKey.toBase58(), action: 'sell', mint,
-        amount: `${pct}%`, denominatedInSol: 'false', slippage: 50, priorityFee: 0.005, pool },
-      { responseType: 'arraybuffer', timeout: 15_000 }
-    );
-    const txBytes = new Uint8Array(resp.data as ArrayBuffer);
-    // Log first bytes to detect error responses vs valid tx
-    if (txBytes.length < 50) {
-      const text = Buffer.from(txBytes).toString('utf8').slice(0, 200);
-      console.warn(`[bonding-scan] Sell response too short (${txBytes.length}b): ${text}`);
-      return { success: false };
-    }
-    const txSignature = await sendPumpTx(txBytes, keypair, connection, true);
-    await connection.confirmTransaction(txSignature, 'confirmed');
-    const balAfter = await connection.getBalance(keypair.publicKey).catch(() => 0);
-    const solReceived = Math.max(0, (balAfter - balBefore) / 1e9);
-    if (solReceived === 0) {
-      console.warn(`[bonding-scan] ⚠️ Sell TX confirmed but 0 SOL received for ${mint.slice(0, 8)} — bonding curve may be graduated/empty`);
-    } else {
-      console.info(`[bonding-scan] 💰 Sold ${pct}% of ${mint.slice(0, 8)} → ${solReceived.toFixed(5)} SOL`);
-    }
+  const SLIPPAGES = [50, 70, 95];
+  for (let attempt = 0; attempt < SLIPPAGES.length; attempt++) {
+    const slippage = SLIPPAGES[attempt];
+    try {
+      const balBefore = await connection.getBalance(keypair.publicKey).catch(() => 0);
+      const resp = await axios.post(
+        PUMPPORTAL_BUY,
+        { publicKey: keypair.publicKey.toBase58(), action: 'sell', mint,
+          amount: `${pct}%`, denominatedInSol: 'false', slippage, priorityFee: 0.005, pool },
+        { responseType: 'arraybuffer', timeout: 15_000 }
+      );
+      const txBytes = new Uint8Array(resp.data as ArrayBuffer);
+      if (txBytes.length < 50) {
+        const text = Buffer.from(txBytes).toString('utf8').slice(0, 200);
+        console.warn(`[bonding-scan] Sell attempt ${attempt + 1} short response (${txBytes.length}b): ${text}`);
+        if (attempt < SLIPPAGES.length - 1) await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
+      const txSignature = await sendPumpTx(txBytes, keypair, connection, true);
+      await connection.confirmTransaction(txSignature, 'confirmed');
+      const balAfter = await connection.getBalance(keypair.publicKey).catch(() => 0);
+      const solReceived = Math.max(0, (balAfter - balBefore) / 1e9);
+      if (solReceived === 0) {
+        console.warn(`[bonding-scan] ⚠️ Sell TX confirmed but 0 SOL for ${mint.slice(0, 8)} (attempt ${attempt + 1})`);
+        if (attempt < SLIPPAGES.length - 1) await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
+      console.info(`[bonding-scan] 💰 Sold ${pct}% of ${mint.slice(0, 8)} → ${solReceived.toFixed(5)} SOL (slippage:${slippage}%)`);
 
-    // Accumulate total_sold_sol on EVERY sell (partial TPs + final)
-    // pct >= 95 → close position (active=false); partial sells keep active=true
-    await query(
-      `UPDATE autobuy_jobs
-       SET total_sold_sol  = COALESCE(total_sold_sol, 0) + $1,
-           active          = CASE WHEN $2 >= 95 THEN false ELSE active END,
-           last_activity_at = now()
-       WHERE mint_address=$3 AND label LIKE 'auto:bonding%' AND active=true`,
-      [solReceived, pct, mint]
-    ).catch(() => {});
-    return { success: true, solReceived };
-  } catch (err: any) {
-    console.warn(`[bonding-scan] Sell failed ${mint.slice(0, 8)}: ${err.message?.slice(0, 120)}`);
-    return { success: false };
+      // Accumulate total_sold_sol on EVERY sell (partial TPs + final)
+      // pct >= 95 → close position (active=false); partial sells keep active=true
+      await query(
+        `UPDATE autobuy_jobs
+         SET total_sold_sol  = COALESCE(total_sold_sol, 0) + $1,
+             active          = CASE WHEN $2 >= 95 THEN false ELSE active END,
+             last_activity_at = now()
+         WHERE mint_address = $3 AND label LIKE 'auto:bonding%'`,
+        [solReceived, pct, mint]
+      ).catch(() => {});
+      return { success: true, solReceived };
+    } catch (err: any) {
+      const msg = err?.response?.data
+        ? Buffer.from(err.response.data as ArrayBuffer).toString('utf8').slice(0, 100)
+        : err.message?.slice(0, 100);
+      console.warn(`[bonding-scan] Sell attempt ${attempt + 1}/${SLIPPAGES.length} failed ${mint.slice(0, 8)} pool:${pool}: ${msg}`);
+      if (attempt < SLIPPAGES.length - 1) await new Promise(r => setTimeout(r, 2000));
+    }
   }
+  return { success: false };
 }
 
 // ─── Watchlist (candidates before entry) ─────────────────────────────────────
@@ -824,15 +833,15 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
         console.debug(`[bonding-scan] ✗mover ${symbol} buys5m:${buys5m} (min 5)`);
         continue;
       }
-      // Need some real volume ($300+) — weeds out micro-trades
-      if (vol5m < 300) {
-        console.debug(`[bonding-scan] ✗mover ${symbol} vol5m:$${vol5m.toFixed(0)} (min $300)`);
+      // Need some real volume ($500+) — weeds out micro-trades
+      if (vol5m < 500) {
+        console.debug(`[bonding-scan] ✗mover ${symbol} vol5m:$${vol5m.toFixed(0)} (min $500)`);
         continue;
       }
-      // MOVERS: price moving SHARPLY upward (5-30%). Under 5% = not a mover yet.
-      // Over 30% = DexScreener lag means the pump is already over.
-      if (pc5m < 5 || pc5m > 30) {
-        console.debug(`[bonding-scan] ✗mover ${symbol} pc5m:${pc5m.toFixed(1)}% (need 5-30%)`);
+      // MOVERS: price moving SHARPLY upward (10-25%). Under 10% = not a mover yet.
+      // Over 25% = DexScreener lag means the pump is already over.
+      if (pc5m < 10 || pc5m > 25) {
+        console.debug(`[bonding-scan] ✗mover ${symbol} pc5m:${pc5m.toFixed(1)}% (need 10-25%)`);
         continue;
       }
       // Buyers must outnumber sellers (momentum confirmation)
@@ -922,6 +931,12 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
           const psResult = await sellOnBondingCurve(mint, 100, keypair, connection, 'pumpswap');
 
           if (!psResult.success || (psResult.solReceived ?? 0) === 0) {
+            // Wait 3s for graduation to settle on PumpSwap before Jupiter attempt
+            await new Promise(r => setTimeout(r, 3000));
+            const psResult2 = await sellOnBondingCurve(mint, 100, keypair, connection, 'pumpswap');
+            if (psResult2.success && (psResult2.solReceived ?? 0) > 0) {
+              console.info(`[bonding-scan] ✅ MOVER ${p.symbol} pumpswap retry sold after graduation`);
+            } else {
             // Attempt 3: Jupiter with W2 keypair (NOT getKeypairFromEnv which returns W1)
             console.warn(`[bonding-scan] ⏱ MOVER ${p.symbol} pumpswap = 0 — trying Jupiter (W2 keypair)`);
             try {
@@ -950,6 +965,7 @@ async function pollHotPumpfunTokens(keypair: Keypair, connection: Connection): P
             } catch (jupErr: any) {
               console.warn(`[bonding-scan] MOVER Jupiter error: ${jupErr.message?.slice(0, 60)}`);
             }
+            } // end else (pumpswap retry failed)
           }
         }
       }, BONDING_TIME_LIMIT_SEC * 1000);
