@@ -228,6 +228,19 @@ function passesPostFilter(t: BscToken): string | null {
 // ─── Main scan cycle ─────────────────────────────────────────────────────────
 const recentScanned = new Set<string>();
 
+// On startup, load recently bought tokens (last 2h) so we don't re-buy after a restart.
+export async function loadBscRecentBuys(): Promise<void> {
+  try {
+    const result = await query<{ contract_address: string }>(
+      `SELECT DISTINCT contract_address FROM bsc_positions WHERE bought_at > NOW() - INTERVAL '2 hours'`
+    );
+    for (const row of result.rows) recentScanned.add(row.contract_address);
+    if (result.rows.length > 0) {
+      console.info(`[bsc-scan] Cooldown: ${result.rows.length} recently bought tokens will be skipped`);
+    }
+  } catch { /* DB not ready yet — scanner will still filter by active positions */ }
+}
+
 export async function runBscScanCycle(): Promise<BscToken[]> {
   const [fourMeme, dex] = await Promise.all([fetchFourMeme(), fetchDexScreenerBsc()]);
 

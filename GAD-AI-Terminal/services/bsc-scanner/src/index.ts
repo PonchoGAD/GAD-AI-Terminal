@@ -1,7 +1,7 @@
 import express from 'express';
 import { query } from '@lib/db';
 import { getBnbBalance, buyBscToken, getBscStatus, checkBscTokenSafety } from '@lib/bsc';
-import { runBscScanCycle, BscToken } from './scanner';
+import { runBscScanCycle, loadBscRecentBuys, BscToken } from './scanner';
 import { startBscMonitor, getBscPositionSummary } from './monitor';
 
 const PORT     = Number(process.env.PORT          || '4006');
@@ -197,5 +197,8 @@ async function runLoop(): Promise<void> {
   await Promise.all(tokens.map(t => handleNewBscToken(t).catch(console.error)));
 }
 
-runLoop().catch(console.error);
-setInterval(() => runLoop().catch(console.error), SCAN_INTERVAL);
+// Load recently bought tokens into cooldown set before first scan
+loadBscRecentBuys().catch(() => {}).then(() => {
+  runLoop().catch(console.error);
+  setInterval(() => runLoop().catch(console.error), SCAN_INTERVAL);
+});
