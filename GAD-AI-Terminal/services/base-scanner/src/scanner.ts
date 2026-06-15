@@ -160,20 +160,24 @@ async function fetchGeckoTerminal(): Promise<BaseToken[]> {
   return tokens;
 }
 
-// DEX IDs we can actually trade on Base (V3 and Aerodrome only)
-// uniswap-v4-base → no pool on V3/Aerodrome → all buys fail → exclude
+// DEX IDs we can actually trade on Base (V3 and Aerodrome V2 only)
+// 'uniswap' = Uniswap V2 on Base — no V3 or Aerodrome pool → buy always fails → exclude
+// 'uniswap-v4-base' = V4 not yet supported → exclude
+// 'aerodrome-cl' = concentrated liquidity (different factory) → our router doesn't find pool → exclude
 const TRADEABLE_DEX_IDS = new Set([
-  'uniswap-v3', 'uniswap-v3-base', 'aerodrome-v2', 'aerodrome', 'uniswap',
-  // 'uniswap-v2' uncomment if needed — Uniswap V2 on Base is rare but exists
+  'uniswap-v3', 'uniswap-v3-base', 'aerodrome-v2', 'aerodrome',
 ]);
 
 // ─── Filter ──────────────────────────────────────────────────────────────────
 function passesFilter(t: BaseToken): string | null {
   if (t.liquidity_usd < MIN_LIQ)            return `liq:$${t.liquidity_usd.toFixed(0)} < $${MIN_LIQ}`;
   if (t.liquidity_usd > MAX_LIQ)            return `liq:$${t.liquidity_usd.toFixed(0)} > $${MAX_LIQ}`;
-  // Skip V4-only tokens — we have no V4 router support; all buys fail and blacklist the token
-  if (t.dex_id === 'uniswap-v4-base' || t.dex_id === 'uniswap-v4') {
-    return `dex:${t.dex_id} (V4 not supported)`;
+  // Only allow DEX IDs we can actually trade (V3 + Aerodrome V2 only)
+  // 'uniswap' = V2 (no V3/Aerodrome pool → buy always fails)
+  // 'uniswap-v4*' = V4 (no router support)
+  // 'aerodrome-cl' = concentrated liquidity (different factory, router fails)
+  if (!TRADEABLE_DEX_IDS.has(t.dex_id)) {
+    return `dex:${t.dex_id} (not supported)`;
   }
   if (t.price_change_1h < MIN_PC1H)         return `pc1h:${t.price_change_1h.toFixed(1)}% < ${MIN_PC1H}%`;
   // Fresh launches (< FRESH_AGE_SEC) use higher cap — first-hour spikes are normal on Base
