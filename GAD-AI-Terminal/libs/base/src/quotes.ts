@@ -11,28 +11,35 @@ export interface QuoteResult {
   priceImpact: number;
 }
 
+// When true: only use Uniswap V3 for auto-buy — skip Aerodrome entirely.
+// Aerodrome can revert on tokens with transfer fees (K invariant broken),
+// causing real TX failures even when staticCall simulation passes.
+const ONLY_UNISWAP_V3 = process.env.BASE_ONLY_UNISWAP_V3 === 'true';
+
 // Get best buy quote: ETH → token
 export async function getBestBuyQuote(
   tokenAddress: string,
   ethAmountWei: bigint,
   slippagePct = 3
 ): Promise<QuoteResult> {
-  const [uniQuote, aeroQuote] = await Promise.allSettled([
-    getUniswapV3Quote(tokenAddress, ethAmountWei, 'buy'),
-    getAerodromeQuote(tokenAddress, ethAmountWei),
-  ]);
+  // Try Uniswap V3 first (preferred: reliable, no transfer-fee issues)
+  const uniQuote = await getUniswapV3Quote(tokenAddress, ethAmountWei, 'buy').catch(() => null);
+  if (uniQuote) {
+    const slippageFactor = BigInt(Math.floor((100 - slippagePct) * 100));
+    uniQuote.amountOutMin = (uniQuote.amountOut * slippageFactor) / 10000n;
+    return uniQuote;
+  }
 
-  const quotes: QuoteResult[] = [];
-  if (uniQuote.status === 'fulfilled') quotes.push(uniQuote.value);
-  if (aeroQuote.status === 'fulfilled') quotes.push(aeroQuote.value);
+  // Skip Aerodrome if BASE_ONLY_UNISWAP_V3=true (safer: no transfer-fee K-invariant reverts)
+  if (ONLY_UNISWAP_V3) {
+    throw new Error('No Uniswap V3 pool found and BASE_ONLY_UNISWAP_V3=true — skipping Aerodrome');
+  }
 
-  if (!quotes.length) throw new Error('No DEX quotes available for ' + tokenAddress);
-
-  // Pick best (highest amountOut)
-  const best = quotes.sort((a, b) => (b.amountOut > a.amountOut ? 1 : -1))[0];
-  const slippageFactor = BigInt(Math.floor((100 - slippagePct) * 100));
-  best.amountOutMin = (best.amountOut * slippageFactor) / 10000n;
-  return best;
+  // Fallback: Aerodrome (use 10% slippage — Aerodrome pools often have higher price impact)
+  const aeroQuote = await getAerodromeQuote(tokenAddress, ethAmountWei);
+  const slippageFactor = BigInt(Math.floor((100 - Math.max(slippagePct, 10)) * 100));
+  aeroQuote.amountOutMin = (aeroQuote.amountOut * slippageFactor) / 10000n;
+  return aeroQuote;
 }
 
 // Get sell quote: token → ETH (with slippage protection for TP sells)
