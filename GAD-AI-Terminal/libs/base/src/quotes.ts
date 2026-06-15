@@ -116,16 +116,18 @@ async function getUniswapV3Quote(
   throw new Error('No Uniswap V3 pool found');
 }
 
-// Aerodrome quote
+// Aerodrome quote — validates that output is non-trivial (> 0.01 ETH equivalent in tokens)
 async function getAerodromeQuote(tokenAddress: string, ethAmountWei: bigint): Promise<QuoteResult> {
   const provider = getProvider();
   const router = new ethers.Contract(ADDRESSES.AERODROME_ROUTER, AERODROME_ROUTER_ABI, provider);
   const routes = [{ from: ADDRESSES.WETH, to: tokenAddress, stable: false, factory: ADDRESSES.AERODROME_FACTORY }];
   const amounts: bigint[] = await router.getAmountsOut(ethAmountWei, routes);
   if (!amounts || amounts.length < 2) throw new Error('Aerodrome: no route');
+  const amountOut = amounts[amounts.length - 1];
+  if (amountOut <= 0n) throw new Error('Aerodrome: zero output (no pool)');
   return {
     dex:          'aerodrome',
-    amountOut:    amounts[amounts.length - 1],
+    amountOut,
     amountOutMin: 0n,
     fee:          0,
     priceImpact:  0,
