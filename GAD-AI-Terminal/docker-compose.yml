@@ -71,6 +71,9 @@ services:
       POSTGRES_HOST: postgres
       REDIS_HOST: redis
       FUTURES_API_URL: "http://futures:4003"
+      BROADCAST_SIGNALS: "${BROADCAST_SIGNALS:-false}"
+      TELEGRAM_CHANNEL_ID: "${TELEGRAM_CHANNEL_ID:-@gadfamilytg}"
+      BROADCAST_INTERVAL_H: "${BROADCAST_INTERVAL_H:-6}"
     depends_on:
       api:
         condition: service_started

@@ -3,6 +3,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
 import { query } from '@lib/db';
 import { runTrendCycle, getTopClusters, getClusterById, getIdeasForCluster, generateCoinIdeas, saveCoinIdea, updateIdeaStatus } from '@lib/trend-engine';
+import { startBroadcaster, broadcastAlphaSignal } from './broadcaster';
 const FUTURES_API = process.env.FUTURES_API_URL || 'http://futures:4003';
 
 dotenv.config();
@@ -1693,6 +1694,18 @@ bot.onText(/^\/rmwallet(?:@\w+)?\s+([1-9A-HJ-NP-Za-km-z]{32,44})$/, (msg, match)
     await send(chatId, `❌ Remove wallet error: ${e.message}`);
   }
 }));
+
+// ─── Admin: manual signal broadcast ──────────────────────────────────────────
+bot.onText(/\/postsignal/, (msg) => {
+  if (String(msg.chat.id) !== String(ADMIN_ID)) return;
+  send(msg.chat.id, '📡 Posting alpha signal to channel...');
+  broadcastAlphaSignal(bot)
+    .then(() => send(msg.chat.id, '✅ Signal posted!'))
+    .catch(e => send(msg.chat.id, `❌ Failed: ${e.message}`));
+});
+
+// ─── Broadcaster — auto-posts top signals to channel ──────────────────────────
+startBroadcaster(bot);
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 bot.on('polling_error', (err) => log('error', 'polling:', err.message));
