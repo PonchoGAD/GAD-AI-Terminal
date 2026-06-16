@@ -5,6 +5,9 @@ export const ADDRESSES = {
   USDC:             '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
   UNISWAP_V3_ROUTER:'0x2626664c2603336E57B271c5C0b26F421741e481',
   UNISWAP_V3_QUOTER:'0x3d4e44Eb1374240CE5F1B136aa68B6a5B9Fe9B54',
+  // Uniswap V2 on Base — used by most meme token launchers (simpler, cheaper to deploy)
+  UNISWAP_V2_ROUTER:'0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24',
+  UNISWAP_V2_FACTORY:'0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6',
   AERODROME_ROUTER: '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43',
   AERODROME_FACTORY:'0x420DD381b31aEf6683db6B902084cB0FFECe40Da',
 };
@@ -22,6 +25,12 @@ export const AERODROME_ROUTER_ABI = [
   'function swapExactETHForTokens(uint256 amountOutMin,(address from,address to,bool stable,address factory)[] routes,address to,uint256 deadline) payable returns (uint256[] amounts)',
   'function swapExactTokensForETH(uint256 amountIn,uint256 amountOutMin,(address from,address to,bool stable,address factory)[] routes,address to,uint256 deadline) returns (uint256[] amounts)',
   'function getAmountsOut(uint256 amountIn,(address from,address to,bool stable,address factory)[] routes) view returns (uint256[] amounts)',
+];
+
+export const UNISWAP_V2_ROUTER_ABI = [
+  'function swapExactETHForTokens(uint256 amountOutMin,address[] path,address to,uint256 deadline) payable returns (uint256[] amounts)',
+  'function swapExactTokensForETH(uint256 amountIn,uint256 amountOutMin,address[] path,address to,uint256 deadline) returns (uint256[] amounts)',
+  'function getAmountsOut(uint256 amountIn,address[] path) view returns (uint256[] amounts)',
 ];
 
 export const ERC20_ABI = [

@@ -78,9 +78,11 @@ async function sellPosition(pos: Position, reason: string, sellPct: number, slip
 
   const ethBalBefore = await getEthBalance();
 
-  // Always sell via same DEX that was used for buying (stored in pos.dex).
-  // This avoids K-invariant reverts when mixing Aerodrome-buy with V3-sell.
-  const sellDex = (pos.dex === 'aerodrome' ? 'aerodrome' : 'uniswap_v3') as 'uniswap_v3' | 'aerodrome';
+  // Always sell via same DEX used for buying (stored in pos.dex) — avoids K-invariant reverts.
+  // pos.dex is stored as 'uniswap_v3' | 'uniswap_v2' | 'aerodrome' from TradeResult.
+  const sellDex = (pos.dex === 'aerodrome' ? 'aerodrome'
+                 : pos.dex === 'uniswap_v2' ? 'uniswap_v2'
+                 : 'uniswap_v3') as 'uniswap_v3' | 'uniswap_v2' | 'aerodrome';
   const result = await sellToken(
     pos.contract_address,
     amountToSell,

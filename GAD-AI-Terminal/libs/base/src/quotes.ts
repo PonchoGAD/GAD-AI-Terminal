@@ -1,10 +1,10 @@
 import { ethers } from 'ethers';
 import axios from 'axios';
 import { getProvider } from './provider';
-import { ADDRESSES, UNISWAP_V3_QUOTER_ABI, AERODROME_ROUTER_ABI, FEE_TIERS } from './contracts';
+import { ADDRESSES, UNISWAP_V3_QUOTER_ABI, UNISWAP_V2_ROUTER_ABI, AERODROME_ROUTER_ABI, FEE_TIERS } from './contracts';
 
 export interface QuoteResult {
-  dex:         'uniswap_v3' | 'aerodrome';
+  dex:         'uniswap_v3' | 'uniswap_v2' | 'aerodrome';
   amountOut:   bigint;
   amountOutMin:bigint; // after slippage
   fee:         number;
@@ -34,8 +34,15 @@ export async function getBestBuyQuote(
     return uniQuote;
   }
 
-  // 2. Fallback: Aerodrome (volatile pool, works for V4 tokens)
-  // Use 12% slippage — Aerodrome pools have higher price impact on thin liquidity
+  // 2. Fallback: Uniswap V2 (most Base meme tokens launch here — cheaper to deploy)
+  const v2Quote = await getUniswapV2Quote(tokenAddress, ethAmountWei).catch(() => null);
+  if (v2Quote) {
+    const sf = BigInt(Math.floor((100 - Math.max(slippagePct, 5)) * 100));
+    v2Quote.amountOutMin = (v2Quote.amountOut * sf) / 10000n;
+    return v2Quote;
+  }
+
+  // 3. Last fallback: Aerodrome (volatile pool, works for V4 tokens)
   const aeroQuote = await getAerodromeQuote(tokenAddress, ethAmountWei);
   const slippageFactor = BigInt(Math.floor((100 - Math.max(slippagePct, 12)) * 100));
   aeroQuote.amountOutMin = (aeroQuote.amountOut * slippageFactor) / 10000n;
@@ -67,6 +74,16 @@ export async function getBestSellQuote(
       return { minEthWei: (expectedEthWei * slippageFactor) / 10000n, expectedEthWei };
     } catch { continue; }
   }
+
+  // Fallback: Uniswap V2 sell quote
+  try {
+    const v2router = new ethers.Contract(ADDRESSES.UNISWAP_V2_ROUTER, UNISWAP_V2_ROUTER_ABI, provider);
+    const amounts: bigint[] = await v2router.getAmountsOut(tokenAmountWei, [tokenAddress, ADDRESSES.WETH]);
+    if (amounts && amounts.length >= 2) {
+      const expectedEthWei = amounts[amounts.length - 1];
+      return { minEthWei: (expectedEthWei * slippageFactor) / 10000n, expectedEthWei };
+    }
+  } catch { }
 
   // Fallback: Aerodrome sell quote
   try {
@@ -114,6 +131,23 @@ async function getUniswapV3Quote(
     } catch { continue; }
   }
   throw new Error('No Uniswap V3 pool found');
+}
+
+// Uniswap V2 quote — used for most Base meme tokens (simpler, no fee tiers)
+async function getUniswapV2Quote(tokenAddress: string, ethAmountWei: bigint): Promise<QuoteResult> {
+  const provider = getProvider();
+  const router   = new ethers.Contract(ADDRESSES.UNISWAP_V2_ROUTER, UNISWAP_V2_ROUTER_ABI, provider);
+  const amounts: bigint[] = await router.getAmountsOut(ethAmountWei, [ADDRESSES.WETH, tokenAddress]);
+  if (!amounts || amounts.length < 2) throw new Error('V2: no route');
+  const amountOut = amounts[amounts.length - 1];
+  if (amountOut <= 0n) throw new Error('V2: zero output (no pool or no liquidity)');
+  return {
+    dex:          'uniswap_v2',
+    amountOut,
+    amountOutMin: 0n,
+    fee:          0,
+    priceImpact:  0,
+  };
 }
 
 // Aerodrome quote — validates that output is non-trivial (> 0.01 ETH equivalent in tokens)

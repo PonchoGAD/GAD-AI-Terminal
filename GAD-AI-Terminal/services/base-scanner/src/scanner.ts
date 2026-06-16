@@ -176,12 +176,15 @@ async function fetchGeckoTerminal(): Promise<BaseToken[]> {
   return tokens;
 }
 
-// DEX IDs we can actually trade on Base (V3 and Aerodrome V2 only)
-// 'uniswap' = Uniswap V2 on Base — no V3 or Aerodrome pool → buy always fails → exclude
-// 'uniswap-v4-base' = V4 not yet supported → exclude
-// 'aerodrome-cl' = concentrated liquidity (different factory) → our router doesn't find pool → exclude
+// DEX IDs we can actually trade on Base.
+// V2: 'uniswap', 'uniswap-v2', 'uniswap-v2-base' — most Base meme tokens launch here
+// V3: 'uniswap-v3', 'uniswap-v3-base' — established tokens, larger liq
+// Aerodrome: 'aerodrome-v2', 'aerodrome' — Base-native DEX, some memes here
+// Excluded: 'uniswap-v4-base' (no router support), 'aerodrome-cl' (different factory), 'sushiswap', 'alien-base'
 const TRADEABLE_DEX_IDS = new Set([
-  'uniswap-v3', 'uniswap-v3-base', 'aerodrome-v2', 'aerodrome',
+  'uniswap', 'uniswap-v2', 'uniswap-v2-base',
+  'uniswap-v3', 'uniswap-v3-base',
+  'aerodrome-v2', 'aerodrome',
 ]);
 
 // ─── Filter ──────────────────────────────────────────────────────────────────

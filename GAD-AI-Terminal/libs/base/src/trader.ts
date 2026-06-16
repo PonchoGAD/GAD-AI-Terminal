@@ -1,6 +1,6 @@
 import { ethers } from 'ethers';
 import { getWallet, getProvider } from './provider';
-import { ADDRESSES, UNISWAP_V3_ROUTER_ABI, AERODROME_ROUTER_ABI, ERC20_ABI } from './contracts';
+import { ADDRESSES, UNISWAP_V3_ROUTER_ABI, UNISWAP_V2_ROUTER_ABI, AERODROME_ROUTER_ABI, ERC20_ABI } from './contracts';
 import { getBestBuyQuote, getBestSellQuote, QuoteResult } from './quotes';
 
 const MAX_SLIPPAGE_PCT = Number(process.env.BASE_MAX_SLIPPAGE_PCT || '3');
@@ -51,13 +51,22 @@ export async function buyToken(
         amountOutMinimum:  quote.amountOutMin,
         sqrtPriceLimitX96: 0n,
       };
-      // Simulate first — catches reverts before wasting gas
       await router.exactInputSingle.staticCall(params, { value: ethAmountWei });
       tx = await router.exactInputSingle(params, { value: ethAmountWei, gasLimit: GAS_LIMIT_BUY });
+    } else if (quote.dex === 'uniswap_v2') {
+      const router   = new ethers.Contract(ADDRESSES.UNISWAP_V2_ROUTER, UNISWAP_V2_ROUTER_ABI, wallet);
+      const path     = [ADDRESSES.WETH, tokenAddress];
+      await router.swapExactETHForTokens.staticCall(quote.amountOutMin, path, wallet.address, deadline, { value: ethAmountWei });
+      tx = await router.swapExactETHForTokens(
+        quote.amountOutMin,
+        path,
+        wallet.address,
+        deadline,
+        { value: ethAmountWei, gasLimit: GAS_LIMIT_BUY }
+      );
     } else {
       const router = new ethers.Contract(ADDRESSES.AERODROME_ROUTER, AERODROME_ROUTER_ABI, wallet);
       const routes = [{ from: ADDRESSES.WETH, to: tokenAddress, stable: false, factory: ADDRESSES.AERODROME_FACTORY }];
-      // Simulate first — Aerodrome reverts often on thin pools
       await router.swapExactETHForTokens.staticCall(quote.amountOutMin, routes, wallet.address, deadline, { value: ethAmountWei });
       tx = await router.swapExactETHForTokens(
         quote.amountOutMin,
@@ -90,14 +99,16 @@ export async function buyToken(
 export async function sellToken(
   tokenAddress: string,
   tokenAmountWei: bigint,
-  dex: 'uniswap_v3' | 'aerodrome',
+  dex: 'uniswap_v3' | 'uniswap_v2' | 'aerodrome',
   feeTier = 3000,
   slippagePct = 0
 ): Promise<TradeResult> {
   const wallet = getWallet();
 
-  // Ensure allowance
-  await ensureAllowance(tokenAddress, dex === 'uniswap_v3' ? ADDRESSES.UNISWAP_V3_ROUTER : ADDRESSES.AERODROME_ROUTER, tokenAmountWei);
+  const spender = dex === 'uniswap_v3' ? ADDRESSES.UNISWAP_V3_ROUTER
+                : dex === 'uniswap_v2' ? ADDRESSES.UNISWAP_V2_ROUTER
+                : ADDRESSES.AERODROME_ROUTER;
+  await ensureAllowance(tokenAddress, spender, tokenAmountWei);
 
   // Compute amountOutMin for slippage protection on TP sells
   let amountOutMin = 0n;
@@ -122,6 +133,16 @@ export async function sellToken(
           amountOutMinimum:  amountOutMin,
           sqrtPriceLimitX96: 0n,
         },
+        { gasLimit: GAS_LIMIT_SELL }
+      );
+    } else if (dex === 'uniswap_v2') {
+      const router = new ethers.Contract(ADDRESSES.UNISWAP_V2_ROUTER, UNISWAP_V2_ROUTER_ABI, wallet);
+      tx = await router.swapExactTokensForETH(
+        tokenAmountWei,
+        amountOutMin,
+        [tokenAddress, ADDRESSES.WETH],
+        wallet.address,
+        deadline,
         { gasLimit: GAS_LIMIT_SELL }
       );
     } else {
