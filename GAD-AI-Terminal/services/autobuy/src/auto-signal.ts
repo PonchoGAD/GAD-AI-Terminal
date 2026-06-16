@@ -429,7 +429,7 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
 
   if (liqUsd <= 80000) return {
     tier: 1, label: 't1',
-    timeLimitSec: 1800,    // 30 min — extended to give stage 2 a chance to fire
+    timeLimitSec: 0,       // disabled — close only via TP or stop-loss
     stopPct: isFear ? 0.10 : 0.08,
     trailPct: 0.20,        // wide trail after stage 1 — gives moon bag room to run
     earlyTrailPct: isFear ? 0.04 : 0.05,
@@ -441,7 +441,7 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
   };
   if (liqUsd <= 250000) return {
     tier: 2, label: 't2',
-    timeLimitSec: 3600,    // 60 min
+    timeLimitSec: 0,       // disabled — close only via TP or stop-loss
     stopPct: isFear ? 0.09 : 0.07,
     trailPct: 0.15,
     earlyTrailPct: isFear ? 0.03 : 0.04,
@@ -453,7 +453,7 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
   };
   return {
     tier: 3, label: 't3',
-    timeLimitSec: 7200,    // 2 h — mid-caps need time
+    timeLimitSec: 0,       // disabled — close only via TP or stop-loss
     stopPct: isFear ? 0.08 : 0.06,
     trailPct: 0.12,
     earlyTrailPct: isFear ? 0.03 : 0.04,
