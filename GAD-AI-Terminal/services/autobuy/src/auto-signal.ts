@@ -861,12 +861,17 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       skipped.hype++; continue;
     }
 
-    // ── Gate 3b: Buy/sell ratio — require net buying pressure, reject wash trading ──
+    // ── Gate 3b: Buy/sell ratio + minimum unique buyers ──
     // If 20%+ more sellers than buyers in the last hour: distribution phase, skip.
     // If ratio >3.5x: wash trading OR pump already peaked (Gaejuki 5.82x then -76%).
-    // Only apply min-ratio when we have real txn data (buys > 0).
+    // Fresh tokens (<6h): require ≥25 buys in 1h — real organic demand, not dev-pumped price.
     const buys1h = (pair.txns?.h1?.buys ?? 0) as number;
     const sells1h = (pair.txns?.h1?.sells ?? 0) as number;
+    const isFreshToken = ageSec >= 0 && ageSec < 6 * 3600;
+    if (isFreshToken && buys1h < 25) {
+      console.debug(`[raydium-scan] ✗buyers ${sym.padEnd(10)} buys1h:${buys1h} age:${(ageSec/3600).toFixed(1)}h (fresh needs ≥25 buys/h)`);
+      skipped.momentum++; continue;
+    }
     if (buys1h > 0 && sells1h > buys1h * 1.2) {
       console.debug(`[raydium-scan] ✗dist ${sym.padEnd(10)} buys:${buys1h} sells:${sells1h} (distribution in 1h)`);
       skipped.momentum++; continue;
