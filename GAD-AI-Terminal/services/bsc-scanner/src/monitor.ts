@@ -4,10 +4,10 @@ import { query } from '@lib/db';
 import { sellBscToken, getBscTokenBalance, getBnbBalance } from '@lib/bsc';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-const STOP_LOSS_PCT   = Number(process.env.BSC_STOP_LOSS_PCT   || '5');    // 5% stop — BSC memes pump fast, dump hard
-const TRAIL_PCT       = Number(process.env.BSC_TRAIL_PCT       || '7');    // 7% trailing stop
+const STOP_LOSS_PCT   = Number(process.env.BSC_STOP_LOSS_PCT   || '15');   // 15% stop — accounts for buy+sell tax friction (~6-10%)
+const TRAIL_PCT       = Number(process.env.BSC_TRAIL_PCT       || '10');   // 10% trailing stop
 const EARLY_TRAIL_PCT = Number(process.env.BSC_EARLY_TRAIL_PCT || '3');    // lock at +3%
-const TIME_LIMIT_SEC  = Number(process.env.BSC_TIME_LIMIT_SEC  || '180');  // 3 min max hold
+const TIME_LIMIT_SEC  = Number(process.env.BSC_TIME_LIMIT_SEC  || '900');  // 15 min max hold (BSC memes need time to develop)
 const POLL_INTERVAL   = Number(process.env.BSC_POLL_INTERVAL_MS || '8000');// 8s poll — BSC 3s blocks
 
 const BSC_TPS = [
@@ -30,6 +30,9 @@ interface BscPosition {
   buy_tax:          number;
   sell_tax:         number;
 }
+
+// Concurrent sell guard — prevents multiple poll cycles from selling simultaneously
+const sellInProgress = new Set<string>();
 
 async function getOpenPositions(): Promise<BscPosition[]> {
   const r = await query<BscPosition>(
@@ -127,6 +130,12 @@ async function sellPosition(pos: BscPosition, reason: string, sellPct: number): 
 }
 
 async function checkPosition(pos: BscPosition): Promise<void> {
+  // Concurrent sell guard — 8s poll + BSC TX latency = multiple cycles can overlap
+  if (sellInProgress.has(pos.id)) {
+    console.debug(`[bsc-monitor] ${pos.symbol} sell in progress — skipping poll`);
+    return;
+  }
+
   const data = await getBscTokenData(pos.contract_address);
   if (!data.priceBnb || data.priceBnb <= 0) return;
 
@@ -149,7 +158,8 @@ async function checkPosition(pos: BscPosition): Promise<void> {
       `[bsc-monitor] 🚨 DUMP ${pos.symbol} sells:${data.sells5m} buys:${data.buys5m} ` +
       `pc5m:${data.pc5m.toFixed(1)}% — emergency exit`
     );
-    await sellPosition(pos, 'DUMP_DETECTED', 100);
+    sellInProgress.add(pos.id);
+    await sellPosition(pos, 'DUMP_DETECTED', 100).finally(() => sellInProgress.delete(pos.id));
     return;
   }
 
@@ -159,31 +169,38 @@ async function checkPosition(pos: BscPosition): Promise<void> {
     ` liq:$${data.liqUsd.toFixed(0)} hold:${holdSec.toFixed(0)}s`
   );
 
-  // Stop loss
-  if (mult <= 1 - STOP_LOSS_PCT / 100) {
-    console.info(`[bsc-monitor] 🔴 STOP ${pos.symbol} ${mult.toFixed(2)}x — selling 100%`);
-    await sellPosition(pos, 'STOP_LOSS', 100);
+  // Stop loss — price-based stop accounts for buy+sell tax so effective BNB loss = STOP_LOSS_PCT
+  // Without this: 5% price stop + 3% buy tax + 3% sell tax = 11% actual BNB loss at trigger
+  const taxFriction = (pos.buy_tax || 0) + (pos.sell_tax || 0);
+  const effectiveStopMult = (1 - STOP_LOSS_PCT / 100) / Math.max(0.5, (1 - taxFriction / 200));
+  if (mult <= effectiveStopMult) {
+    console.info(`[bsc-monitor] 🔴 STOP ${pos.symbol} ${mult.toFixed(3)}x (stop@${effectiveStopMult.toFixed(3)}x tax:${taxFriction.toFixed(1)}%) — selling 100%`);
+    sellInProgress.add(pos.id);
+    await sellPosition(pos, 'STOP_LOSS', 100).finally(() => sellInProgress.delete(pos.id));
     return;
   }
 
   // Time limit
   if (holdSec > TIME_LIMIT_SEC) {
     console.info(`[bsc-monitor] ⏱ TIME_LIMIT ${pos.symbol} ${holdSec.toFixed(0)}s — selling 100%`);
-    await sellPosition(pos, 'TIME_LIMIT', 100);
+    sellInProgress.add(pos.id);
+    await sellPosition(pos, 'TIME_LIMIT', 100).finally(() => sellInProgress.delete(pos.id));
     return;
   }
 
   // Early trailing stop: if price rose > EARLY_TRAIL_PCT then fell below entry — exit
   if (pos.trail_high > entryPrice * (1 + EARLY_TRAIL_PCT / 100) && data.priceBnb < entryPrice) {
     console.info(`[bsc-monitor] 📉 EARLY_TRAIL ${pos.symbol} — was profitable, now below entry`);
-    await sellPosition(pos, 'EARLY_TRAIL', 100);
+    sellInProgress.add(pos.id);
+    await sellPosition(pos, 'EARLY_TRAIL', 100).finally(() => sellInProgress.delete(pos.id));
     return;
   }
 
   // Trailing stop from ATH
   if (pos.trail_high > 0 && data.priceBnb < pos.trail_high * (1 - TRAIL_PCT / 100)) {
     console.info(`[bsc-monitor] 🎯 TRAIL_STOP ${pos.symbol} ${mult.toFixed(2)}x — ATH:${(pos.trail_high/entryPrice).toFixed(2)}x`);
-    await sellPosition(pos, 'TRAIL_STOP', 100);
+    sellInProgress.add(pos.id);
+    await sellPosition(pos, 'TRAIL_STOP', 100).finally(() => sellInProgress.delete(pos.id));
     return;
   }
 
@@ -194,7 +211,8 @@ async function checkPosition(pos: BscPosition): Promise<void> {
     const tp = tps[tpIdx];
     if (mult >= tp.mult) {
       console.info(`[bsc-monitor] 🎯 TP${tpIdx + 1} ${pos.symbol} ${mult.toFixed(2)}x — selling ${tp.sellPct}%`);
-      await sellPosition(pos, `TP${tpIdx + 1}`, tp.sellPct);
+      sellInProgress.add(pos.id);
+      await sellPosition(pos, `TP${tpIdx + 1}`, tp.sellPct).finally(() => sellInProgress.delete(pos.id));
       tpIdx++;
     } else {
       break;

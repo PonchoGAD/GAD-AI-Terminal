@@ -195,6 +195,19 @@ function passesFilter(t: BaseToken): string | null {
 // ─── Main scan cycle ─────────────────────────────────────────────────────────
 const recentScanned = new Set<string>();
 
+// On startup, load recently bought tokens (last 2h) so we don't re-buy after a restart.
+export async function loadBaseRecentBuys(): Promise<void> {
+  try {
+    const result = await query<{ contract_address: string }>(
+      `SELECT DISTINCT contract_address FROM base_positions WHERE bought_at > NOW() - INTERVAL '2 hours'`
+    );
+    for (const row of result.rows) recentScanned.add(row.contract_address);
+    if (result.rows.length > 0) {
+      console.info(`[base-scan] Cooldown: ${result.rows.length} recently bought tokens will be skipped`);
+    }
+  } catch { /* DB not ready yet */ }
+}
+
 export async function runScanCycle(): Promise<BaseToken[]> {
   const [dex, gecko] = await Promise.all([fetchDexScreener(), fetchGeckoTerminal()]);
   const all = dedupeByAddress([...dex, ...gecko]);

@@ -1,7 +1,7 @@
 import express from 'express';
 import { query } from '@lib/db';
 import { getEthBalance, buyToken } from '@lib/base';
-import { runScanCycle, BaseToken } from './scanner';
+import { runScanCycle, loadBaseRecentBuys, BaseToken } from './scanner';
 import { startMonitor, getPositionSummary } from './monitor';
 import { registerMoralisStream, handleMoralisWebhook } from './moralis-stream';
 
@@ -223,8 +223,11 @@ async function runLoop(): Promise<void> {
   await Promise.all(tokens.map(t => handleNewToken(t).catch(console.error)));
 }
 
-runLoop().catch(console.error);
-setInterval(() => runLoop().catch(console.error), SCAN_INTERVAL_MS);
+// Load recently bought tokens into cooldown set before first scan (prevents re-buy after restart)
+loadBaseRecentBuys().catch(() => {}).then(() => {
+  runLoop().catch(console.error);
+  setInterval(() => runLoop().catch(console.error), SCAN_INTERVAL_MS);
+});
 
 // Register Moralis stream (no-op if MORALIS_API_KEY not set)
 registerMoralisStream().catch(console.error);
