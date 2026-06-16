@@ -51,8 +51,10 @@ const MAX_PRICE_CHANGE_1H = Number(process.env.MAX_PRICE_CHANGE_1H || '150');
 // Time limit for positions (seconds) — sell 95% if no activity
 const TIME_LIMIT_SECONDS = Number(process.env.TIME_LIMIT_SECONDS || '1800');
 
-// Jupiter track: established DEXes + PumpSwap (pump.fun graduates go here now)
-const JUPITER_DEX_IDS = ['raydium', 'orca', 'meteora', 'lifinity', 'saber', 'aldrin', 'pumpswap'];
+// Jupiter track: ONLY true Raydium/Orca/Meteora — pumpswap REMOVED.
+// pump.fun graduates to pumpswap NOT raydium — Jupiter buy for pumpswap tokens
+// causes zero-balance errors (0 tokens received). Must go PumpPortal or be skipped.
+const JUPITER_DEX_IDS = ['raydium', 'orca', 'meteora', 'lifinity', 'saber', 'aldrin'];
 // PumpPortal track: pump.fun ecosystem DEXes — routed via pool:"auto"
 const PUMP_DEX_IDS = ['pumpfun', 'pumpswap', 'meteoradbc', 'fluxbeam'];
 const PUMP_PORTAL_ENABLED = process.env.PUMP_PORTAL_ENABLED === 'true';
