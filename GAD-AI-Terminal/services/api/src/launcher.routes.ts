@@ -123,7 +123,11 @@ router.get('/coins/:mint/events', async (req: Request, res: Response) => {
 // Creates a coin_idea in DB + notifies admin via Telegram
 router.post('/submit', async (req: Request, res: Response) => {
   try {
-    const { name, ticker, description, imageB64, imageName, imageType, devBuySol, w2BuySol, w3BuySol } = req.body;
+    const { name, ticker, description, imageB64, imageName, imageType, devBuySol, w2BuySol, w3BuySol, chain } = req.body;
+    const chainUpper = (chain ?? 'SOLANA').toUpperCase();
+    const chainUnit  = chainUpper === 'BSC' ? 'BNB' : chainUpper === 'BASE' ? 'ETH' : 'SOL';
+    const platform   = chainUpper === 'BSC' ? '4meme.fun' : chainUpper === 'BASE' ? 'clank.fun' : 'pump.fun';
+
     if (!name || !ticker || !description) {
       return res.status(400).json({ error: 'name, ticker, description required' });
     }
@@ -143,7 +147,7 @@ router.post('/submit', async (req: Request, res: Response) => {
       ticker.toUpperCase().slice(0, 8),
       name.slice(0, 100),
       description.slice(0, 500),
-      JSON.stringify({ imageB64, imageName, imageType, devBuySol, w2BuySol, w3BuySol }),
+      JSON.stringify({ imageB64, imageName, imageType, devBuySol, w2BuySol, w3BuySol, chain: chainUpper }),
     ]);
 
     const ideaId = rows[0].id;
@@ -152,12 +156,16 @@ router.post('/submit', async (req: Request, res: Response) => {
     const botToken = process.env.TELEGRAM_BOT_TOKEN;
     const adminId  = process.env.TELEGRAM_ADMIN_CHAT_ID;
     if (botToken && adminId) {
+      const chainEmoji = chainUpper === 'BSC' ? '🟡' : chainUpper === 'BASE' ? '🔵' : '🟣';
       const msg =
-        `🆕 *New Token Submission from Website*\n\n` +
+        `🆕 *New Token Submission — ${chainEmoji} ${chainUpper}*\n\n` +
         `*${ticker.toUpperCase()}* — ${name}\n` +
         `"${description.slice(0, 150)}..."\n\n` +
-        `Dev: ${devBuySol} SOL | W2: ${w2BuySol} SOL | W3: ${w3BuySol} SOL\n\n` +
-        `Launch: \`/auto_launch ${ideaId}\``;
+        `Platform: ${platform}\n` +
+        `Dev: ${devBuySol} ${chainUnit} | W2: ${w2BuySol} ${chainUnit} | W3: ${w3BuySol} ${chainUnit}\n\n` +
+        (chainUpper === 'SOLANA'
+          ? `Launch: \`/auto_launch ${ideaId}\``
+          : `Chain: ${chainUpper} — launch manually on ${platform}, then confirm in bot`);
       fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
