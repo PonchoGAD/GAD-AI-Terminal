@@ -432,10 +432,10 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
     timeLimitSec: 0,       // disabled — close only via TP or stop-loss
     stopPct: isFear ? 0.10 : 0.08,
     trailPct: 0.20,        // wide trail after stage 1 — gives moon bag room to run
-    earlyTrailPct: isFear ? 0.04 : 0.05,
+    earlyTrailPct: isFear ? 0.03 : 0.04,  // tighter trail = keep more of the gain
     sellStages: [
-      { stage: 1, multiplier: isBull ? 2.00 : isFear ? 1.45 : 1.65, sellPct: 60 },  // lock 60%
-      { stage: 2, multiplier: isBull ? 4.00 : isFear ? 2.50 : 3.00, sellPct: 90 },  // sell 90% of remaining 40% = 36% total
+      { stage: 1, multiplier: isBull ? 2.30 : isFear ? 1.65 : 1.80, sellPct: 60 },  // raised: FEAR 1.45→1.65, NEUTRAL 1.65→1.80, BULL 2.00→2.30
+      { stage: 2, multiplier: isBull ? 5.00 : isFear ? 3.50 : 4.00, sellPct: 90 },  // raised: bigger 2nd take
       { stage: 3, multiplier: 999, sellPct: 100 },  // ~4% moon bag — exits via trailing stop
     ],
   };
@@ -446,8 +446,8 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
     trailPct: 0.15,
     earlyTrailPct: isFear ? 0.03 : 0.04,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.65 : isFear ? 1.28 : 1.42, sellPct: 60 },
-      { stage: 2, multiplier: isBull ? 2.80 : isFear ? 1.90 : 2.30, sellPct: 90 },
+      { stage: 1, multiplier: isBull ? 1.80 : isFear ? 1.45 : 1.60, sellPct: 60 },
+      { stage: 2, multiplier: isBull ? 3.20 : isFear ? 2.50 : 3.00, sellPct: 90 },
       { stage: 3, multiplier: 999, sellPct: 100 },
     ],
   };
@@ -458,8 +458,8 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
     trailPct: 0.12,
     earlyTrailPct: isFear ? 0.03 : 0.04,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.45 : isFear ? 1.20 : 1.30, sellPct: 60 },
-      { stage: 2, multiplier: isBull ? 2.20 : isFear ? 1.60 : 1.85, sellPct: 90 },
+      { stage: 1, multiplier: isBull ? 1.55 : isFear ? 1.30 : 1.42, sellPct: 60 },
+      { stage: 2, multiplier: isBull ? 2.50 : isFear ? 1.90 : 2.20, sellPct: 90 },
       { stage: 3, multiplier: 999, sellPct: 100 },
     ],
   };
