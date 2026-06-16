@@ -864,12 +864,17 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     // ── Gate 3b: Buy/sell ratio + minimum unique buyers ──
     // If 20%+ more sellers than buyers in the last hour: distribution phase, skip.
     // If ratio >3.5x: wash trading OR pump already peaked (Gaejuki 5.82x then -76%).
-    // Fresh tokens (<6h): require ≥25 buys in 1h — real organic demand, not dev-pumped price.
+    // Fresh tokens (<6h): require ≥40 buys in 1h — real organic demand, not dev-pumped price.
+    // High-liq fresh tokens ($40k+, <6h): require ≥1h age — inflated liq is a common rug setup.
     const buys1h = (pair.txns?.h1?.buys ?? 0) as number;
     const sells1h = (pair.txns?.h1?.sells ?? 0) as number;
     const isFreshToken = ageSec >= 0 && ageSec < 6 * 3600;
-    if (isFreshToken && buys1h < 25) {
-      console.debug(`[raydium-scan] ✗buyers ${sym.padEnd(10)} buys1h:${buys1h} age:${(ageSec/3600).toFixed(1)}h (fresh needs ≥25 buys/h)`);
+    if (isFreshToken && liq >= 40000 && ageSec >= 0 && ageSec < 3600) {
+      console.debug(`[raydium-scan] ✗hiLiqFresh ${sym.padEnd(10)} liq:$${liq.toFixed(0)} age:${(ageSec/60).toFixed(0)}min (≥$40k fresh needs ≥60min)`);
+      skipped.age++; continue;
+    }
+    if (isFreshToken && buys1h < 40) {
+      console.debug(`[raydium-scan] ✗buyers ${sym.padEnd(10)} buys1h:${buys1h} age:${(ageSec/3600).toFixed(1)}h (fresh needs ≥40 buys/h)`);
       skipped.momentum++; continue;
     }
     if (buys1h > 0 && sells1h > buys1h * 1.2) {
