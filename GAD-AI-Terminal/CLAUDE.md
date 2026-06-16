@@ -136,6 +136,7 @@ console.warn('[sell] ...')
 - [x] **CRITICAL FIX (июнь 2026):** Entry price unit mismatch — был SOL/base-unit, стал SOL/readable-token
 - [x] Raydium DexScreener multi-source (5 источников: profiles, boosts, top-boosts, 8 queries, Birdeye)
 - [x] Filter calibration из 72h анализа pump.fun winners: min_liq 22k, max B/S ratio 3.5x, vol/liq 8%
+- [x] **Rug filters tightened (16.06.2026):** buys1h 25→40 for fresh tokens (<6h), + min 1h age for liq≥$40k fresh tokens
 - [x] Trend-to-MemeCoin Engine: migration 011, libs/trend-engine, telegram /trends commands
 - [x] Landing: мультилокаль (en/ru), pricing, payment form, API proxy
 - [x] Docker Compose: все сервисы + postgres + redis + `restart: unless-stopped`
