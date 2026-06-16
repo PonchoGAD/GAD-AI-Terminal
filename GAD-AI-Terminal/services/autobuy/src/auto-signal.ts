@@ -414,49 +414,51 @@ export interface LiqTier {
 }
 
 export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
-  // TP strategy by market regime:
-  // FEAR/EXTREME_FEAR: 1.20x TP (memes barely move, capture 15-20% and run)
-  // NEUTRAL:           1.30x TP (moderate targets, balanced)
-  // BULL/EUPHORIA:     1.50x TP (big moves, let winners run)
+  // TP strategy — 2 real stages + moon bag:
+  //   Stage 1: lock 60% at moderate TP (avoids giving back gains)
+  //   Stage 2: let 40% run to higher TP (captures moonshots)
+  //   Stage 3 (999x): ~4% moon bag, exits via trailing stop or time limit
   //
-  // earlyTrailPct (3-5%): fires BEFORE TP — sells when peak drops this % from high.
-  // This is the mechanism that captured +7.9% in the best real trade (June 2026 data).
-  // It fires SOONER than TP, so TP is a backstop for coins that just blast up.
+  // earlyTrailPct: fires BEFORE stage 1 TP — sells 100% when peak drops this % from ATH.
+  // Only fires when trail price > entry × 1.10 (guarantees real profit after fees).
   const r = regime.toUpperCase();
   const isFear = r === 'FEAR' || r === 'EXTREME_FEAR';
   const isBull = r === 'BULL' || r === 'EUPHORIA';
 
   if (liqUsd <= 80000) return {
     tier: 1, label: 't1',
-    timeLimitSec: 1200,    // 20 min — thin pools move fast, don't hold stale positions
-    stopPct: isFear ? 0.10 : 0.08,   // wider stop in fear (more volatility noise)
-    trailPct: 0.10,
-    earlyTrailPct: isFear ? 0.03 : 0.04,   // tighter early trail = lock gains sooner
+    timeLimitSec: 1800,    // 30 min — extended to give stage 2 a chance to fire
+    stopPct: isFear ? 0.10 : 0.08,
+    trailPct: 0.20,        // wide trail after stage 1 — gives moon bag room to run
+    earlyTrailPct: isFear ? 0.04 : 0.05,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.55 : isFear ? 1.18 : 1.30, sellPct: 90 },
-      { stage: 2, multiplier: 9999, sellPct: 100 },  // moon bag placeholder — managed by floor/trail
+      { stage: 1, multiplier: isBull ? 2.00 : isFear ? 1.45 : 1.65, sellPct: 60 },  // lock 60%
+      { stage: 2, multiplier: isBull ? 4.00 : isFear ? 2.50 : 3.00, sellPct: 90 },  // sell 90% of remaining 40% = 36% total
+      { stage: 3, multiplier: 999, sellPct: 100 },  // ~4% moon bag — exits via trailing stop
     ],
   };
   if (liqUsd <= 250000) return {
     tier: 2, label: 't2',
-    timeLimitSec: 2400,    // 40 min
+    timeLimitSec: 3600,    // 60 min
     stopPct: isFear ? 0.09 : 0.07,
-    trailPct: 0.09,
+    trailPct: 0.15,
     earlyTrailPct: isFear ? 0.03 : 0.04,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.45 : isFear ? 1.15 : 1.28, sellPct: 90 },
-      { stage: 2, multiplier: 9999, sellPct: 100 },  // moon bag placeholder
+      { stage: 1, multiplier: isBull ? 1.65 : isFear ? 1.28 : 1.42, sellPct: 60 },
+      { stage: 2, multiplier: isBull ? 2.80 : isFear ? 1.90 : 2.30, sellPct: 90 },
+      { stage: 3, multiplier: 999, sellPct: 100 },
     ],
   };
   return {
     tier: 3, label: 't3',
-    timeLimitSec: 3600,    // 60 min — mid-caps need more time
+    timeLimitSec: 7200,    // 2 h — mid-caps need time
     stopPct: isFear ? 0.08 : 0.06,
-    trailPct: 0.08,
+    trailPct: 0.12,
     earlyTrailPct: isFear ? 0.03 : 0.04,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.38 : isFear ? 1.12 : 1.25, sellPct: 90 },
-      { stage: 2, multiplier: 9999, sellPct: 100 },  // moon bag placeholder
+      { stage: 1, multiplier: isBull ? 1.45 : isFear ? 1.20 : 1.30, sellPct: 60 },
+      { stage: 2, multiplier: isBull ? 2.20 : isFear ? 1.60 : 1.85, sellPct: 90 },
+      { stage: 3, multiplier: 999, sellPct: 100 },
     ],
   };
 }

@@ -821,9 +821,8 @@ async function checkAndExecuteSells(walletAddress: string) {
           `tx:${sellResult.txSignature}`
         );
 
-        // After stage 1 (90% TP), record floor for moon bag protection
-        // stage 2 (multiplier=9999) is the moon bag placeholder — skip normal path for it
-        if (stage.stage_number === 1 && stage.sell_percent >= 85 && stage.trigger_mult < 50 && refEntry > 0) {
+        // After stage 1 (60% TP), record floor for moon bag protection
+        if (stage.stage_number === 1 && stage.sell_percent >= 55 && stage.trigger_mult < 50 && refEntry > 0) {
           const tpFloor = refEntry * stage.trigger_mult;
           moonbagFloorMap.set(stage.autobuy_job_id, tpFloor);
           console.info(`[autosell] 🌙 Moon bag active — floor set at ${tpFloor.toExponential(4)} SOL/tok for ${mint.slice(0,8)} (10% rides, floor at TP price)`);
