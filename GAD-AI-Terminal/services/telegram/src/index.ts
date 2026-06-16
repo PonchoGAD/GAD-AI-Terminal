@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
+import { query } from '@lib/db';
 import { runTrendCycle, getTopClusters, getClusterById, getIdeasForCluster, generateCoinIdeas, saveCoinIdea, updateIdeaStatus } from '@lib/trend-engine';
 const FUTURES_API = process.env.FUTURES_API_URL || 'http://futures:4003';
 
@@ -1622,6 +1623,76 @@ bot.on('photo', async (msg) => {
     await send(chatId, `❌ Error during launch: ${e.message}`);
   }
 });
+
+// ─── Copy-Trading Commands ───────────────────────────────────────────────────
+
+// /copywallets — list copy-trading wallets + stats
+bot.onText(/^\/copywallets(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const r = await query<any>(
+      `SELECT address, label, enabled, win_rate, total_copies, last_copy_at
+       FROM copy_wallets ORDER BY total_copies DESC`
+    );
+    if (!r.rows.length) {
+      return send(chatId,
+        '📋 *COPY WALLETS*\n\nNo wallets tracked yet.\n\n' +
+        'Add one:\n`/addwallet <sol_address> <label>`'
+      );
+    }
+    const lines = ['📋 *COPY WALLETS*', ''];
+    for (const w of r.rows) {
+      const status = w.enabled ? '🟢' : '🔴';
+      const wr     = w.win_rate > 0 ? ` WR:${(w.win_rate * 100).toFixed(0)}%` : '';
+      const copies = w.total_copies > 0 ? ` copies:${w.total_copies}` : '';
+      const last   = w.last_copy_at ? ` last:${new Date(w.last_copy_at).toLocaleDateString()}` : '';
+      lines.push(`${status} *${w.label}*${wr}${copies}${last}`);
+      lines.push(`  \`${w.address}\``);
+    }
+    lines.push('');
+    lines.push('`/addwallet <addr> <label>` | `/rmwallet <addr>`');
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ Copy wallets error: ${e.message}`);
+  }
+}));
+
+// /addwallet <address> <label> — add wallet to copy-trade list
+bot.onText(/^\/addwallet(?:@\w+)?\s+([1-9A-HJ-NP-Za-km-z]{32,44})\s+(.+)$/, (msg, match) => guard(msg.chat.id, async () => {
+  if (!isAdmin(msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  const address = match![1].trim();
+  const label   = match![2].trim().slice(0, 32);
+  try {
+    await query(
+      `INSERT INTO copy_wallets (address, label)
+       VALUES ($1, $2)
+       ON CONFLICT (address) DO UPDATE SET label=$2, enabled=true, updated_at=NOW()`,
+      [address, label]
+    );
+    await send(chatId, `✅ Added *${label}* to copy-trade list.\n\`${address}\`\n\n_Will start copying new buys._`);
+  } catch (e: any) {
+    await send(chatId, `❌ Add wallet error: ${e.message}`);
+  }
+}));
+
+// /rmwallet <address> — disable wallet from copy-trade list
+bot.onText(/^\/rmwallet(?:@\w+)?\s+([1-9A-HJ-NP-Za-km-z]{32,44})$/, (msg, match) => guard(msg.chat.id, async () => {
+  if (!isAdmin(msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  const address = match![1].trim();
+  try {
+    const r = await query(
+      `UPDATE copy_wallets SET enabled=false, updated_at=NOW() WHERE address=$1 RETURNING label`,
+      [address]
+    );
+    const label = r.rows[0]?.label ?? address.slice(0, 8);
+    await send(chatId, `🔴 Disabled *${label}* — no longer copying trades.`);
+  } catch (e: any) {
+    await send(chatId, `❌ Remove wallet error: ${e.message}`);
+  }
+}));
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 bot.on('polling_error', (err) => log('error', 'polling:', err.message));

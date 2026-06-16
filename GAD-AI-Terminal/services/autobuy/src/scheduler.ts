@@ -12,6 +12,7 @@ import { PublicKey } from '@solana/web3.js';
 import { processAutoSignals, processRaydiumOpportunities, AUTO_BUY_ENABLED, getLiqTier } from './auto-signal';
 import { startGraduationScanner } from './graduation-scanner';
 import { startBondingScanner } from './bonding-scanner';
+import { startCopyTrader } from './copy-trader';
 
 const POLL_MS    = Number(process.env.AUTOBUY_POLL_SECONDS  || '15') * 1000;
 const MAX_ERRORS = Number(process.env.AUTOBUY_MAX_ERRORS    || '5');
@@ -1005,6 +1006,7 @@ export async function startAutobuyScheduler() {
   process.on('SIGTERM', () => { shouldStop = true; });
 
   const keypair = getKeypairFromEnv();
+  const connection = getConnection();
   const walletAddress = keypair?.publicKey.toBase58() ?? '';
 
   // Start real-time graduation scanner (WebSocket — sub-second latency for pump.fun graduates)
@@ -1012,6 +1014,13 @@ export async function startAutobuyScheduler() {
 
   // Start bonding curve scanner — buys tokens BEFORE graduation using PUMPFUN_WALLET
   startBondingScanner();
+
+  // Start copy-trader — mirrors buys from curated profitable wallets via Helius
+  if (keypair) {
+    startCopyTrader(keypair, connection).catch(e =>
+      console.error('[autobuy] Copy-trader start error:', e.message)
+    );
+  }
 
   // ─── Fast sell loop — checks every 1 second for TP/SL hits ───────────────
   // The main poll loop runs every 5s (including raydium scan). Memecoins pump and

@@ -97,6 +97,13 @@ services:
     environment:
       POSTGRES_HOST: postgres
       REDIS_HOST: redis
+      COPY_TRADE_ENABLED: "${COPY_TRADE_ENABLED:-false}"
+      COPY_TRADE_SOL: "${COPY_TRADE_SOL:-0.03}"
+      COPY_MAX_POSITIONS: "${COPY_MAX_POSITIONS:-5}"
+      COPY_MIN_LIQ_USD: "${COPY_MIN_LIQ_USD:-20000}"
+      COPY_DAILY_MAX_SOL: "${COPY_DAILY_MAX_SOL:-0.3}"
+      COPY_POLL_SEC: "${COPY_POLL_SEC:-5}"
+      COPY_MIN_WALLET_SOL: "${COPY_MIN_WALLET_SOL:-0.05}"
     depends_on:
       api:
         condition: service_started

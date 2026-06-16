@@ -120,43 +120,59 @@ function mapDexPair(p: any): BaseToken | null {
 }
 
 // ─── GeckoTerminal ───────────────────────────────────────────────────────────
+function mapGeckoPool(pool: any, dexOverride?: string): BaseToken | null {
+  const attrs      = pool.attributes ?? {};
+  const baseToken  = pool.relationships?.base_token?.data?.id ?? '';
+  const addr       = baseToken.replace('base_', '');
+  if (!addr) return null;
+  const createdAt  = attrs.pool_created_at
+    ? (Date.now() - new Date(attrs.pool_created_at).getTime()) / 1000 : 0;
+  return {
+    contract_address: addr.toLowerCase(),
+    symbol:           attrs.name?.split('/')[0] ?? '',
+    name:             attrs.name ?? '',
+    pair_address:     attrs.address ?? '',
+    dex_id:           dexOverride ?? (pool.relationships?.dex?.data?.id ?? 'unknown'),
+    liquidity_usd:    Math.max(0, Number(attrs.reserve_in_usd ?? 0)),
+    volume_1h:        Math.max(0, Number(attrs.volume_usd?.h1 ?? 0)),
+    volume_24h:       Math.max(0, Number(attrs.volume_usd?.h24 ?? 0)),
+    price_change_1h:  Number(attrs.price_change_percentage?.h1 ?? 0),
+    price_change_5m:  Number(attrs.price_change_percentage?.m5 ?? 0),
+    price_eth:        Number(attrs.base_token_price_native_currency ?? 0),
+    mcap_usd:         Math.max(0, Number(attrs.market_cap_usd ?? 0)),
+    holders:          0,
+    age_sec:          Math.max(0, createdAt),
+    buy_sell_ratio:   Number(attrs.transactions?.h1?.buys ?? 1) / Math.max(1, Number(attrs.transactions?.h1?.sells ?? 1)),
+    txns_h1_buys:     Number(attrs.transactions?.h1?.buys ?? 0),
+    is_verified:      false,
+    lp_locked:        false,
+    safe_score:       50,
+  };
+}
+
 async function fetchGeckoTerminal(): Promise<BaseToken[]> {
   const tokens: BaseToken[] = [];
-  try {
-    const r = await axios.get(
-      'https://api.geckoterminal.com/api/v2/networks/base/new_pools?page=1',
-      { timeout: 8000, headers: { Accept: 'application/json;version=20230302' } }
-    );
-    const pools: any[] = r.data?.data ?? [];
-    for (const pool of pools) {
-      const attrs = pool.attributes ?? {};
-      const baseToken = pool.relationships?.base_token?.data?.id ?? '';
-      const addr = baseToken.replace('base_', '');
-      if (!addr) continue;
-      const createdAt = attrs.pool_created_at ? (Date.now() - new Date(attrs.pool_created_at).getTime()) / 1000 : 0;
-      tokens.push({
-        contract_address: addr.toLowerCase(),
-        symbol:           attrs.name?.split('/')[0] ?? '',
-        name:             attrs.name ?? '',
-        pair_address:     attrs.address ?? '',
-        dex_id:           pool.relationships?.dex?.data?.id ?? 'unknown',
-        liquidity_usd:    Math.max(0, Number(attrs.reserve_in_usd ?? 0)),
-        volume_1h:        Math.max(0, Number(attrs.volume_usd?.h1 ?? 0)),
-        volume_24h:       Math.max(0, Number(attrs.volume_usd?.h24 ?? 0)),
-        price_change_1h:  Number(attrs.price_change_percentage?.h1 ?? 0),
-        price_change_5m:  Number(attrs.price_change_percentage?.m5 ?? 0),
-        price_eth:        Number(attrs.base_token_price_native_currency ?? 0),
-        mcap_usd:         Math.max(0, Number(attrs.market_cap_usd ?? 0)),
-        holders:          0,
-        age_sec:          Math.max(0, createdAt),
-        buy_sell_ratio:   Number(attrs.transactions?.h1?.buys ?? 1) / Math.max(1, Number(attrs.transactions?.h1?.sells ?? 1)),
-        txns_h1_buys:     Number(attrs.transactions?.h1?.buys ?? 0),
-        is_verified:      false,
-        lp_locked:        false,
-        safe_score:       50,
-      });
-    }
-  } catch { }
+  const GECKO_HEADERS = { Accept: 'application/json;version=20230302' };
+
+  // DEX-specific endpoints — these return ONLY V3 or Aerodrome pools (tradeable by our router)
+  const dexEndpoints: Array<{ url: string; dexId: string }> = [
+    { url: 'https://api.geckoterminal.com/api/v2/networks/base/dexes/uniswap-v3/pools?page=1', dexId: 'uniswap-v3' },
+    { url: 'https://api.geckoterminal.com/api/v2/networks/base/dexes/uniswap-v3/pools?page=2', dexId: 'uniswap-v3' },
+    { url: 'https://api.geckoterminal.com/api/v2/networks/base/dexes/aerodrome-v2/pools?page=1', dexId: 'aerodrome-v2' },
+    { url: 'https://api.geckoterminal.com/api/v2/networks/base/new_pools?page=1', dexId: '' },
+  ];
+
+  for (const endpoint of dexEndpoints) {
+    try {
+      const r = await axios.get(endpoint.url, { timeout: 8_000, headers: GECKO_HEADERS });
+      const pools: any[] = r.data?.data ?? [];
+      for (const pool of pools) {
+        const t = mapGeckoPool(pool, endpoint.dexId || undefined);
+        if (t) tokens.push(t);
+      }
+    } catch { }
+  }
+
   return tokens;
 }
 
