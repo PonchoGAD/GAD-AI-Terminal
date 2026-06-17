@@ -62,7 +62,9 @@ function mapDexPair(p: any): BscToken | null {
     price_change_24h: Number(p.priceChange?.h24 ?? 0),
     price_change_5m:  Number(p.priceChange?.m5  ?? 0),
     price_bnb:        Number(p.priceNative       ?? 0),
-    mcap_usd:         Math.max(0, Number(p.fdv ?? p.marketCap ?? 0)),
+    // Use marketCap (circulating) first, not FDV — FDV can be 3-10x circulating for BSC tokens.
+    // FDV-based mcap filter passes tokens with tiny circulating supply that fail the $20M threshold.
+    mcap_usd:         Math.max(0, Number(p.marketCap ?? p.fdv ?? 0)),
     age_sec:          Math.max(0, createdAt),
     buy_sell_ratio:   Number(p.txns?.h1?.buys ?? 1) / Math.max(1, Number(p.txns?.h1?.sells ?? 1)),
     txns_h1_buys:     Number(p.txns?.h1?.buys ?? 0),
@@ -248,14 +250,18 @@ export async function runBscScanCycle(): Promise<BscToken[]> {
       `liq:$${(token.liquidity_usd/1000).toFixed(0)}k`
     );
 
-    // Safety check: honeypot.is + GoPlus
+    // Safety check: honeypot.is + GoPlus — FAIL-CLOSED: if API unavailable, skip token.
+    // Bug fix: previous code defaulted safe_score=50 (pass) when safety API failed.
+    // Now: failed safety check = rejected, not silently passed.
     const safety = await checkBscTokenSafety(token.contract_address).catch(() => null);
-    if (safety) {
-      token.is_honeypot = safety.is_honeypot;
-      token.buy_tax     = safety.buy_tax;
-      token.sell_tax    = safety.sell_tax;
-      token.safe_score  = safety.safe_score;
+    if (!safety) {
+      console.info(`[bsc-scan] ✗safe ${token.symbol} — safety API unavailable, skipping (fail-closed)`);
+      continue;
     }
+    token.is_honeypot = safety.is_honeypot;
+    token.buy_tax     = safety.buy_tax;
+    token.sell_tax    = safety.sell_tax;
+    token.safe_score  = safety.safe_score;
 
     const safetyReason = passesSafetyFilter(token);
     if (safetyReason) {

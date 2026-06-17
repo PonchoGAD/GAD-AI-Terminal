@@ -434,8 +434,8 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
     trailPct: 0.20,        // wide trail after stage 1 — gives moon bag room to run
     earlyTrailPct: isFear ? 0.03 : 0.04,  // tighter trail = keep more of the gain
     sellStages: [
-      { stage: 1, multiplier: isBull ? 2.30 : isFear ? 1.65 : 1.80, sellPct: 60 },  // raised: FEAR 1.45→1.65, NEUTRAL 1.65→1.80, BULL 2.00→2.30
-      { stage: 2, multiplier: isBull ? 5.00 : isFear ? 3.50 : 4.00, sellPct: 90 },  // raised: bigger 2nd take
+      { stage: 1, multiplier: isBull ? 1.80 : isFear ? 1.50 : 1.40, sellPct: 70 },  // lowered: NEUTRAL 1.80→1.40 — achievable for 70% position, FEAR 1.65→1.50
+      { stage: 2, multiplier: isBull ? 3.50 : isFear ? 2.50 : 2.50, sellPct: 90 },  // T1 stage2: 4.00→2.50 — realistic for pump.fun graduates
       { stage: 3, multiplier: 999, sellPct: 100 },  // ~4% moon bag — exits via trailing stop
     ],
   };
@@ -864,8 +864,12 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     }
 
     // ── Gate 3: momentum ──
-    // Skip pc5m check when vol5m=0 (GeckoTerminal source has no m5 data).
-    // pc1h and pc6h are always available.
+    // Skip pc5m check when vol5m=0 (GeckoTerminal / direct Raydium endpoint with no m5 data).
+    // No 5m data = no current signal — require stronger 1h momentum to compensate.
+    if (vol5m === 0 && pc1h < 5) {
+      console.debug(`[raydium-scan] ✗no5m ${sym.padEnd(10)} no 5m data + pc1h only ${pc1h.toFixed(1)}% (need ≥5%)`);
+      skipped.momentum++; continue;
+    }
     if (vol5m > 0 && pc5m < RAYDIUM_MIN_PC5M) {
       console.debug(`[raydium-scan] ✗mom  ${sym.padEnd(10)} pc5m:${pc5m.toFixed(1)}% liq:$${liq.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
       skipped.momentum++; continue;
@@ -929,7 +933,12 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       console.debug(`[raydium-scan] ✗ratio ${sym.padEnd(10)} vol/liq:${(vol1h/liq*100).toFixed(1)}% vol1h:$${vol1h.toFixed(0)} liq:$${liq.toFixed(0)}`);
       skipped.vol++; continue;
     }
-    if (vol5m > 0 && vol1h > 0 && vol5m * 12 < vol1h * 0.25) { skipped.vol++; continue; }
+    // Vol acceleration: current 5m rate must be ≥40% of 1h average (was 25% — too loose).
+    // Prevents buying tokens where volume is tapering off (early dump detection).
+    if (vol5m > 0 && vol1h > 0 && vol5m * 12 < vol1h * 0.40) {
+      console.debug(`[raydium-scan] ✗vaccel ${sym.padEnd(10)} vol5m*12:$${(vol5m*12).toFixed(0)} < vol1h*40%:$${(vol1h*0.40).toFixed(0)} (tapering)`);
+      skipped.vol++; continue;
+    }
 
     if (await recentlyBought(mint)) { skipped.cooldown++; continue; }
     if (await previouslyLost(mint)) { skipped.cooldown++; console.debug(`[raydium-scan] ♻️ Skip ${mint.slice(0,8)} — previously lost on this token (7-day blacklist)`); continue; }

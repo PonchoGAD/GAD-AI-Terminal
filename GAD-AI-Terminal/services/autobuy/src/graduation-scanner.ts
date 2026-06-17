@@ -151,6 +151,17 @@ async function processGraduate(mint: string): Promise<void> {
       console.info(`[grad-scan] ✗dump ${sym.padEnd(10)} pc5m:${pc5m.toFixed(1)}% — dumping at open`);
       return;
     }
+    // Sellers dominating = distribution, not recovery. Skip even if buys5m looks ok.
+    if (sells5m > buys5m * 1.5) {
+      console.info(`[grad-scan] ✗dist ${sym.padEnd(10)} buys5m:${buys5m} sells5m:${sells5m} — sellers dominate`);
+      return;
+    }
+    // Vol must still be active — if 5m rate < 15% of 1h, momentum dying
+    const vol1h = bestPair.volume?.h1 ?? 0;
+    if (vol1h > 0 && vol5m > 0 && vol5m * 12 < vol1h * 0.15) {
+      console.info(`[grad-scan] ✗vol  ${sym.padEnd(10)} vol momentum dying (5m pace < 15% of 1h)`);
+      return;
+    }
 
     console.info(
       `[grad-scan] 🎓 GRADUATE ${sym} (${mint.slice(0, 8)}) ` +
@@ -177,7 +188,7 @@ async function processGraduate(mint: string): Promise<void> {
         300,           // 3% slippage — fresh pools have wider spread
         86400,
         configuredWallet,
-        1200,          // 20 min hold — graduates move fast, don't overstay
+        2400,          // 40 min hold — recovery plays need time after 10-min delay (was 20min)
       ]
     );
 
