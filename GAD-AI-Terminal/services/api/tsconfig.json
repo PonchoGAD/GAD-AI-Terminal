@@ -5,11 +5,37 @@
     "outDir": "dist",
     "isolatedModules": false,
     "paths": {
-      "@lib/db": ["../../libs/db/src/index.d.ts"]
+      "@lib/db":          ["libs/db/src/index.d.ts"],
+      "@lib/intelligence":["libs/intelligence/src/index.d.ts"],
+      "@lib/scoring":     ["libs/scoring/src/index.d.ts"],
+      "@lib/rug":         ["libs/rug/src/index.d.ts"],
+      "@lib/gad-score":   ["libs/gad-score/src/index.d.ts"],
+      "@lib/narrative":   ["libs/narrative/src/index.d.ts"],
+      "@lib/social":      ["libs/social/src/index.d.ts"],
+      "@lib/lifecycle":   ["libs/lifecycle/src/index.d.ts"],
+      "@lib/survival":    ["libs/survival/src/index.d.ts"],
+      "@lib/opportunity": ["libs/opportunity/src/index.d.ts"],
+      "@lib/memory":      ["libs/memory/src/index.d.ts"],
+      "@lib/regime":      ["libs/regime/src/index.d.ts"],
+      "@lib/dna":         ["libs/dna/src/index.d.ts"],
+      "@lib/reputation":  ["libs/reputation/src/index.d.ts"]
     }
   },
   "include": [
     "src/**/*",
-    "../../libs/db/src/index.d.ts"
+    "../../libs/db/src/index.d.ts",
+    "../../libs/intelligence/src/index.d.ts",
+    "../../libs/scoring/src/index.d.ts",
+    "../../libs/rug/src/index.d.ts",
+    "../../libs/gad-score/src/index.d.ts",
+    "../../libs/narrative/src/index.d.ts",
+    "../../libs/social/src/index.d.ts",
+    "../../libs/lifecycle/src/index.d.ts",
+    "../../libs/survival/src/index.d.ts",
+    "../../libs/opportunity/src/index.d.ts",
+    "../../libs/memory/src/index.d.ts",
+    "../../libs/regime/src/index.d.ts",
+    "../../libs/dna/src/index.d.ts",
+    "../../libs/reputation/src/index.d.ts"
   ]
 }

@@ -1,6 +1,7 @@
 import { Application, Request, Response } from 'express';
 import { query, transaction } from '@lib/db';
 import launcherRouter from './launcher.routes';
+import { analyzeToken } from '@lib/intelligence';
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 function isValidMint(mint: string): boolean {
@@ -1043,6 +1044,71 @@ export function registerRoutes(app: Application) {
   app.get('/ton/trades',    (req, res)  => proxyTon(res, `/trades?limit=${req.query.limit ?? 30}`));
   app.get('/ton/pnl',       (_req, res) => proxyTon(res, '/pnl'));
   app.get('/ton/health',    (_req, res) => proxyTon(res, '/health'));
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // GAD MARKET INTELLIGENCE — deep on-demand token analysis
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** GET /tokens/:mint/intelligence — full intelligence analysis */
+  app.get('/tokens/:mint/intelligence', async (req: Request, res: Response) => {
+    await safeRes(res, async () => {
+      const { mint } = req.params;
+      if (!isValidMint(mint)) return res.status(400).json({ error: 'Invalid mint address' });
+
+      // Pull last known token data from DB
+      const [tokQ, metQ, scoreQ, gadQ] = await Promise.all([
+        query('SELECT * FROM tokens WHERE mint_address = $1', [mint]),
+        query(`SELECT * FROM token_metrics tm
+               JOIN tokens t ON t.id = tm.token_id
+               WHERE t.mint_address = $1
+               ORDER BY tm.timestamp DESC LIMIT 1`, [mint]),
+        query(`SELECT sh.* FROM score_history sh
+               JOIN tokens t ON t.id = sh.token_id
+               WHERE t.mint_address = $1
+               ORDER BY sh.created_at DESC LIMIT 1`, [mint]),
+        query(`SELECT gs.* FROM gad_scores gs
+               JOIN tokens t ON t.id = gs.token_id
+               WHERE t.mint_address = $1
+               ORDER BY gs.computed_at DESC LIMIT 1`, [mint]),
+      ]);
+
+      const token  = tokQ.rows[0];
+      const metric = metQ.rows[0] ?? {};
+      const score  = scoreQ.rows[0] ?? {};
+      const gad    = gadQ.rows[0] ?? {};
+
+      if (!token) return res.status(404).json({ error: 'Token not found' });
+
+      const intelligence = await analyzeToken({
+        mint,
+        symbol:        token.symbol ?? '?',
+        name:          token.name   ?? token.symbol ?? '?',
+        priceUsd:      Number(metric.price_usd      ?? 0),
+        marketCapUsd:  Number(token.market_cap       ?? 0),
+        liquidityUsd:  Number(metric.liquidity_usd   ?? token.liquidity_usd ?? 0),
+        volume5m:      Number(metric.volume_5m        ?? 0),
+        volume15m:     Number(metric.volume_15m       ?? 0),
+        volume1h:      Number(metric.volume_1h        ?? 0),
+        volume24h:     Number(metric.volume_24h       ?? token.volume_24h ?? 0),
+        holders:       Number(token.holder_count      ?? 0),
+        ageMins:       token.listed_at
+          ? (Date.now() - new Date(token.listed_at).getTime()) / 60000
+          : Number(token.age_hours ?? 0) * 60,
+        buys5m:        Number(metric.buys_5m          ?? 0),
+        sells5m:       Number(metric.sells_5m          ?? 0),
+        buys1h:        Number(metric.buys_1h           ?? 0),
+        sells1h:       Number(metric.sells_1h          ?? 0),
+        priceChange5m: Number(metric.price_change_5m   ?? 0),
+        priceChange1h: Number(metric.price_change_1h   ?? 0),
+        priceChange24h:Number(metric.price_change_24h  ?? 0),
+        top10HolderPct:Number(metric.top10_holder_pct  ?? gad.top10_holder_pct ?? 50),
+        txCount1h:     Number(metric.tx_count_1h       ?? 0),
+        heliusApiKey:  process.env.HELIUS_API_KEY,
+      });
+
+      res.json({ ok: true, intelligence });
+    });
+  });
 }
 
 // ─── GAD AI narrative builders ────────────────────────────────────────────────

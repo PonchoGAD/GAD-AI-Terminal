@@ -1,0 +1,39 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "src",
+    "declaration": true,
+    "isolatedModules": false,
+    "paths": {
+      "@lib/scoring":    ["../scoring/src/index.d.ts"],
+      "@lib/rug":        ["../rug/src/index.d.ts"],
+      "@lib/gad-score":  ["../gad-score/src/index.d.ts"],
+      "@lib/narrative":  ["../narrative/src/index.d.ts"],
+      "@lib/social":     ["../social/src/index.d.ts"],
+      "@lib/lifecycle":  ["../lifecycle/src/index.d.ts"],
+      "@lib/survival":   ["../survival/src/index.d.ts"],
+      "@lib/opportunity":["../opportunity/src/index.d.ts"],
+      "@lib/memory":     ["../memory/src/index.d.ts"],
+      "@lib/regime":     ["../regime/src/index.d.ts"],
+      "@lib/dna":        ["../dna/src/index.d.ts"],
+      "@lib/reputation": ["../reputation/src/index.d.ts"]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "../scoring/src/index.d.ts",
+    "../rug/src/index.d.ts",
+    "../gad-score/src/index.d.ts",
+    "../narrative/src/index.d.ts",
+    "../social/src/index.d.ts",
+    "../lifecycle/src/index.d.ts",
+    "../survival/src/index.d.ts",
+    "../opportunity/src/index.d.ts",
+    "../memory/src/index.d.ts",
+    "../regime/src/index.d.ts",
+    "../dna/src/index.d.ts",
+    "../reputation/src/index.d.ts"
+  ],
+  "exclude": ["**/*.test.ts"]
+}

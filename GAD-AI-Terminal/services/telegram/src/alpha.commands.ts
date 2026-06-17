@@ -357,4 +357,87 @@ export function registerAlphaCommands(
       }
     }
   };
+
+  // ── /analyze <mint> — deep intelligence analysis ───────────────────────────
+  bot.onText(/\/analyze(?:\s+(\S+))?/, (msg, match) => {
+    const chatId = msg.chat.id;
+    const tgId   = msg.from?.id ?? chatId;
+    const mint   = match?.[1]?.trim();
+
+    (async () => {
+      if (!await requireSub(chatId, tgId)) return;
+      if (!mint) {
+        return send(bot, chatId, '❓ Usage: `/analyze <mint_address>`\n\nExample:\n`/analyze DfaPx6oj5gHcEbBa8N2JSmdLgdQX4Tq7EcJPbTGya4Yx`');
+      }
+
+      await send(bot, chatId, `🔍 Analyzing \`${mint}\`...`);
+
+      const data = await apiGet(`/tokens/${mint}/intelligence`);
+      const intel = data.intelligence;
+      if (!intel) return send(bot, chatId, '❌ No data found for this token.');
+
+      const {
+        symbol, ageMins, marketCapUsd, liquidityUsd, holders,
+        aiScore, gadScore, gadScoreLabel, opportunityScore,
+        rugProbability, confidenceScore, confidenceLevel,
+        lifecycleStage, narrativeTag, whaleAccumulation,
+        holderVelocity, slippageRisk, survivalScores,
+        signals, redFlags, devIntelligence, buySellRatio,
+      } = intel;
+
+      const age = ageMins < 60
+        ? `${Math.round(ageMins)}min`
+        : `${(ageMins / 60).toFixed(1)}h`;
+
+      const mc  = marketCapUsd >= 1e6 ? `$${(marketCapUsd / 1e6).toFixed(1)}M`
+                : marketCapUsd >= 1e3 ? `$${(marketCapUsd / 1e3).toFixed(0)}K`
+                : `$${marketCapUsd?.toFixed(0) ?? 0}`;
+
+      const liq = liquidityUsd >= 1e3 ? `$${(liquidityUsd / 1e3).toFixed(0)}K` : `$${liquidityUsd?.toFixed(0) ?? 0}`;
+
+      const signalLines = (signals?.length ?? 0) > 0
+        ? signals.map((s: string) => `✅ ${s}`).join('\n')
+        : '• No strong signals detected';
+
+      const flagLines = (redFlags?.length ?? 0) > 0
+        ? redFlags.map((f: string) => `⚠️ ${f}`).join('\n')
+        : '• No red flags detected';
+
+      const dev = devIntelligence?.devConviction !== 'UNKNOWN'
+        ? `Dev: ${devIntelligence.devConviction} (sold ${devIntelligence.devSoldPct}%)`
+        : '';
+
+      const text = [
+        `🧠 *GAD INTELLIGENCE — ${symbol ?? '?'}*`,
+        ``,
+        `🆔 \`${mint}\``,
+        `🕐 Age: ${age} | MC: ${mc} | Liq: ${liq}`,
+        `👥 Holders: ${holders} ${holderVelocity?.per5m > 0 ? `(+${holderVelocity.per5m}/5m)` : ''}`,
+        `📈 B/S Ratio: ${buySellRatio?.toFixed(2) ?? '?'}`,
+        ``,
+        `*── SCORES ──*`,
+        `🤖 AI: ${aiScore} | GAD: ${gadScore} (${gadScoreLabel})`,
+        `🎯 Opportunity: ${opportunityScore} | Whale: ${whaleAccumulation}`,
+        `💀 Rug: ${rugProbability}% | Narrative: ${narrativeTag}`,
+        `📊 Stage: ${lifecycleStage}`,
+        ``,
+        `*── SURVIVAL ──*`,
+        `1h: ${survivalScores?.h1 ?? '?'}% | 6h: ${survivalScores?.h6 ?? '?'}% | 24h: ${survivalScores?.h24 ?? '?'}% | 7d: ${survivalScores?.d7 ?? '?'}%`,
+        ``,
+        `*── EXIT ──*`,
+        `Slippage $1k: ${slippageRisk?.usd1000 ?? '?'}%`,
+        dev,
+        ``,
+        `*── SIGNALS ──*`,
+        signalLines,
+        ``,
+        `*── RED FLAGS ──*`,
+        flagLines,
+        ``,
+        `_Confidence: ${confidenceScore}% (${confidenceLevel})_`,
+      ].filter(Boolean).join('\n');
+
+      send(bot, chatId, text);
+    })().catch(err => send(bot, chatId, `❌ Error: ${err.message}`));
+  });
 }
