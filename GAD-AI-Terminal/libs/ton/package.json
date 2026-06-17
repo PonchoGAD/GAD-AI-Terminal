@@ -2,13 +2,5 @@
   "name": "@lib/ton",
   "version": "1.0.0",
   "private": true,
-  "main": "src/index.js",
-  "dependencies": {
-    "@ton/ton": "^15.0.0",
-    "@ton/crypto": "^3.3.0",
-    "@ton/core": "^0.62.0",
-    "@ston-fi/sdk": "^2.2.0",
-    "@ston-fi/api": "*",
-    "axios": "^1.6.0"
-  }
+  "main": "src/index.js"
 }

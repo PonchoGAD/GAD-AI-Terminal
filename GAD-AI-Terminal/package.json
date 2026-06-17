@@ -61,11 +61,6 @@
     "pumpdotfun-sdk": "^1.4.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "ws": "^8.17.1",
-    "@ton/ton": "^15.0.0",
-    "@ton/crypto": "^3.3.0",
-    "@ton/core": "^0.62.0",
-    "@ston-fi/sdk": "^2.2.0",
-    "@ston-fi/api": "*"
+    "ws": "^8.17.1"
   }
 }
