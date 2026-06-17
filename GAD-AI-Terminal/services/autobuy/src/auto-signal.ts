@@ -385,8 +385,8 @@ const RAYDIUM_MAX_LIQUIDITY_USD = Number(process.env.RAYDIUM_MAX_LIQUIDITY_USD |
 const RAYDIUM_MIN_VOLUME_H1_USD = Number(process.env.RAYDIUM_MIN_VOLUME_H1_USD || '0');
 // Min 1h price change — real pump.fun winners show 0.5-20% in 1h at optimal entry
 const RAYDIUM_MIN_PC1H = Number(process.env.RAYDIUM_MIN_PC1H || '1');
-// Max 1h price change — blow-off tops filtered by MAYHEM MODE (>50% pc5m), not pc1h
-const RAYDIUM_MAX_PC1H = Number(process.env.RAYDIUM_MAX_PC1H || '100');
+// Max 1h price change — tokens up >45% in 1h are near blow-off top, late entry
+const RAYDIUM_MAX_PC1H = Number(process.env.RAYDIUM_MAX_PC1H || '45');
 // Min 5m price change — require active momentum RIGHT NOW (key entry signal)
 const RAYDIUM_MIN_PC5M = Number(process.env.RAYDIUM_MIN_PC5M || '0.5');
 // Max token age — 48h: memecoins that haven't pumped in 2 days are usually dead
@@ -552,9 +552,29 @@ async function fetchRaydiumPairs(): Promise<any[]> {
   const seen = new Set<string>();
   const results: any[] = [];
 
-  // Note: GeckoTerminal removed from autobuy — scanner service already uses it and
-  // the shared VPS IP hits 429 consistently. DexScreener sources below cover discovery.
-  const raydiumDexCount = 0;
+  // Source 0: DexScreener direct Raydium pairs endpoint — actual live Raydium market.
+  // Returns active pairs sorted by volume. Highest signal quality: real trading happening NOW.
+  // This replaces relying purely on keyword searches which return stale indexed tokens.
+  try {
+    const rayR = await axios.get(
+      'https://api.dexscreener.com/latest/dex/pairs/solana/raydium?sort=volume&order=desc',
+      { timeout: 7_000 }
+    );
+    const pairs: any[] = rayR.data?.pairs ?? [];
+    let added = 0;
+    for (const p of pairs) {
+      if (p.chainId !== 'solana') continue;
+      if (!JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')) continue;
+      const mint = p.baseToken?.address;
+      if (!mint || seen.has(mint)) continue;
+      seen.add(mint);
+      results.push(p);
+      added++;
+    }
+    if (added > 0) console.debug(`[raydium-scan] Direct Raydium endpoint: ${added} active pairs`);
+  } catch (e: any) {
+    console.debug(`[raydium-scan] Direct Raydium endpoint error: ${e.message?.slice(0, 40)}`);
+  }
 
   // Source 1: DexScreener token-profiles/latest — freshly launched tokens with community profiles.
   // These are brand-new tokens someone just added a profile for — high community engagement signal.
@@ -865,6 +885,7 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     // If 20%+ more sellers than buyers in the last hour: distribution phase, skip.
     // If ratio >3.5x: wash trading OR pump already peaked (Gaejuki 5.82x then -76%).
     // Fresh tokens (<6h): require ≥40 buys in 1h — real organic demand, not dev-pumped price.
+    // All tokens: require ≥20 buys in 1h — stale pools with 5-10 buys/h rarely pump.
     // High-liq fresh tokens ($40k+, <6h): require ≥1h age — inflated liq is a common rug setup.
     const buys1h = (pair.txns?.h1?.buys ?? 0) as number;
     const sells1h = (pair.txns?.h1?.sells ?? 0) as number;
@@ -875,6 +896,10 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     }
     if (isFreshToken && buys1h < 40) {
       console.debug(`[raydium-scan] ✗buyers ${sym.padEnd(10)} buys1h:${buys1h} age:${(ageSec/3600).toFixed(1)}h (fresh needs ≥40 buys/h)`);
+      skipped.momentum++; continue;
+    }
+    if (!isFreshToken && buys1h < 20) {
+      console.debug(`[raydium-scan] ✗stale ${sym.padEnd(10)} buys1h:${buys1h} age:${(ageSec/3600).toFixed(1)}h (aged needs ≥20 buys/h)`);
       skipped.momentum++; continue;
     }
     if (buys1h > 0 && sells1h > buys1h * 1.2) {

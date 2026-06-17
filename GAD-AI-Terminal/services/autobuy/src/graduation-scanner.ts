@@ -19,19 +19,21 @@ import { AUTO_BUY_ENABLED, getLiqTier } from './auto-signal';
 const PUMPPORTAL_WS   = 'wss://pumpportal.fun/api/data';
 const DEXSCREENER_URL = 'https://api.dexscreener.com/latest/dex/tokens';
 
-// Delay after detecting graduation — wait for DexScreener to index the Raydium pool
-const GRAD_DELAY_MS      = Number(process.env.GRAD_DELAY_MS      || '45000'); // 45s
+// Delay after graduation: 10 minutes lets the initial sniper/bot dump pass.
+// Bots and snipers front-run within 2-5 seconds. Buying at 45s = after the spike, before recovery.
+// At 10 min: initial pump-dump complete, organic buyers are coming back = better R/R.
+const GRAD_DELAY_MS      = Number(process.env.GRAD_DELAY_MS      || '600000'); // 10 min (was 45s)
 // Buy parameters for graduates
 const GRAD_BUY_SOL       = Number(process.env.GRAD_BUY_SOL       || '0.02');
 const GRAD_MAX_SOL_DAILY = Number(process.env.GRAD_MAX_SOL_DAILY || '0.3');
 const GRAD_MAX_POSITIONS = Number(process.env.GRAD_MAX_POSITIONS || '3');
-// Liquidity range — fresh pool is $10-200k
-const GRAD_MIN_LIQ = Number(process.env.GRAD_MIN_LIQ || '10000');
-const GRAD_MAX_LIQ = Number(process.env.GRAD_MAX_LIQ || '200000');
-// How many buys in first 5m to confirm traders are active (not a ghost pool)
-const GRAD_MIN_BUYS_5M = Number(process.env.GRAD_MIN_BUYS_5M || '3');
-// Skip if dumping immediately after graduation
-const GRAD_MIN_PC5M = Number(process.env.GRAD_MIN_PC5M || '-5');
+// Liquidity range — post-dump pool has settled liq
+const GRAD_MIN_LIQ = Number(process.env.GRAD_MIN_LIQ || '15000');
+const GRAD_MAX_LIQ = Number(process.env.GRAD_MAX_LIQ || '300000');
+// Require 12+ buys in 5m — confirms real organic demand, not dev bounce or empty pool
+const GRAD_MIN_BUYS_5M = Number(process.env.GRAD_MIN_BUYS_5M || '12');
+// Require price recovering (+1%) — not buying a dead cat that's still falling
+const GRAD_MIN_PC5M = Number(process.env.GRAD_MIN_PC5M || '1');
 
 // PumpSwap is pump.fun's own AMM — where most tokens graduate now. Jupiter routes through it.
 const JUPITER_DEX_IDS = ['raydium', 'orca', 'meteora', 'lifinity', 'pumpswap'];
