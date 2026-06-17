@@ -889,7 +889,8 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       skipped.momentum++; continue;
     }
     if (pc1h < minPc1hOverride || pc1h > RAYDIUM_MAX_PC1H) {
-      console.debug(`[raydium-scan] ✗mom  ${sym.padEnd(10)} pc1h:${pc1h.toFixed(1)}% liq:$${liq.toFixed(0)} [min:${minPc1hOverride}%]`);
+      const reason = pc1h > RAYDIUM_MAX_PC1H ? `max:${RAYDIUM_MAX_PC1H}% already pumped` : `min:${minPc1hOverride}% need momentum`;
+      console.debug(`[raydium-scan] ✗mom  ${sym.padEnd(10)} pc1h:${pc1h.toFixed(1)}% liq:$${liq.toFixed(0)} [${reason}]`);
       skipped.momentum++; continue;
     }
 

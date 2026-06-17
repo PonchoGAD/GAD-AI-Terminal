@@ -203,23 +203,28 @@ async function markBuyError(jobId: string, error: string, intervalSeconds: numbe
 }
 
 // ─── Extract tier from job label ──────────────────────────────────────────────
-// Labels: auto:raydium_scan:liq250k:fresh2h:t3  →  tier 3
+// Labels: auto:raydium_scan:liq250k:fresh2h:t3:fear  →  tier 3, FEAR regime
+// BUG FIX: Must extract regime from label and pass to getLiqTier.
+// Without this, getLiqTier defaults to NEUTRAL — wrong TP targets in FEAR/BULL.
 function getTierFromLabel(label: string | null): ReturnType<typeof getLiqTier> {
+  // Extract market regime from label suffix (:fear, :neutral, :bull, :euphoria, etc.)
+  const regimeMatch = label?.match(/:(fear|neutral|bull|euphoria|extreme_fear)$/i);
+  const regime = regimeMatch ? regimeMatch[1].toUpperCase() : 'NEUTRAL';
+
   if (label?.includes(':t3')) {
-    // Extract liq from label to get exact tier config
     const liqMatch = label.match(/:liq(\d+)k/);
     const liq = liqMatch ? Number(liqMatch[1]) * 1000 : 300000;
-    return getLiqTier(Math.max(liq, 250001));  // force T3
+    return getLiqTier(Math.max(liq, 250001), regime);
   }
   if (label?.includes(':t1')) {
     const liqMatch = label.match(/:liq(\d+)k/);
     const liq = liqMatch ? Number(liqMatch[1]) * 1000 : 50000;
-    return getLiqTier(Math.min(liq, 79999));   // force T1
+    return getLiqTier(Math.min(liq, 79999), regime);
   }
   // Default: T2 or derive from liq in label
   const liqMatch = label?.match(/:liq(\d+)k/);
-  if (liqMatch) return getLiqTier(Number(liqMatch[1]) * 1000);
-  return getLiqTier(100000);  // fallback to T2
+  if (liqMatch) return getLiqTier(Number(liqMatch[1]) * 1000, regime);
+  return getLiqTier(100000, regime);  // fallback to T2 NEUTRAL
 }
 
 // ─── Create sell stages after a buy ──────────────────────────────────────────
