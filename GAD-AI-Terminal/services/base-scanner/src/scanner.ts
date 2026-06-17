@@ -69,7 +69,10 @@ async function fetchDexScreener(): Promise<BaseToken[]> {
 
   // Also search DexScreener directly for new Base pairs
   try {
-    const searches = ['base meme', 'base new', 'base ai', 'base dog', 'base pepe'];
+    const searches = [
+      'base meme', 'base new', 'base ai', 'base dog', 'base pepe',
+      'base cat', 'base frog', 'base coin', 'new base token', 'base pump',
+    ];
     for (const q of searches) {
       const r = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`, { timeout: 6000 });
       const pairs: any[] = (r.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
@@ -177,13 +180,13 @@ async function fetchGeckoTerminal(): Promise<BaseToken[]> {
 }
 
 // DEX IDs we can actually trade on Base.
-// V2: 'uniswap', 'uniswap-v2', 'uniswap-v2-base' — most Base meme tokens launch here
-// V3: 'uniswap-v3', 'uniswap-v3-base' — established tokens, larger liq
-// Aerodrome: 'aerodrome-v2', 'aerodrome' — Base-native DEX, some memes here
-// Excluded: 'uniswap-v4-base' (no router support), 'aerodrome-cl' (different factory), 'sushiswap', 'alien-base'
+// V4: tokens listed as 'uniswap-v4-base' can be bought via Aerodrome fallback
+// (quotes.ts tries V3 → V2 → Aerodrome; Aerodrome handles V4 tokens without native pool)
+// Excluded: 'aerodrome-cl' (concentrated liquidity, different factory), 'sushiswap', 'alien-base'
 const TRADEABLE_DEX_IDS = new Set([
   'uniswap', 'uniswap-v2', 'uniswap-v2-base',
   'uniswap-v3', 'uniswap-v3-base',
+  'uniswap-v4', 'uniswap-v4-base',
   'aerodrome-v2', 'aerodrome',
 ]);
 
@@ -202,7 +205,8 @@ function passesFilter(t: BaseToken): string | null {
   // Fresh launches (< FRESH_AGE_SEC) use higher cap — first-hour spikes are normal on Base
   const maxPc1h = t.age_sec < FRESH_AGE_SEC ? MAX_PC1H_FRESH : MAX_PC1H;
   if (t.price_change_1h > maxPc1h)          return `pc1h:${t.price_change_1h.toFixed(1)}% > ${maxPc1h}% (age:${(t.age_sec/60).toFixed(0)}min)`;
-  if (t.price_change_5m < MIN_PC5M)         return `pc5m:${t.price_change_5m.toFixed(1)}% < ${MIN_PC5M}%`;
+  // Skip pc5m check when pc5m=0 (GeckoTerminal or DexScreener with no 5m data)
+  if (t.price_change_5m !== 0 && t.price_change_5m < MIN_PC5M)  return `pc5m:${t.price_change_5m.toFixed(1)}% < ${MIN_PC5M}%`;
   if (t.volume_1h / Math.max(1, t.liquidity_usd) < MIN_VOL_LIQ) return `vol/liq:${(t.volume_1h / Math.max(1, t.liquidity_usd) * 100).toFixed(0)}% < ${MIN_VOL_LIQ * 100}%`;
   if (t.buy_sell_ratio > MAX_BS_RATIO)      return `bs:${t.buy_sell_ratio.toFixed(1)} > ${MAX_BS_RATIO}`;
   if (t.txns_h1_buys < MIN_BUYS_H1)        return `buys1h:${t.txns_h1_buys} < ${MIN_BUYS_H1}`;
