@@ -1095,7 +1095,20 @@ export async function startAutobuyScheduler() {
   const connection = getConnection();
   const walletAddress = keypair?.publicKey.toBase58() ?? '';
 
-  // Start real-time graduation scanner (WebSocket — sub-second latency for pump.fun graduates)
+  // Graduation scanner: DISABLED by default (100% loss rate — tokens are unsellable post-graduation).
+  // GRAD_HUNTER_ENABLED=false → scanner connects but buy logic is gated inside graduation-scanner.ts.
+  const GRAD_HUNTER_ENABLED = process.env.GRAD_HUNTER_ENABLED === 'true';
+  const SCORE80_SIGNAL_ENABLED = false; // permanently disabled — 100% loss rate on pump.fun tokens
+  const WHALE_SIGNAL_ENABLED   = false; // permanently disabled — same root cause as score80
+  if (GRAD_HUNTER_ENABLED) {
+    console.warn('[autobuy] ⚠️  GRAD_HUNTER_ENABLED=true — graduated tokens are difficult to sell, risk of 100% loss');
+  } else {
+    console.info('[autobuy] ✅ GRAD scanner disabled (GRAD_HUNTER_ENABLED=false) — buys will be skipped');
+  }
+  if (SCORE80_SIGNAL_ENABLED || WHALE_SIGNAL_ENABLED) {
+    console.error('[autobuy] 🚨 Score80/Whale signal flag is TRUE — OVERRIDING to false (100% loss history)');
+  }
+  // WebSocket still connects for sub-second graduation event detection (pre-graduation exit guard).
   if (walletAddress) startGraduationScanner(walletAddress);
 
   // Start bonding curve scanner — buys tokens BEFORE graduation using PUMPFUN_WALLET

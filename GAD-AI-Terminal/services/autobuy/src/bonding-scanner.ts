@@ -144,17 +144,21 @@ const PUMPSWAP_TPS = [
 // This catches real momentum BEFORE it shows on DexScreener charts.
 const SOL_VELOCITY_ENABLED  = process.env.SOL_VELOCITY_ENABLED === 'true';
 const SOL_VELOCITY_BUY_SOL  = Number(process.env.SOL_VELOCITY_BUY_SOL      || '0.012');
-const SOL_VELOCITY_MIN_SOL  = Number(process.env.SOL_VELOCITY_MIN_SOL      || '15');   // skip early bot dump (<15 SOL)
-const SOL_VELOCITY_MAX_SOL  = Number(process.env.SOL_VELOCITY_MAX_SOL      || '70');   // don't buy too deep in curve
-const SOL_VELOCITY_RATE     = Number(process.env.SOL_VELOCITY_RATE_SOL_MIN || '3');    // SOL/min minimum
-const SOL_VELOCITY_WINDOW   = Number(process.env.SOL_VELOCITY_WINDOW_SEC   || '60');   // velocity calculation window
-const SOL_VELOCITY_MAX_AGE  = Number(process.env.SOL_VELOCITY_MAX_AGE_SEC  || '300');  // 5 min max token age
-const SOL_VELOCITY_MIN_BUYS = Number(process.env.SOL_VELOCITY_MIN_BUYS     || '5');    // min unique buyer wallets
-const SOL_VELOCITY_TIME_LIM = Number(process.env.SOL_VELOCITY_TIME_LIM_SEC || '120');  // 2 min hard exit
-const SOL_VELOCITY_STOP_PCT = Number(process.env.SOL_VELOCITY_STOP_PCT     || '0.12'); // 12% stop loss
+const SOL_VELOCITY_MIN_SOL      = Number(process.env.SOL_VELOCITY_MIN_SOL           || '25');   // 7% of graduation threshold
+const SOL_VELOCITY_MAX_SOL      = Number(process.env.SOL_VELOCITY_MAX_SOL           || '80');   // <100 SOL to graduation safety margin
+const SOL_VELOCITY_RATE         = Number(process.env.SOL_VELOCITY_MIN_SOL_PER_60S   || '3');    // SOL flowing in per 60s window
+const SOL_VELOCITY_WINDOW       = Number(process.env.SOL_VELOCITY_WINDOW_SEC        || '60');   // velocity calculation window
+const SOL_VELOCITY_MAX_AGE      = Number(process.env.SOL_VELOCITY_MAX_AGE_SEC       || '300');  // 5 min max token age
+const SOL_VELOCITY_MIN_BUYS     = Number(process.env.SOL_VELOCITY_MIN_UNIQUE_BUYERS || '8');    // min unique buyer wallets
+const SOL_VELOCITY_MAX_SINGLE   = Number(process.env.SOL_VELOCITY_MAX_SINGLE_BUY    || '5');    // anti-whale: skip if any single buy > 5 SOL
+const SOL_VELOCITY_MAX_GAP_SEC  = Number(process.env.SOL_VELOCITY_MAX_LAST_TRADE_GAP_SEC || '30'); // momentum dead if no trade for 30s
+const SOL_VELOCITY_TIME_LIM     = Number(process.env.SOL_VELOCITY_TIME_LIM_SEC      || '90');  // 90s hard exit
+const SOL_VELOCITY_STOP_PCT     = Number(process.env.SOL_VELOCITY_STOP_PCT          || '0.12'); // 12% stop loss
+const SOL_VELOCITY_DECAY_SOL    = Number(process.env.SOL_VELOCITY_DECAY_SOL         || '1');    // velocity decay: exit if flow < 1 SOL/60s
+const GRADUATION_THRESHOLD_SOL  = 588;                                                          // pump.fun graduation threshold
+const GRADUATION_SAFETY_MARGIN  = 100;                                                          // refuse buy if within 100 SOL of graduation
 const VELOCITY_TPS = [
-  { mult: 1.5, sellPct: 70 },  // take 70% at 1.5x — fast spike then dump
-  { mult: 3.0, sellPct: 30 },  // let 30% ride to 3x
+  { mult: 1.5, sellPct: 100 },  // take 100% at 1.5x — bonding curve spikes dump fast
 ];
 
 // Live SOL price (updated every 5 min)
@@ -376,11 +380,12 @@ interface VelocityToken {
   mint:      string;
   symbol:    string;
   name:      string;
-  createdAt: number;                                // ms when token was created
+  createdAt: number;
   devBuySol: number;
-  samples:   Array<{ ts: number; vSol: number }>;  // marketCapSol samples over time
-  buyers:    Set<string>;                           // unique buyer wallets seen
+  trades:    Array<{ ts: number; vSol: number; solAmount: number; wallet: string }>;
+  buyers:    Set<string>;
   bought:    boolean;
+  lastVSol:  number;
 }
 const velocityTokens = new Map<string, VelocityToken>();
 
@@ -1326,9 +1331,9 @@ function trackVelocityCreate(event: any): void {
     mint, symbol: (event.symbol ?? mint.slice(0, 4)).toUpperCase(),
     name: event.name ?? event.symbol ?? mint.slice(0, 4),
     createdAt: Date.now(), devBuySol: devBuy,
-    samples: [{ ts: Date.now(), vSol }],
-    buyers: new Set([event.traderPublicKey].filter(Boolean)),
-    bought: false,
+    trades: [{ ts: Date.now(), vSol, solAmount: devBuy, wallet: event.traderPublicKey ?? '' }],
+    buyers: new Set<string>([event.traderPublicKey].filter(Boolean) as string[]),
+    bought: false, lastVSol: vSol,
   });
   // Clean tokens older than 10 min
   const cutoff = Date.now() - 600_000;
@@ -1337,127 +1342,167 @@ function trackVelocityCreate(event: any): void {
   }
 }
 
+async function velocityForceSell(mint: string, sym: string, reason: string,
+  kp: Keypair, conn: Connection): Promise<void> {
+  positions2.delete(mint);
+  console.info(`[velocity] ⏱ ${reason} ${sym} — force exit`);
+  const r1 = await sellOnBondingCurve(mint, 100, kp, conn, 'pump');
+  if (r1.success && (r1.solReceived ?? 0) > 0) {
+    await query(`UPDATE autobuy_jobs SET total_sold_sol=COALESCE(total_sold_sol,0)+$1,active=false WHERE mint_address=$2 AND label LIKE 'auto:bonding:vel%' AND active=true`, [r1.solReceived ?? 0, mint]).catch(() => {});
+    return;
+  }
+  const r2 = await sellOnBondingCurve(mint, 100, kp, conn, 'pumpswap');
+  if (r2.success && (r2.solReceived ?? 0) > 0) {
+    await query(`UPDATE autobuy_jobs SET total_sold_sol=COALESCE(total_sold_sol,0)+$1,active=false WHERE mint_address=$2 AND label LIKE 'auto:bonding:vel%' AND active=true`, [r2.solReceived ?? 0, mint]).catch(() => {});
+    return;
+  }
+  try {
+    const tas = await conn.getParsedTokenAccountsByOwner(kp.publicKey, { mint: new PublicKey(mint) });
+    const raw = BigInt((tas.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0');
+    if (raw > 0n) {
+      const jr = await executeAutoSell({ mintAddress: mint, tokenAmount: raw, slippageBps: 1500 }, conn, kp);
+      if (jr.success) {
+        await query(`UPDATE autobuy_jobs SET total_sold_sol=COALESCE(total_sold_sol,0)+$1,active=false WHERE mint_address=$2 AND label LIKE 'auto:bonding:vel%' AND active=true`, [jr.solReceived ?? 0, mint]).catch(() => {});
+        console.info(`[velocity] ✅ Jupiter exit ${sym} → ${(jr.solReceived ?? 0).toFixed(5)} SOL`);
+      }
+    }
+  } catch { /* accept loss on rug */ }
+}
+
 async function trackVelocityTrade(event: any): Promise<void> {
   if (!SOL_VELOCITY_ENABLED) return;
   const mint = event.mint ?? '';
-  const token = velocityTokens.get(mint);
-  if (!token || token.bought) return;
-
   const vSol = Number(event.marketCapSol ?? 0);
-  if (vSol <= 0) return;
+  const solAmount = Number(event.solAmount ?? 0);
   const now = Date.now();
 
-  token.samples.push({ ts: now, vSol });
-  if (event.txType === 'buy' && event.traderPublicKey) token.buyers.add(event.traderPublicKey);
-
-  // Trim old samples outside velocity window + buffer
-  const windowMs = SOL_VELOCITY_WINDOW * 1000;
-  token.samples = token.samples.filter(s => now - s.ts <= windowMs + 5_000);
-
-  const ageSec = (now - token.createdAt) / 1000;
-  if (ageSec > SOL_VELOCITY_MAX_AGE) { velocityTokens.delete(mint); return; }
-  if (ageSec < 15) return; // wait 15s for initial sniper bots to settle
-
-  // vSol range: must be in the sweet spot (past initial dump, not too deep)
-  if (vSol < SOL_VELOCITY_MIN_SOL || vSol > SOL_VELOCITY_MAX_SOL) return;
-
-  // Need at least 3 samples in window
-  const windowSamples = token.samples.filter(s => now - s.ts <= windowMs);
-  if (windowSamples.length < 3) return;
-
-  const oldest = windowSamples[0];
-  const newest = windowSamples[windowSamples.length - 1];
-  const timeDiffMin = (newest.ts - oldest.ts) / 60_000;
-  if (timeDiffMin < 0.2) return; // need >12s of data
-
-  const solAdded = newest.vSol - oldest.vSol;
-  if (solAdded <= 0) return; // must be accumulating (not draining)
-
-  const velocityPerMin = solAdded / timeDiffMin;
-  if (velocityPerMin < SOL_VELOCITY_RATE) return;
-  if (token.buyers.size < SOL_VELOCITY_MIN_BUYS) return;
-
-  // Capacity and dedup checks
-  if (positions2.size >= BONDING_MAX_POSITIONS_W2) return;
-  if (!checkDailyBudget2(SOL_VELOCITY_BUY_SOL)) return;
-  if (recentMints.has(mint)) return;
-
-  token.bought = true;
-  velocityTokens.delete(mint);
-  recentMints.add(mint);
-
-  const kp = keypairInstance2 ?? keypairInstance;
-  const conn = connectionInstance;
-  if (!kp || !conn) return;
-
-  console.info(
-    `[velocity] 🚀 SIGNAL ${token.symbol} — vSol:${vSol.toFixed(1)} ` +
-    `rate:${velocityPerMin.toFixed(1)} SOL/min age:${ageSec.toFixed(0)}s ` +
-    `buyers:${token.buyers.size} buying ${SOL_VELOCITY_BUY_SOL} SOL`
-  );
-
-  const buyResult = await buyOnBondingCurve(mint, SOL_VELOCITY_BUY_SOL, kp, conn, 'pump');
-  if (!buyResult.success) { recentMints.delete(mint); return; }
-
-  bonding2DailySpent += SOL_VELOCITY_BUY_SOL;
-
-  try {
-    await query(
-      `INSERT INTO autobuy_jobs
-         (mint_address, label, amount_sol, slippage_bps, interval_seconds,
-          autosell_enabled, active, last_tx_signature, bought_at, last_activity_at,
-          total_spent_sol, time_limit_seconds, time_limit_enabled)
-       VALUES ($1,$2,$3,250,60,false,true,$4,now(),now(),$3,$5,true)
-       ON CONFLICT DO NOTHING`,
-      [mint, `auto:bonding:vel:${token.symbol}:pump:mcap${Math.round(vSol)}sol`,
-       SOL_VELOCITY_BUY_SOL, buyResult.txSignature ?? '', SOL_VELOCITY_TIME_LIM]
-    );
-  } catch (dbErr: any) {
-    console.warn(`[velocity] DB error: ${(dbErr as Error).message?.slice(0, 60)}`);
-  }
-
-  positions2.set(mint, {
-    mint, symbol: token.symbol, name: token.name,
-    buyTx: buyResult.txSignature ?? '',
-    buyTime: Date.now(), buySol: SOL_VELOCITY_BUY_SOL,
-    entryMcapSol: vSol, currentMcapSol: vSol, peakMcapSol: vSol,
-    tpIndex: 0, allTpsDone: false,
-    uniqueBuyers: new Set(token.buyers),
-    recentBuySol: 0, recentSellSol: 0,
-    windowResetAt: Date.now() + 90_000,
-    dexPool: 'pump',
-    tpLevels: VELOCITY_TPS,
-    stopPct: SOL_VELOCITY_STOP_PCT,
-  });
-
-  if (wsInstance?.readyState === WebSocket.OPEN) {
-    wsInstance.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
-  }
-
-  // Hard time limit — sell everything after SOL_VELOCITY_TIME_LIM seconds
-  setTimeout(async () => {
-    const p = positions2.get(mint);
-    if (!p) return;
-    console.info(`[velocity] ⏱ TIME_LIMIT ${p.symbol} — force exit`);
-    positions2.delete(mint);
-    const r1 = await sellOnBondingCurve(mint, 100, kp, conn, 'pump');
-    if (r1.success && (r1.solReceived ?? 0) > 0) return;
-    const r2 = await sellOnBondingCurve(mint, 100, kp, conn, 'pumpswap');
-    if (r2.success && (r2.solReceived ?? 0) > 0) return;
-    try {
-      const tas = await conn.getParsedTokenAccountsByOwner(kp.publicKey, { mint: new PublicKey(mint) });
-      const raw = BigInt((tas.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0');
-      if (raw > 0n) {
-        const jr = await executeAutoSell({ mintAddress: mint, tokenAmount: raw, slippageBps: 1500 }, conn, kp);
-        if (jr.success) {
-          await query(`UPDATE autobuy_jobs SET total_sold_sol=COALESCE(total_sold_sol,0)+$1,active=false WHERE mint_address=$2 AND label LIKE 'auto:bonding:vel%' AND active=true`, [jr.solReceived ?? 0, mint]).catch(() => {});
-          console.info(`[velocity] ✅ Jupiter fallback ${token.symbol} → ${(jr.solReceived ?? 0).toFixed(5)} SOL`);
-        }
+  // ── Check open positions for pre-graduation exit ──────────────────────────
+  if (vSol > GRADUATION_THRESHOLD_SOL - GRADUATION_SAFETY_MARGIN) {
+    const pos = positions2.get(mint);
+    if (pos) {
+      const kp = keypairInstance2 ?? keypairInstance;
+      const conn = connectionInstance;
+      if (kp && conn) {
+        console.warn(`[velocity] ⚠️ PRE_GRAD_EXIT ${pos.symbol} vSol:${vSol.toFixed(0)} — selling before graduation`);
+        await velocityForceSell(mint, pos.symbol, 'PRE_GRAD_EXIT', kp, conn);
       }
-    } catch { /* accept loss on rug */ }
-  }, SOL_VELOCITY_TIME_LIM * 1000);
+    }
+    velocityTokens.delete(mint); // don't track near-graduation tokens
+    return;
+  }
 
-  console.info(`[velocity] ✅ Entered ${token.symbol} — time limit ${SOL_VELOCITY_TIME_LIM}s`);
+  // ── Track velocity tokens (candidates not yet bought) ────────────────────
+  const token = velocityTokens.get(mint);
+  if (token && !token.bought) {
+    if (vSol > 0) {
+      token.lastVSol = vSol;
+      token.trades.push({ ts: now, vSol, solAmount, wallet: event.traderPublicKey ?? '' });
+      if (event.txType === 'buy' && event.traderPublicKey) token.buyers.add(event.traderPublicKey);
+      // Trim old trades
+      const windowMs = SOL_VELOCITY_WINDOW * 1000;
+      token.trades = token.trades.filter(t => now - t.ts <= windowMs + 5_000);
+    }
+
+    const ageSec = (now - token.createdAt) / 1000;
+    if (ageSec > SOL_VELOCITY_MAX_AGE) { velocityTokens.delete(mint); return; }
+    if (ageSec < 15) return; // wait for initial sniper bots to dump
+
+    // SOL range: sweet spot on bonding curve, safe from graduation
+    if (vSol < SOL_VELOCITY_MIN_SOL || vSol > SOL_VELOCITY_MAX_SOL) return;
+
+    const windowMs = SOL_VELOCITY_WINDOW * 1000;
+    const recentTrades = token.trades.filter(t => now - t.ts <= windowMs);
+    if (recentTrades.length < 3) return;
+
+    // Momentum: last trade must be recent (active buying NOW)
+    const lastTrade = recentTrades[recentTrades.length - 1];
+    if (now - lastTrade.ts > SOL_VELOCITY_MAX_GAP_SEC * 1000) return;
+
+    // Velocity: sum of SOL flowing in (not delta of marketCapSol)
+    const buyTrades = recentTrades.filter(t => t.solAmount > 0);
+    const velocitySol = buyTrades.reduce((sum, t) => sum + t.solAmount, 0);
+    if (velocitySol < SOL_VELOCITY_RATE) return;
+
+    // Anti-whale: skip if single buy dominates (manipulation signal)
+    const hasWhaleBuy = buyTrades.some(t => t.solAmount > SOL_VELOCITY_MAX_SINGLE);
+    if (hasWhaleBuy) {
+      console.debug(`[velocity] ✗whale ${token.symbol} — single buy > ${SOL_VELOCITY_MAX_SINGLE} SOL`);
+      return;
+    }
+
+    // Unique buyer count
+    if (token.buyers.size < SOL_VELOCITY_MIN_BUYS) return;
+
+    // Pre-graduation safety guard
+    if (vSol > GRADUATION_THRESHOLD_SOL - GRADUATION_SAFETY_MARGIN) return;
+
+    // Capacity and dedup
+    if (positions2.size >= BONDING_MAX_POSITIONS_W2) return;
+    if (!checkDailyBudget2(SOL_VELOCITY_BUY_SOL)) return;
+    if (recentMints.has(mint)) return;
+
+    token.bought = true;
+    velocityTokens.delete(mint);
+    recentMints.add(mint);
+
+    const kp = keypairInstance2 ?? keypairInstance;
+    const conn = connectionInstance;
+    if (!kp || !conn) return;
+
+    console.info(
+      `[velocity] 🚀 SIGNAL ${token.symbol} — vSol:${vSol.toFixed(1)} ` +
+      `flow60s:${velocitySol.toFixed(2)} SOL age:${ageSec.toFixed(0)}s ` +
+      `buyers:${token.buyers.size} → buying ${SOL_VELOCITY_BUY_SOL} SOL`
+    );
+
+    const buyResult = await buyOnBondingCurve(mint, SOL_VELOCITY_BUY_SOL, kp, conn, 'pump');
+    if (!buyResult.success) { recentMints.delete(mint); return; }
+
+    bonding2DailySpent += SOL_VELOCITY_BUY_SOL;
+
+    try {
+      await query(
+        `INSERT INTO autobuy_jobs
+           (mint_address, label, amount_sol, slippage_bps, interval_seconds,
+            autosell_enabled, active, last_tx_signature, bought_at, last_activity_at,
+            total_spent_sol, time_limit_seconds, time_limit_enabled)
+         VALUES ($1,$2,$3,250,60,false,true,$4,now(),now(),$3,$5,true)
+         ON CONFLICT DO NOTHING`,
+        [mint, `auto:bonding:vel:${token.symbol}:pump:vSol${Math.round(vSol)}`,
+         SOL_VELOCITY_BUY_SOL, buyResult.txSignature ?? '', SOL_VELOCITY_TIME_LIM]
+      );
+    } catch (dbErr: any) {
+      console.warn(`[velocity] DB error: ${(dbErr as Error).message?.slice(0, 60)}`);
+    }
+
+    positions2.set(mint, {
+      mint, symbol: token.symbol, name: token.name,
+      buyTx: buyResult.txSignature ?? '',
+      buyTime: Date.now(), buySol: SOL_VELOCITY_BUY_SOL,
+      entryMcapSol: vSol, currentMcapSol: vSol, peakMcapSol: vSol,
+      tpIndex: 0, allTpsDone: false,
+      uniqueBuyers: new Set(token.buyers),
+      recentBuySol: 0, recentSellSol: 0,
+      windowResetAt: Date.now() + 90_000,
+      dexPool: 'pump',
+      tpLevels: VELOCITY_TPS,
+      stopPct: SOL_VELOCITY_STOP_PCT,
+    });
+
+    if (wsInstance?.readyState === WebSocket.OPEN) {
+      wsInstance.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
+    }
+
+    // Hard time limit exit
+    setTimeout(() => {
+      if (positions2.has(mint) && kp && conn) {
+        velocityForceSell(mint, token.symbol, 'TIME_LIMIT', kp, conn);
+      }
+    }, SOL_VELOCITY_TIME_LIM * 1000);
+
+    console.info(`[velocity] ✅ Entered ${token.symbol} — time limit ${SOL_VELOCITY_TIME_LIM}s`);
+  }
+
 }
 
 let wsInstance: WebSocket | null = null;

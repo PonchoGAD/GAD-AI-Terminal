@@ -16,6 +16,8 @@ import axios from 'axios';
 import { query } from '@lib/db';
 import { AUTO_BUY_ENABLED, getLiqTier } from './auto-signal';
 
+const GRAD_HUNTER_ENABLED = process.env.GRAD_HUNTER_ENABLED === 'true';
+
 const PUMPPORTAL_WS   = 'wss://pumpportal.fun/api/data';
 const DEXSCREENER_URL = 'https://api.dexscreener.com/latest/dex/tokens';
 
@@ -170,6 +172,10 @@ async function processGraduate(mint: string): Promise<void> {
       `buys:${buys5m} sells:${sells5m}`
     );
 
+    if (!GRAD_HUNTER_ENABLED) {
+      console.info(`[grad-scan] ✗disabled GRAD_HUNTER_ENABLED=false — skipping buy for ${sym} (100% loss strategy)`);
+      return;
+    }
     if (!configuredWallet) {
       console.warn('[grad-scan] wallet not configured — cannot create job');
       return;
