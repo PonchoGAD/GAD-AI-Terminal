@@ -179,7 +179,7 @@ bot.onText(/\/start/, async (msg) => {
   send(msg.chat.id,
     `🤖 *GAD AI Terminal*\n\nGM, ${name}! Real-time Solana alpha.\n\n${tierLine}\n\n` +
     `*📊 Analytics (Starter+):*\n/trending /new /highscore /highrisk\n/analyze /signals /whales /tokenscore\n\n` +
-    `*🤖 Bot Control (PRO):*\n/bot — Solana bot PnL\n/futures — futures trading\n/basestatus — Base Network\n/bscstatus — BSC / Four.meme\n/autobuy /portfolio\n\n` +
+    `*🤖 Bot Control (PRO):*\n/bot — Solana bot PnL\n/futures — futures trading\n/basestatus — Base Network\n/bscstatus — BSC / Four.meme\n/tonstatus — TON Network\n/autobuy /portfolio\n\n` +
     `*🔑 Free:*\n/subscribe /status /wallet /help`,
     {
       reply_markup: {
@@ -235,6 +235,10 @@ bot.onText(/\/help/, (msg) => {
     `/basetrades — Base trade history\n\n` +
     `*BSC / Four.meme (PRO):*\n` +
     `/bscstatus — BSC scanner status\n` +
+    `/tonstatus — TON / STON.fi scanner\n` +
+    `/tonpositions — open TON positions\n` +
+    `/tontrades — TON trade history\n` +
+    `/tonpnl — TON PnL summary\n\n` +
     `/bscpositions — open BNB positions\n` +
     `/bsctokens — discovered BSC tokens\n` +
     `/bsctrades — BSC trade history\n\n` +
@@ -1412,6 +1416,112 @@ bot.onText(/^\/bsctokens(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
     await send(chatId, lines.join('\n'));
   } catch (e: any) {
     await send(chatId, `❌ BSC tokens error: ${e.message}`);
+  }
+}));
+
+// ─── TON Network Commands ────────────────────────────────────────────────────
+
+const TON_SCANNER_URL = process.env.TON_SCANNER_URL ?? 'http://ton-scanner:4007';
+
+async function tonGet<T = any>(path: string): Promise<T> {
+  const axios = (await import('axios')).default;
+  const r = await axios.get(`${TON_SCANNER_URL}${path}`, { timeout: 8_000 });
+  if (!r.data?.ok) throw new Error(r.data?.error ?? 'TON API error');
+  return r.data as T;
+}
+
+// /tonstatus — PRO: TON scanner status
+bot.onText(/^\/tonstatus(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const d = await tonGet<any>('/status');
+    const autoBuy = d.auto_buy ? '✅ ON' : '❌ OFF (dry-run)';
+    const lines = [
+      `💎 *TON NETWORK STATUS*`,
+      ``,
+      `*Auto-Buy:* ${autoBuy}`,
+      `*TON Balance:* ${d.balance ?? '?'}`,
+      `*Open positions:* ${d.open_positions ?? 0}`,
+      `*Total trades:* ${d.total_trades ?? 0}`,
+      ``,
+      `*Wallet:* \`${d.wallet ?? 'not set'}\``,
+      ``,
+      `/tonpositions — open positions`,
+      `/tontrades — trade history`,
+      `/tonpnl — PnL summary`,
+    ];
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ TON scanner: ${e.message}\nIs ton-scanner running?`);
+  }
+}));
+
+// /tonpositions — PRO: open TON positions
+bot.onText(/^\/tonpositions(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const d = await tonGet<any>('/positions');
+    const positions: any[] = d.positions ?? [];
+    if (!positions.length) return send(chatId, '💎 No open TON positions.');
+    const lines = [`💎 *OPEN TON POSITIONS* (${positions.length})`, ``];
+    for (const p of positions) {
+      const holdMin = Math.floor((Date.now() - new Date(p.bought_at).getTime()) / 60000);
+      const tpIdx = Number(p.tp_index ?? 0);
+      lines.push(`• *${p.symbol}* — ${Number(p.amount_ton).toFixed(2)} TON`);
+      lines.push(`  dex:${p.dex} | hold:${holdMin}min | tp_idx:${tpIdx} | safe:${p.safe_score}`);
+      lines.push(`  \`${p.jetton_address}\``);
+    }
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ TON positions error: ${e.message}`);
+  }
+}));
+
+// /tontrades — PRO: TON trade history
+bot.onText(/^\/tontrades(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const d = await tonGet<any>('/trades?limit=8');
+    const trades: any[] = d.trades ?? [];
+    if (!trades.length) return send(chatId, '💎 No TON trades yet.');
+    const lines = [`💎 *TON TRADES (last ${trades.length})*`, ``];
+    for (const t of trades) {
+      const tonIn  = Number(t.amount_ton ?? 0);
+      const tonOut = Number(t.total_sold_ton ?? 0);
+      const mult   = tonIn > 0 && tonOut > 0 ? tonOut / tonIn : 0;
+      const pnlStr = tonOut > 0 ? `${mult.toFixed(2)}x → +${(tonOut - tonIn).toFixed(3)} TON` : 'unsold';
+      const icon   = mult >= 1 ? '✅' : (mult > 0 ? '❌' : '⏳');
+      lines.push(`${icon} *${t.symbol}* ${pnlStr} [${t.sell_reason ?? '?'}]`);
+    }
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ TON trades error: ${e.message}`);
+  }
+}));
+
+// /tonpnl — PRO: TON PnL summary
+bot.onText(/^\/tonpnl(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const d = await tonGet<any>('/pnl');
+    const net = Number(d.net_pnl_ton ?? 0);
+    const wr  = d.total_trades > 0 ? ((d.wins / d.total_trades) * 100).toFixed(0) : '0';
+    const icon = net >= 0 ? '✅' : '❌';
+    const lines = [
+      `💎 *TON PnL SUMMARY*`,
+      ``,
+      `Trades: ${d.total_trades} | Wins: ${d.wins} | Losses: ${d.losses} | WR: ${wr}%`,
+      `Spent: ${Number(d.total_spent).toFixed(3)} TON`,
+      `Received: ${Number(d.total_received).toFixed(3)} TON`,
+      `${icon} *Net: ${net >= 0 ? '+' : ''}${net.toFixed(3)} TON*`,
+    ];
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ TON PnL error: ${e.message}`);
   }
 }));
 

@@ -1002,6 +1002,47 @@ export function registerRoutes(app: Application) {
   app.get('/base/tokens',          (req, res) => proxyBase(res, `/base/tokens?limit=${req.query.limit ?? 20}`));
   app.get('/base/stats',           (req, res) => proxyBase(res, `/base/stats?days=${req.query.days ?? 7}`));
   app.post('/base/buy', async (req, res) => proxyBase(res, '/base/buy', { method: 'POST', body: req.body }));
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TON NETWORK — proxy to ton-scanner service
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  const TON_SCANNER_URL = process.env.TON_SCANNER_URL ?? 'http://ton-scanner:4007';
+
+  async function proxyTon(res: Response, path: string, opts?: { method?: string; body?: any }) {
+    const http = await import('http');
+    const url  = new URL(path, TON_SCANNER_URL);
+    return new Promise<void>((resolve) => {
+      const reqOpts = {
+        hostname: url.hostname,
+        port:     url.port || 4007,
+        path:     url.pathname + url.search,
+        method:   opts?.method ?? 'GET',
+        headers:  opts?.body ? { 'Content-Type': 'application/json' } : {},
+      };
+      const req2 = http.request(reqOpts, (r2) => {
+        let body = '';
+        r2.on('data', (d: Buffer) => { body += d.toString(); });
+        r2.on('end', () => {
+          try   { res.status(r2.statusCode ?? 200).json(JSON.parse(body)); }
+          catch { res.status(500).json({ ok: false, error: 'ton-scanner parse error' }); }
+          resolve();
+        });
+      });
+      req2.on('error', (e: Error) => {
+        res.status(503).json({ ok: false, error: `ton-scanner unavailable: ${e.message}` });
+        resolve();
+      });
+      if (opts?.body) req2.write(JSON.stringify(opts.body));
+      req2.end();
+    });
+  }
+
+  app.get('/ton/status',    (_req, res) => proxyTon(res, '/status'));
+  app.get('/ton/positions', (req, res)  => proxyTon(res, '/positions'));
+  app.get('/ton/trades',    (req, res)  => proxyTon(res, `/trades?limit=${req.query.limit ?? 30}`));
+  app.get('/ton/pnl',       (_req, res) => proxyTon(res, '/pnl'));
+  app.get('/ton/health',    (_req, res) => proxyTon(res, '/health'));
 }
 
 // ─── GAD AI narrative builders ────────────────────────────────────────────────

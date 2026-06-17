@@ -286,5 +286,43 @@ services:
         condition: service_healthy
       api:
         condition: service_started
+
+  ton-scanner:
+    build:
+      context: .
+      dockerfile: services/ton-scanner/Dockerfile
+    container_name: gad-ai-ton-scanner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      PORT: "4007"
+      TON_AUTO_BUY: "${TON_AUTO_BUY:-false}"
+      TON_BUY_AMOUNT: "${TON_BUY_AMOUNT:-2}"
+      TON_MAX_POSITIONS: "${TON_MAX_POSITIONS:-3}"
+      TON_DAILY_MAX_TON: "${TON_DAILY_MAX_TON:-20}"
+      TON_SCAN_INTERVAL_SEC: "${TON_SCAN_INTERVAL_SEC:-60}"
+      TON_MIN_LIQUIDITY_USD: "${TON_MIN_LIQUIDITY_USD:-5000}"
+      TON_MAX_LIQUIDITY_USD: "${TON_MAX_LIQUIDITY_USD:-200000}"
+      TON_MIN_PC1H: "${TON_MIN_PC1H:-5}"
+      TON_MAX_PC1H: "${TON_MAX_PC1H:-60}"
+      TON_MIN_PC5M: "${TON_MIN_PC5M:-1}"
+      TON_MAX_BUY_SELL_RATIO: "${TON_MAX_BUY_SELL_RATIO:-3.0}"
+      TON_MAX_AGE_SEC: "${TON_MAX_AGE_SEC:-86400}"
+      TON_MIN_BUYS_H1: "${TON_MIN_BUYS_H1:-5}"
+      TON_MIN_SAFE_SCORE: "${TON_MIN_SAFE_SCORE:-40}"
+      TON_STOP_LOSS_PCT: "${TON_STOP_LOSS_PCT:-8}"
+      TON_TRAIL_PCT: "${TON_TRAIL_PCT:-10}"
+      TON_TIME_LIMIT_SEC: "${TON_TIME_LIMIT_SEC:-600}"
+      TON_POLL_INTERVAL_SEC: "${TON_POLL_INTERVAL_SEC:-15}"
+    ports:
+      - "4007:4007"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+
 volumes:
   postgres-data:

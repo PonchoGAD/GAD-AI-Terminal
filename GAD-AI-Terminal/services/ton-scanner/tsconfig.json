@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "isolatedModules": false,
+    "strict": false,
+    "baseUrl": "../..",
+    "paths": {
+      "@lib/db":  ["libs/db/src/index.d.ts"],
+      "@lib/ton": ["libs/ton/src/index.d.ts"]
+    }
+  },
+  "include": ["src/**/*"]
+}
