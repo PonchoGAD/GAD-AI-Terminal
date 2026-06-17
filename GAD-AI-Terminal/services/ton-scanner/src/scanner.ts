@@ -30,7 +30,7 @@ async function getDailySpend(): Promise<number> {
      WHERE bought_at >= NOW() - INTERVAL '24 hours'`,
     []
   );
-  return Number(r[0]?.total ?? 0);
+  return Number(r.rows[0]?.total ?? 0);
 }
 
 async function getOpenCount(): Promise<number> {
@@ -38,7 +38,7 @@ async function getOpenCount(): Promise<number> {
     `SELECT COUNT(*) AS cnt FROM ton_positions WHERE is_active = true`,
     []
   );
-  return Number(r[0]?.cnt ?? 0);
+  return Number(r.rows[0]?.cnt ?? 0);
 }
 
 function filterToken(t: TonToken): string | null {

@@ -35,13 +35,14 @@ export async function runTonMonitorCycle(): Promise<void> {
   let positions: TonPosition[];
 
   try {
-    positions = await query<TonPosition>(
+    const res = await query<TonPosition>(
       `SELECT id, jetton_address, pool_address, symbol, wallet, amount_ton,
               token_amount, entry_price_ton, tp_index, trail_high, bought_at
        FROM ton_positions
        WHERE is_active = true`,
       []
     );
+    positions = res.rows;
   } catch (e: any) {
     console.error(`${label} DB query failed:`, e.message);
     return;

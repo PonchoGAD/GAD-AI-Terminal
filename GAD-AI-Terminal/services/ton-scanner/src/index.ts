@@ -26,8 +26,8 @@ app.get('/status', async (_req, res) => {
       wallet:    walletAddress,
       balance:   `${balance.toFixed(3)} TON`,
       auto_buy:  process.env.TON_AUTO_BUY === 'true',
-      open_positions: Number(positions[0]?.cnt ?? 0),
-      total_trades:   Number(trades[0]?.cnt ?? 0),
+      open_positions: Number(positions.rows[0]?.cnt ?? 0),
+      total_trades:   Number(trades.rows[0]?.cnt ?? 0),
     });
   } catch (e: any) {
     res.status(500).json({ ok: false, error: e.message });
@@ -37,7 +37,7 @@ app.get('/status', async (_req, res) => {
 // ─── Positions ────────────────────────────────────────────────────────────────
 app.get('/positions', async (_req, res) => {
   try {
-    const rows = await query(
+    const r = await query(
       `SELECT id, jetton_address, symbol, name, dex,
               amount_ton, token_amount, entry_price_ton, entry_mcap_usd,
               tp_index, trail_high, safe_score, liq_at_entry, pc1h_at_entry,
@@ -45,7 +45,7 @@ app.get('/positions', async (_req, res) => {
        FROM ton_positions WHERE is_active=true ORDER BY bought_at DESC`,
       []
     );
-    res.json({ ok: true, positions: rows });
+    res.json({ ok: true, positions: r.rows });
   } catch (e: any) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -55,14 +55,14 @@ app.get('/positions', async (_req, res) => {
 app.get('/trades', async (req, res) => {
   const limit = Number(req.query.limit ?? 30);
   try {
-    const rows = await query(
+    const r2 = await query(
       `SELECT id, symbol, dex, amount_ton, entry_price_ton,
               total_sold_ton, sell_reason, bought_at, sold_at
        FROM ton_positions WHERE sold_at IS NOT NULL
        ORDER BY sold_at DESC LIMIT $1`,
       [limit]
     );
-    res.json({ ok: true, trades: rows });
+    res.json({ ok: true, trades: r2.rows });
   } catch (e: any) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -84,8 +84,8 @@ app.get('/pnl', async (_req, res) => {
        FROM ton_positions`,
       []
     );
-    const d = r[0];
-    const net = Number(d.total_received) - Number(d.total_spent);
+    const d = r.rows[0];
+    const net = Number(d?.total_received ?? 0) - Number(d?.total_spent ?? 0);
     res.json({
       ok: true,
       total_trades: Number(d.total_trades),

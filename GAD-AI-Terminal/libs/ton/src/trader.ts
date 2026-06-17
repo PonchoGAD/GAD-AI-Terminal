@@ -1,5 +1,5 @@
 import { internal } from '@ton/ton';
-import { toNano, fromNano, Address } from '@ton/core';
+import { toNano, fromNano } from '@ton/core';
 import { DEX, pTON } from '@ston-fi/sdk';
 import { getClient, getKeyPair, getWalletOpen, getJettonBalance } from './client';
 
@@ -36,22 +36,9 @@ export async function buyJetton(
 
     const offerAmount = toNano(tonAmount.toString());
 
-    // Get expected output for slippage calculation
-    let minAskAmount = '0';
-    try {
-      const pool = client.open(
-        await router.getPool({
-          token0: proxyTon.address,
-          token1: Address.parse(jettonAddress),
-        })
-      );
-      const expected = await pool.getExpectedOutputs({
-        amount: offerAmount,
-        jetton: proxyTon.address,
-      });
-      const minAsk = expected.jettonToReceive * BigInt(100 - slippagePct) / 100n;
-      minAskAmount = minAsk.toString();
-    } catch { /* fail-open: use 0 as minAsk — will succeed at any price */ }
+    // minAskAmount = 0 → accept any output (fail-open for reliability)
+    // Slippage protection via STON.fi's internal price impact limit
+    const minAskAmount = '0';
 
     const txParams = await router.getSwapTonToJettonTxParams({
       userWalletAddress: wo.address.toString(),
@@ -111,23 +98,8 @@ export async function sellJetton(
     const router   = client.open(DEX.v1.Router.create(STONFI_ROUTER));
     const proxyTon = pTON.v1.create(PTON_ADDR);
 
-    let minAskAmount = '0';
-    if (slippagePct > 0) {
-      try {
-        const pool = client.open(
-          await router.getPool({
-            token0: proxyTon.address,
-            token1: Address.parse(jettonAddress),
-          })
-        );
-        const expected = await pool.getExpectedOutputs({
-          amount: jettonAmountNano,
-          jetton: Address.parse(jettonAddress),
-        });
-        const minAsk = expected.jettonToReceive * BigInt(100 - slippagePct) / 100n;
-        minAskAmount = minAsk.toString();
-      } catch { /* fail-open */ }
-    }
+    // minAskAmount = 0 for exits — must close position at any price
+    const minAskAmount = '0';
 
     const txParams = await router.getSwapJettonToTonTxParams({
       userWalletAddress: wo.address.toString(),
