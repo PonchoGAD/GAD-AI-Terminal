@@ -895,10 +895,10 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     }
 
     // ── MAYHEM MODE filter: skip tokens in violent pump/dump phase ──
-    // pc5m > 50% = already in blow-off top, likely about to dump hard
+    // pc5m > 20% = already in blow-off top on Raydium, we'd be entering the tail
     // pc5m < -20% = already crashing, don't catch the falling knife
-    if (vol5m > 0 && (pc5m > 50 || pc5m < -20)) {
-      console.debug(`[raydium-scan] ✗mayhem ${sym.padEnd(10)} pc5m:${pc5m.toFixed(1)}% (MAYHEM MODE — skip)`);
+    if (vol5m > 0 && (pc5m > 20 || pc5m < -20)) {
+      console.debug(`[raydium-scan] ✗mayhem ${sym.padEnd(10)} pc5m:${pc5m.toFixed(1)}% (${pc5m > 20 ? 'late-pump tail' : 'crashing'} — skip)`);
       skipped.hype++; continue;
     }
 

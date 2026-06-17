@@ -1077,7 +1077,9 @@ async function deactivateStuckJobs() {
 
 export async function startAutobuyScheduler() {
   console.info(`[autobuy] Scheduler started. Poll every ${POLL_MS / 1000}s.`);
-  console.info(`[autobuy] Sell stages: ${SELL_STAGES.map(s => `${s.multiplier}x(${s.sellPct}%)`).join(' → ')}`);
+  // Show example stages for T1 in current-regime context (actual stages are dynamic per getLiqTier)
+  const exampleTier = getLiqTier(50000, 'NEUTRAL');
+  console.info(`[autobuy] Sell stages (T1/NEUTRAL example): ${exampleTier.sellStages.map(s => `${s.multiplier === 999 ? 'trail' : s.multiplier + 'x'}(${s.sellPct}%)`).join(' → ')}`);
   console.info(`[autobuy] Slippage — buy: ${AUTOBUY_SLIPPAGE_BPS}bps, sell: ${AUTOSELL_SLIPPAGE_BPS}bps`);
   console.info(`[autobuy] Stop-loss: ${STOP_LOSS_PCT > 0 ? `${(STOP_LOSS_PCT * 100).toFixed(0)}%` : 'disabled'}`);
   const earlyTrailPct = Number(process.env.EARLY_TRAIL_PCT || '6');

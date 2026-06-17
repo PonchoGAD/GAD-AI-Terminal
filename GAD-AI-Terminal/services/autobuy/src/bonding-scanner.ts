@@ -221,12 +221,28 @@ async function buyOnBondingCurve(
     const resp = await axios.post(
       PUMPPORTAL_BUY,
       { publicKey: keypair.publicKey.toBase58(), action: 'buy', mint,
-        amount: amountSol, denominatedInSol: 'true', slippage: 25, priorityFee: 0.002, pool },
+        amount: amountSol, denominatedInSol: 'true', slippage: 25, priorityFee: 0.003, pool },
       { responseType: 'arraybuffer', timeout: 15_000 }
     );
     const txBytes = new Uint8Array(resp.data as ArrayBuffer);
     const txSignature = await sendPumpTx(txBytes, keypair, connection, true);
-    await connection.confirmTransaction(txSignature, 'confirmed');
+    try {
+      await connection.confirmTransaction(txSignature, 'confirmed');
+    } catch (confirmErr: any) {
+      // Timeout — TX may have landed. Poll getTransaction to verify.
+      if (confirmErr.message?.includes('was not confirmed')) {
+        console.warn(`[bonding-scan] Confirm timeout — checking TX on-chain: ${txSignature.slice(0, 20)}`);
+        await new Promise(r => setTimeout(r, 5000));
+        const txInfo = await connection.getTransaction(txSignature, { maxSupportedTransactionVersion: 0 }).catch(() => null);
+        if (txInfo && !txInfo.meta?.err) {
+          console.info(`[bonding-scan] ✅ TX confirmed after extra wait: ${txSignature.slice(0, 20)}`);
+          return { success: true, txSignature };
+        }
+        console.warn(`[bonding-scan] TX not found on-chain after timeout — treating as failed`);
+        return { success: false, error: 'TX not confirmed in 35s' };
+      }
+      throw confirmErr;
+    }
     console.info(`[bonding-scan] ✅ Bought ${mint.slice(0, 8)} for ${amountSol} SOL | tx:${txSignature.slice(0, 20)}`);
     return { success: true, txSignature };
   } catch (err: any) {
