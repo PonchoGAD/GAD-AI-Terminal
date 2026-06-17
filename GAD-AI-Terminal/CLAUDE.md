@@ -224,6 +224,25 @@ console.warn('[sell] ...')
   - Сайт (`gadai.shop`): Vercel → `PonchoGAD/gadai.git` → `C:\Users\gafit\saas-landing-demo`
   - Деплой сайта: `cd C:\Users\gafit\saas-landing-demo && git push gadai main`
 - [x] **EXTREME_FEAR порог снижен до 13 (14.06.2026):** бот покупает при F&G 13-45 (FEAR = contrarian buy zone)
+- [x] **GRAD/Score80/Whale стратегии отключены (17.06.2026):** 100% loss rate
+  - `graduation-scanner.ts`: добавлен `GRAD_HUNTER_ENABLED` чек перед покупкой — при false логирует и пропускает
+  - `scheduler.ts`: явный лог `✅ GRAD scanner disabled` при старте; `SCORE80_SIGNAL_ENABLED=false`, `WHALE_SIGNAL_ENABLED=false` — hardcoded
+  - GRAD WebSocket остаётся подключён для pre-graduation exit guard
+- [x] **SOL Velocity Tracker v2 (17.06.2026):** АКТИВЕН на VPS
+  - Реальный PumpPortal WebSocket сигнал вместо DexScreener polling (0 lag)
+  - Зона входа: 25-80 SOL в кривой (7-14% от graduation threshold 588 SOL)
+  - Velocity: сумма `solAmount` за 60s ≥ 3 SOL (реальный поток денег)
+  - Anti-whale: пропуск если одна покупка > 5 SOL (manipulation guard)
+  - Unique buyers ≥ 8, последний трейд < 30s назад (momentum alive)
+  - Pre-graduation exit: если vSol > 488 (588-100) и есть позиция → PRE_GRAD_EXIT немедленно
+  - Time limit: 90s, TP: 100% на 1.5x, Stop: 12%
+  - Env: `SOL_VELOCITY_ENABLED=true`, `SOL_VELOCITY_BUY_SOL=0.012`
+- [x] **VPS RAM увеличена (17.06.2026):** пользователь изменил тип сервера в Hetzner (RAM увеличилась)
+  - ВНИМАНИЕ: RAM ≠ Disk. Диск остался 38GB, заполнен на 100%
+  - Фикс диска: `tune2fs -m 2 /dev/sda1` → снизили reserved блоки с 5% до 2%, освободили 291MB
+  - PostgreSQL падал с "could not write lock file postmaster.pid: No space left on device"
+  - Hot-patch метод деплоя: `scp .ts → docker cp → docker exec build → docker restart` (без пересборки образа)
+  - КРИТИЧНО: нужно добавить Hetzner Volume или перейти на тип с большим диском
 
 ---
 
@@ -273,14 +292,20 @@ console.warn('[sell] ...')
 
 ### КРИТИЧНО
 - [x] ~~W3 нужна пополнение SOL~~ — DJ8Tq8vi теперь 0.13 SOL ✅ (пополнен 14.06.2026)
+- [ ] **⚠️ ДИСК VPS КРИТИЧЕСКИ ЗАПОЛНЕН (17.06.2026):** 38GB, 0 байт свободно
+  - Временный фикс: `tune2fs -m 2 /dev/sda1` — reserved blocks 5%→2%, дало 291MB
+  - Решение: добавить Hetzner Volume (20GB = ~5€/мес) ИЛИ перейти на тип сервера с бо́льшим диском
+  - RAM ≠ Disk: увеличение RAM не добавляет диск. Нужно отдельно: Hetzner → Server → Volumes → Create Volume
+  - `docker builder prune -af` теперь даёт 0B (build cache пуст). Диск занят ОБРАЗАМИ запущенных контейнеров
+  - До расширения диска: деплой через hot-patch (scp + docker exec build), НЕ docker compose build
 - [ ] **Metadata enrichment** — tokens.symbol/name остаются NULL
 - [ ] **ANTHROPIC_API_KEY** в VPS .env — нужен для trend-engine AI генерации идей
 - [ ] **Migration 011** применить на VPS: `docker compose exec -T postgres psql -U gad -d gad_ai < migrations/011_trend_engine.sql`
 - [ ] **Health checks** для scanner, telegram, autobuy, whale-tracker
 - [ ] **Futures LIVE MODE:** отключён по умолчанию (FUTURES_LIVE_MODE=false → paper trading). Для real Drift Protocol включить через .env + депозит USDC на Drift аккаунт
 - [ ] **PumpSwap graduated token sells** — HOT токены > $8k mcap нужно продавать через Jupiter, не PumpPortal. Сейчас ограничено max $8k в HOT poller.
-- [ ] **Периодический pruning Docker cache** — `docker builder prune -af` на VPS раз в 1-2 недели (диск был 100% 14.06.2026, PostgreSQL упал)
 - [ ] **Auto-launch на VPS** — токены сейчас запускаются только локально через scripts/. Нужна Telegram /auto_launch команда.
+- [ ] **Velocity Tracker — 50 трейдов перед масштабированием:** собрать P&L отчёт, сравнить с -37% baseline, тогда решать увеличивать ли позицию с 0.012 SOL
 
 ### ВАЖНО
 - [ ] **Unit-тесты** для rug, gad-score, narrative, survival, dna, social, lifecycle, regime
@@ -411,7 +436,7 @@ docker logs gad-ai-autobuy --tail=20
 
 ---
 
-## Текущие параметры бота (VPS .env — 14.06.2026)
+## Текущие параметры бота (VPS .env — 17.06.2026)
 
 ```bash
 AUTO_BUY_ENABLED=true
@@ -463,6 +488,18 @@ BIRDEYE_API_KEY=b027655dffa446308f5073d48653c5d2
 PUMP_PORTAL_ENABLED=true
 PUMP_MIN_LIQUIDITY_USD=9000
 PUMP_MIN_TOKEN_AGE_SEC=1200
+
+# SOL Velocity Tracker (добавлено 17.06.2026 — АКТИВЕН):
+SOL_VELOCITY_ENABLED=true
+SOL_VELOCITY_BUY_SOL=0.012         # 0.012 SOL на сделку (тестовый размер)
+SOL_VELOCITY_MIN_SOL=25            # минимум SOL в кривой (7% от graduation)
+SOL_VELOCITY_MAX_SOL=80            # максимум (безопасно от graduation)
+SOL_VELOCITY_MIN_SOL_PER_60S=3    # минимальный поток SOL за 60 сек
+SOL_VELOCITY_MIN_UNIQUE_BUYERS=8  # мин уникальных покупателей
+SOL_VELOCITY_MAX_SINGLE_BUY=5     # anti-whale: пропуск если 1 покупка > 5 SOL
+SOL_VELOCITY_MAX_LAST_TRADE_GAP_SEC=30  # momentum умер если нет трейдов 30s
+SOL_VELOCITY_TIME_LIM_SEC=90      # 90s жёсткий лимит
+SOL_VELOCITY_STOP_PCT=0.12        # 12% stop-loss
 ```
 
 ---
@@ -485,6 +522,29 @@ PUMP_MIN_TOKEN_AGE_SEC=1200
 - 30-120 мин: Основной памп (200-900% у победителей)
 - 2-6 ч: Дистрибуция
 - 6+ ч: Стабилизация или смерть
+
+---
+
+### 2026-06 — GRAD/Score80/Whale стратегии принудительно отключены
+**Решение:** Три стратегии с историческим P&L -54% до -100% заблокированы на уровне кода.
+**Почему GRAD упускался при GRAD_HUNTER_ENABLED=false:** `graduation-scanner.ts` не читал этот флаг — WebSocket подключался и покупки делались. Фикс: добавлен явный чек внутри файла.
+**Правило:** GRAD WebSocket остаётся подключён — нужен для pre-graduation exit (если наша velocity-позиция приближается к 588 SOL). Это не баг.
+
+### 2026-06 — SOL Velocity Tracker vs DexScreener HOT poller
+**Решение:** Velocity Tracker через PumpPortal WebSocket (реальное время) вместо DexScreener polling.
+**Почему HOT/MOVER терял деньги:** DexScreener лаг 30-60с. Спайк происходил → через 60с DexScreener обновлялся → мы покупали ТОП спайка, откат = стоп-лосс.
+**Velocity:** сумма solAmount за 60с, не delta marketCapSol — это реальный поток денег в кривую.
+**Anti-whale:** пропуск если 1 покупка > 5 SOL — whale spike виден как искусственный памп, не органическое накопление.
+
+### 2026-06 — Hot-patch деплой при заполненном диске (17.06.2026)
+**Проблема:** Docker build требует ~500MB+ временного пространства (node_modules содержит Next.js ~300MB). Диск 38GB = 100%.
+**Фикс:** `tune2fs -m 2 /dev/sda1` → reserved 5%→2% → 291MB свободно (только для postgres, не для docker build).
+**Hot-patch протокол:**
+1. `scp -i ~/.ssh/gad_deploy file.ts root@VPS:/tmp/`
+2. `docker cp /tmp/file.ts container:/usr/src/app/services/autobuy/src/`
+3. `docker exec container sh -c 'cd /usr/src/app && npm --workspace services/autobuy run build'`
+4. `docker restart container`
+**ВАЖНО:** при `docker compose up -d --no-deps` контейнер пересоздаётся из IMAGE → patch теряется → нужно снова hot-patch после каждого recreate.
 
 ---
 
@@ -526,6 +586,14 @@ DRILL достиг 58x но все TP sells упали. Потеря 50% при 
 Docker build cache вырос до 8.7GB → диск 100% → PostgreSQL упал с "No space left on device".
 Фикс: `docker builder prune -af` → 7.5GB freed → `docker restart gad-ai-postgres`.
 **Профилактика:** Запускать `docker builder prune -af` на VPS раз в 1-2 недели.
+
+### Диск 100% — образами, не кешем (17.06.2026)
+Диск 38GB заполнен 14 запущенными контейнерами (~25GB rootfs) + другие проекты (auto-search: 7GB, shopify-bot: 4GB).
+`docker builder prune -af` = 0B (кеш уже пуст). Docker прун не помогает когда образы используются контейнерами.
+Временный фикс: `tune2fs -m 2 /dev/sda1` — снизить reserved blocks с 5% до 2% (+291MB для non-root).
+PostgreSQL падает с "could not write lock file postmaster.pid: No space left on device" — postgres user не root, нет reserved blocks.
+**Решение:** добавить Hetzner Volume 20GB (Volumes → Create, mount to /mnt/data, docker data-root на /mnt/data) ИЛИ перейти на CPX41 (160GB диск).
+**RAM увеличение ≠ диск увеличение** — это разные ресурсы в Hetzner. Изменить RAM в настройках сервера не изменяет размер диска /dev/sda1.
 
 ### W3 GADAI продажа не прошла (14.06.2026)
 W3 (DJ8Tq8vi) держит 1,407,117 $GADAI (~$2.75 при mcap $1,955). SOL баланс 0.0027.
