@@ -90,6 +90,28 @@ async function checkHolderMomentum(mint: string): Promise<{ ok: boolean; holders
   }
 }
 
+// ─── Top Holder Check (Rug Protection) ───────────────────────────────────────
+const SOLANA_RPC = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.solana.com';
+const TOP_HOLDER_RUG_PCT = Number(process.env.TOP_HOLDER_RUG_PCT || '50');
+
+async function checkTopHolder(mint: string): Promise<number> {
+  try {
+    const resp = await axios.post(SOLANA_RPC, {
+      jsonrpc: '2.0', id: 1,
+      method: 'getTokenLargestAccounts',
+      params: [mint, { commitment: 'confirmed' }],
+    }, { timeout: 4_000 });
+    const accounts: any[] = resp.data?.result?.value ?? [];
+    if (accounts.length < 2) return 0;
+    const top = Number(accounts[0].uiAmount ?? accounts[0].amount ?? 0);
+    const total = accounts.reduce((s: number, a: any) => s + Number(a.uiAmount ?? a.amount ?? 0), 0);
+    if (total <= 0) return 0;
+    return (top / total) * 100;
+  } catch {
+    return 0; // fail-open: allow buy if RPC unavailable
+  }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function getDailySpent(): Promise<number> {
@@ -1001,11 +1023,21 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       continue;
     }
 
+    // ── Gate 6: Top holder rug check ──
+    // Single wallet holding >50% of supply = dev can dump at any moment
+    const topHolderPct = await checkTopHolder(mint);
+    if (topHolderPct > TOP_HOLDER_RUG_PCT) {
+      console.info(`[raydium-scan] 🐋 SKIP ${pair.baseToken?.symbol ?? mint.slice(0,8)} — top holder ${topHolderPct.toFixed(0)}% (>${TOP_HOLDER_RUG_PCT}% = rug risk)`);
+      skipped.bot++;
+      continue;
+    }
+
     const slippage = shield.slippage_bps;
+    const rugTag = topHolderPct > 0 ? ` top_holder:${topHolderPct.toFixed(0)}%` : '';
     console.info(
       `[raydium-scan] 🟢 PASS ${pair.baseToken?.symbol ?? mint.slice(0,8)} (${mint.slice(0,8)}) ` +
       `liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc5m:${pc5m.toFixed(1)}% pc1h:${pc1h.toFixed(1)}% ` +
-      `buys5m:${buys5m} sells5m:${sells5m} buys1h:${buys1h} age:${(ageSec/3600).toFixed(1)}h`
+      `buys5m:${buys5m} sells5m:${sells5m} buys1h:${buys1h} age:${(ageSec/3600).toFixed(1)}h${rugTag}`
     );
 
     try {
