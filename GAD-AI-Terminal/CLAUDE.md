@@ -193,6 +193,14 @@ console.warn('[sell] ...')
   - Telegram: /basestatus /basepositions /basetrades /basetokens (PRO/STARTER+)
   - API: /base/* routes proxied from api service to base-scanner:4005
   - Docker: `BASE_AUTO_BUY=false` by default (dry-run) — set to true + add BASE_WALLET_PRIVATE_KEY to activate
+- [x] **TON Network Integration (17.06.2026):** migration 020, libs/ton, services/ton-scanner, port 4007
+  - libs/ton: TonClient + WalletContractV4, STON.fi v1 router (buy/sell Jettons), tonapi.io safety, GeckoTerminal + DexScreener discovery
+  - ton-scanner: token discovery (GeckoTerminal + DexScreener every 60s), 5-stage TP (1.2/1.5/2.0/3.0/5.0x), trail stop 10%, SL 8%, time limit 10min
+  - Telegram: /tonstatus /tonpositions /tontrades /tonpnl (PRO)
+  - API: /ton/* routes proxied from api service to ton-scanner:4007
+  - Docker: `TON_AUTO_BUY=false` by default (dry-run) — requires TON_WALLET_MNEMONIC + TON_API_KEY to activate
+  - **Config для активации:** добавить в VPS .env: `TON_WALLET_MNEMONIC=word1...word24`, `TON_API_KEY=<toncenter key>`, `TON_AUTO_BUY=true`
+  - Deps: `@ton/ton@^15`, `@ton/crypto@^3`, `@ton/core@^0.62`, `@ston-fi/sdk@^2.2`, `@ston-fi/api@*`
 - [x] **Market Regime Gating для Raydium autobuy (14.06.2026):**
   - `getFearGreed()` — Fear&Greed API (alternative.me), кеш 30мин
   - `getMarketRegime()` → EXTREME_FEAR/FEAR/NEUTRAL/BULL/EUPHORIA (или overrideMARKET_REGIME=AUTO)
@@ -248,6 +256,7 @@ console.warn('[sell] ...')
 | landing | 3001 | ✅ 24/7 | gadai.shop |
 | futures | 4003 | ✅ 24/7 | BTC futures анализ (paper mode) |
 | base-scanner | 4005 | ✅ 24/7 | Base Network EVM (dry-run) |
+| ton-scanner | 4007 | ✅ 24/7 | TON Network / STON.fi (dry-run, needs TON_WALLET_MNEMONIC) |
 
 **Только локально (НЕ на VPS):**
 - `scripts/launch-*.ts` — запуск токенов на pump.fun (нужен ключ + pumpdotfun-sdk локально)
