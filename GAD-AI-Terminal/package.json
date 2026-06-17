@@ -66,6 +66,6 @@
     "@ton/crypto": "^3.3.0",
     "@ton/core": "^0.62.0",
     "@ston-fi/sdk": "^2.2.0",
-    "@ston-fi/api": "^2.0.0"
+    "@ston-fi/api": "*"
   }
 }
