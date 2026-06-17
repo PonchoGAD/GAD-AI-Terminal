@@ -482,7 +482,7 @@ BONDING_HOT_MAX_MCAP_USD=8000   # max mcap при покупке $8k (было $
 
 # Birdeye:
 BIRDEYE_MIN_HOLDERS=70
-BIRDEYE_API_KEY=b027655dffa446308f5073d48653c5d2
+BIRDEYE_API_KEY=<rotated — see VPS .env>
 
 # PumpPortal:
 PUMP_PORTAL_ENABLED=true
