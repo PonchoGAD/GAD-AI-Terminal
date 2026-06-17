@@ -576,6 +576,8 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     console.debug(`[raydium-scan] Direct Raydium endpoint error: ${e.message?.slice(0, 40)}`);
   }
 
+  const raydiumDexCount = results.length;
+
   // Source 1: DexScreener token-profiles/latest — freshly launched tokens with community profiles.
   // These are brand-new tokens someone just added a profile for — high community engagement signal.
   try {
