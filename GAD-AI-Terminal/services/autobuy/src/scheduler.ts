@@ -637,18 +637,22 @@ async function checkAndExecuteSells(walletAddress: string) {
 
     // ── Stop-loss check (with stop-hunt protection) ───────────────────────────
     if (STOP_LOSS_PCT > 0) {
-      // Fresh tokens get slightly wider stop (10% vs 8%) to survive initial volatility.
-      // Use tier-specific stop-loss — T1/T2 = tight (5%), T3 = wider (8%, less volatile)
       const effectiveStop = jobTier.stopPct || STOP_LOSS_PCT;
+      // After TP1 (sell_stage_reached >= 1): move stop to entry price (BREAKEVEN STOP).
+      // This ensures a winning trade can NEVER turn into a losing trade.
+      // Example: TP1 hits at 1.12x → remaining 80% has stop at entry (not -9% below).
+      const stopFloor = (refStage.sell_stage_reached >= 1)
+        ? refEntry                          // breakeven — price back to entry = full exit
+        : refEntry * (1 - effectiveStop);   // normal stop (-7% to -9% depending on tier)
 
-      if (refEntry > 0 && currentPriceSol < refEntry * (1 - effectiveStop)) {  // refEntry declared above in activity tracking block
+      if (refEntry > 0 && currentPriceSol < stopFloor) {  // refEntry declared above in activity tracking block
         // Require N consecutive readings below stop before firing — filters out 1-candle stop hunts
         const confirms = (stopLossConfirmCount.get(mint) ?? 0) + 1;
         stopLossConfirmCount.set(mint, confirms);
         if (confirms < STOP_LOSS_CONFIRMS_REQUIRED) {
           console.debug(
             `[autosell] ⚠️ Stop below ${mint.slice(0,8)} — ` +
-            `${currentPriceSol.toFixed(12)} < ${(refEntry * (1 - effectiveStop)).toFixed(12)} ` +
+            `${currentPriceSol.toFixed(12)} < ${stopFloor.toFixed(12)} ` +
             `(${confirms}/${STOP_LOSS_CONFIRMS_REQUIRED} confirms, waiting...)`
           );
           // Don't fire yet — check next cycle
@@ -656,8 +660,8 @@ async function checkAndExecuteSells(walletAddress: string) {
           stopLossConfirmCount.delete(mint);
           console.warn(
             `[autosell] 🛑 STOP-LOSS confirmed for ${mint.slice(0,8)} — ` +
-            `price ${currentPriceSol.toFixed(12)} < stop ${(refEntry * (1 - effectiveStop)).toFixed(12)} ` +
-            `(${(effectiveStop * 100).toFixed(0)}% below entry, ${STOP_LOSS_CONFIRMS_REQUIRED} confirms)`
+            `price ${currentPriceSol.toFixed(12)} < stop ${stopFloor.toFixed(12)} ` +
+            `(${refStage.sell_stage_reached >= 1 ? 'BREAKEVEN' : `${(effectiveStop * 100).toFixed(0)}%`} stop, ${STOP_LOSS_CONFIRMS_REQUIRED} confirms)`
           );
           const result = await claimAndSell(mint, refStage.autobuy_job_id, 100, 'STOP_LOSS', connection, keypair, !refStage.label?.includes(':pumpportal'));
           if (result === 'success') {
@@ -821,11 +825,16 @@ async function checkAndExecuteSells(walletAddress: string) {
           `tx:${sellResult.txSignature}`
         );
 
-        // After stage 1 (60% TP), record floor for moon bag protection
-        if (stage.stage_number === 1 && stage.sell_percent >= 55 && stage.trigger_mult < 50 && refEntry > 0) {
+        // Track highest TP reached as moon bag floor — after each TP stage, raise the floor.
+        // Moon bag sells 70% when price drops back below last TP (protects gains on remaining 20%).
+        // Works with both 3-stage (old) and 5-stage (new) TP systems.
+        if (stage.trigger_mult >= 1 && stage.trigger_mult < 50 && refEntry > 0) {
           const tpFloor = refEntry * stage.trigger_mult;
-          moonbagFloorMap.set(stage.autobuy_job_id, tpFloor);
-          console.info(`[autosell] 🌙 Moon bag active — floor set at ${tpFloor.toExponential(4)} SOL/tok for ${mint.slice(0,8)} (10% rides, floor at TP price)`);
+          const currentFloor = moonbagFloorMap.get(stage.autobuy_job_id) ?? 0;
+          if (tpFloor > currentFloor) {
+            moonbagFloorMap.set(stage.autobuy_job_id, tpFloor);
+            console.info(`[autosell] 🌙 Moon bag floor raised → TP${stage.stage_number} price ${tpFloor.toExponential(4)} for ${mint.slice(0,8)}`);
+          }
         }
 
         // Auto-close job when last sell stage executes (100% sell_percent or no pending stages left)
@@ -934,9 +943,20 @@ async function runBuyCycle() {
         }
       } catch (balErr: any) {
         console.warn(`[autobuy] Balance check error — fetching entry price from DexScreener: ${balErr.message}`);
-        // Fallback: use current market price as entry estimate (close enough for TP/SL)
         const dsPrice = await getPriceSolViaDS(job.mint_address);
         actualEntryReadable = dsPrice > 0 ? dsPrice : null;
+      }
+
+      // If balance check succeeded but price wasn't computed (uiAmount=0 edge case):
+      // use DexScreener current price as entry estimate so sell stages are created.
+      // Without this, positions stay stuck forever (fetchPendingSellStages requires IS NOT NULL).
+      if (!actualEntryReadable && !zeroBal) {
+        console.warn(`[autobuy] ${tag} — entry price not computed, fetching from DexScreener as fallback`);
+        const dsPrice = await getPriceSolViaDS(job.mint_address);
+        if (dsPrice > 0) {
+          actualEntryReadable = dsPrice;
+          console.info(`[autobuy] ${tag} — entry fallback: ${dsPrice.toExponential(4)} SOL/tok`);
+        }
       }
 
       if (zeroBal) {
@@ -969,10 +989,12 @@ async function runBuyCycle() {
 // ─── Cleanup stuck jobs ───────────────────────────────────────────────────────
 
 async function deactivateStuckJobs() {
+  // 1. Deactivate jobs with no successful buy (entry_price_sol IS NULL, error or stale)
   const { rows } = await query<{ id: string; mint_address: string; label: string }>(
     `UPDATE autobuy_jobs SET active = false
      WHERE active = true
        AND entry_price_sol IS NULL
+       AND bought_at IS NULL
        AND created_at < now() - interval '30 minutes'
        AND (
          (label LIKE 'auto:%' AND error_count > 0)
@@ -981,10 +1003,68 @@ async function deactivateStuckJobs() {
      RETURNING id, mint_address, label`
   );
   for (const row of rows) {
-    console.warn(
-      `[autobuy] 🧹 Stuck job ${row.id.slice(0,8)} ` +
-      `(${row.label ?? row.mint_address.slice(0,8)}) deactivated — no successful buy`
-    );
+    console.warn(`[autobuy] 🧹 Stuck job ${row.id.slice(0,8)} (${row.label ?? row.mint_address.slice(0,8)}) deactivated — no buy`);
+  }
+
+  // 2. Rescue positions where buy SUCCEEDED but entry_price_sol was not recorded.
+  // These never appear in fetchPendingSellStages (requires IS NOT NULL) → stuck forever.
+  // Fix: fetch current price from DexScreener and use as entry estimate so sell stages can fire.
+  const { rows: stuck } = await query<{ id: string; mint_address: string; amount_sol: string; label: string }>(
+    `SELECT j.id, j.mint_address, j.amount_sol, j.label
+     FROM autobuy_jobs j
+     WHERE j.active = true
+       AND (j.entry_price_sol IS NULL OR j.entry_price_sol = 0)
+       AND j.bought_at IS NOT NULL
+       AND j.bought_at < now() - interval '10 minutes'
+       AND j.label LIKE 'auto:%'
+     LIMIT 5`
+  );
+  for (const job of stuck) {
+    console.warn(`[autobuy] 🔧 Rescuing stuck position ${job.mint_address.slice(0,8)} — buy OK but no entry price`);
+    try {
+      const keypairForRescue = getKeypairFromEnv();
+      if (!keypairForRescue) { await query(`UPDATE autobuy_jobs SET active=false WHERE id=$1`, [job.id]); continue; }
+      const conn = getConnection();
+      // Get on-chain balance
+      const tokenAccounts = await conn.getParsedTokenAccountsByOwner(
+        keypairForRescue.publicKey, { mint: new PublicKey(job.mint_address) }
+      );
+      const parsedInfo = (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info;
+      const onChainBalance = BigInt(parsedInfo?.tokenAmount?.amount ?? '0');
+      const uiAmount = Number(parsedInfo?.tokenAmount?.uiAmount ?? 0);
+      if (onChainBalance <= 0n) {
+        // No tokens — already lost, close the job
+        await query(`UPDATE autobuy_jobs SET active=false WHERE id=$1`, [job.id]);
+        console.warn(`[autobuy] 💀 Rescue ${job.mint_address.slice(0,8)} — 0 on-chain balance, closed as loss`);
+        continue;
+      }
+      const currentPrice = await getPriceSolViaDS(job.mint_address);
+      if (currentPrice <= 0) {
+        // No price available — token dead, close
+        await query(`UPDATE autobuy_jobs SET active=false WHERE id=$1`, [job.id]);
+        console.warn(`[autobuy] 💀 Rescue ${job.mint_address.slice(0,8)} — no price available, closed`);
+        continue;
+      }
+      // Use actual amount paid / ui balance as entry; fallback to market price
+      const entryPrice = uiAmount > 0 ? Number(job.amount_sol) / uiAmount : currentPrice;
+      await query(
+        `UPDATE autobuy_jobs SET entry_price_sol=$1, token_amount_bought=$2, last_activity_at=now() WHERE id=$3`,
+        [entryPrice, onChainBalance.toString(), job.id]
+      );
+      // Check if sell stages exist; if not, create them now
+      const { rows: stageCheck } = await query<{ cnt: string }>(
+        `SELECT COUNT(*) as cnt FROM autosell_stages WHERE autobuy_job_id=$1 AND tokens_at_stage IS NOT NULL`, [job.id]
+      );
+      if (Number(stageCheck[0]?.cnt ?? 0) === 0) {
+        await createSellStages(job.id, job.mint_address, keypairForRescue.publicKey.toBase58(),
+          entryPrice, onChainBalance, job.label);
+        console.info(`[autobuy] ✅ Rescued ${job.mint_address.slice(0,8)} — entry=${entryPrice.toExponential(4)} created sell stages`);
+      } else {
+        console.info(`[autobuy] ✅ Rescued ${job.mint_address.slice(0,8)} — entry=${entryPrice.toExponential(4)} sell stages already exist`);
+      }
+    } catch (err: any) {
+      console.error(`[autobuy] Rescue failed for ${job.id.slice(0,8)}: ${err.message}`);
+    }
   }
 }
 

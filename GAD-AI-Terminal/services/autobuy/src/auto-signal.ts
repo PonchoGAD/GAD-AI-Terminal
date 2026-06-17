@@ -388,7 +388,7 @@ const RAYDIUM_MIN_PC1H = Number(process.env.RAYDIUM_MIN_PC1H || '1');
 // Max 1h price change — tokens up >45% in 1h are near blow-off top, late entry
 const RAYDIUM_MAX_PC1H = Number(process.env.RAYDIUM_MAX_PC1H || '45');
 // Min 5m price change — require active momentum RIGHT NOW (key entry signal)
-const RAYDIUM_MIN_PC5M = Number(process.env.RAYDIUM_MIN_PC5M || '0.5');
+const RAYDIUM_MIN_PC5M = Number(process.env.RAYDIUM_MIN_PC5M || '1.5');
 // Max token age — 48h: memecoins that haven't pumped in 2 days are usually dead
 const RAYDIUM_MAX_AGE_SEC = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(2 * 24 * 3600));
 // Min token age — 30min prevents buying in the first minutes of Raydium launch
@@ -416,51 +416,65 @@ export interface LiqTier {
 }
 
 export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
-  // TP strategy — 2 real stages + moon bag:
-  //   Stage 1: lock 60% at moderate TP (avoids giving back gains)
-  //   Stage 2: let 40% run to higher TP (captures moonshots)
-  //   Stage 3 (999x): ~4% moon bag, exits via trailing stop or time limit
+  // TP strategy — 5 stages: sell equal ~20% portions of position at each level.
+  // sellPct is % of REMAINING tokens at that stage, so to sell 20% of original each time:
+  //   Stage 1: 20% of 100% = sell 20 → 80 left
+  //   Stage 2: 25% of 80%  = sell 20 → 60 left
+  //   Stage 3: 33% of 60%  = sell 20 → 40 left
+  //   Stage 4: 50% of 40%  = sell 20 → 20 left (moon bag)
+  //   Stage 5: 999x = moon bag placeholder — exits via trailing stop
   //
-  // earlyTrailPct: fires BEFORE stage 1 TP — sells 100% when peak drops this % from ATH.
-  // Only fires when trail price > entry × 1.10 (guarantees real profit after fees).
+  // Breakeven stop: fires in scheduler when sell_stage_reached >= 1 (stop moved to entry)
+  // earlyTrailPct: fires BEFORE TP1 when peak drops earlyTrailPct% AND trail > entry × 1.04
   const r = regime.toUpperCase();
   const isFear = r === 'FEAR' || r === 'EXTREME_FEAR';
   const isBull = r === 'BULL' || r === 'EUPHORIA';
 
+  // T1: pump.fun graduates ($12k–$80k liq) — volatile, fast movers
   if (liqUsd <= 80000) return {
     tier: 1, label: 't1',
-    timeLimitSec: 0,       // disabled — close only via TP or stop-loss
-    stopPct: isFear ? 0.10 : 0.08,
-    trailPct: 0.20,        // wide trail after stage 1 — gives moon bag room to run
-    earlyTrailPct: isFear ? 0.03 : 0.04,  // tighter trail = keep more of the gain
+    timeLimitSec: 0,
+    stopPct: isFear ? 0.09 : 0.07,         // 7-9% stop — tighter than before
+    trailPct: 0.18,                          // 18% trail after TP1 (moon bag room)
+    earlyTrailPct: isFear ? 0.035 : 0.045,  // pre-TP1 trail (fires only if above entry×1.04)
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.80 : isFear ? 1.50 : 1.40, sellPct: 70 },  // lowered: NEUTRAL 1.80→1.40 — achievable for 70% position, FEAR 1.65→1.50
-      { stage: 2, multiplier: isBull ? 3.50 : isFear ? 2.50 : 2.50, sellPct: 90 },  // T1 stage2: 4.00→2.50 — realistic for pump.fun graduates
-      { stage: 3, multiplier: 999, sellPct: 100 },  // ~4% moon bag — exits via trailing stop
+      { stage: 1, multiplier: isBull ? 1.15 : isFear ? 1.10 : 1.12, sellPct: 20 },  // Quick lock → enables breakeven stop
+      { stage: 2, multiplier: isBull ? 1.35 : isFear ? 1.22 : 1.28, sellPct: 25 },  // 25% of 80 remaining = 20% total
+      { stage: 3, multiplier: isBull ? 1.65 : isFear ? 1.45 : 1.55, sellPct: 33 },  // 33% of 60 remaining = 20% total
+      { stage: 4, multiplier: isBull ? 2.30 : isFear ? 1.85 : 2.00, sellPct: 50 },  // 50% of 40 remaining = 20% total
+      { stage: 5, multiplier: 999, sellPct: 100 },                                    // Moon bag — exits via trailing stop
     ],
   };
+
+  // T2: small-cap memecoins ($80k–$250k liq) — steadier movers
   if (liqUsd <= 250000) return {
     tier: 2, label: 't2',
-    timeLimitSec: 0,       // disabled — close only via TP or stop-loss
-    stopPct: isFear ? 0.09 : 0.07,
+    timeLimitSec: 0,
+    stopPct: isFear ? 0.08 : 0.06,
     trailPct: 0.15,
     earlyTrailPct: isFear ? 0.03 : 0.04,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.80 : isFear ? 1.45 : 1.60, sellPct: 60 },
-      { stage: 2, multiplier: isBull ? 3.20 : isFear ? 2.50 : 3.00, sellPct: 90 },
-      { stage: 3, multiplier: 999, sellPct: 100 },
+      { stage: 1, multiplier: isBull ? 1.12 : isFear ? 1.08 : 1.10, sellPct: 20 },
+      { stage: 2, multiplier: isBull ? 1.30 : isFear ? 1.18 : 1.23, sellPct: 25 },
+      { stage: 3, multiplier: isBull ? 1.55 : isFear ? 1.38 : 1.46, sellPct: 33 },
+      { stage: 4, multiplier: isBull ? 2.10 : isFear ? 1.70 : 1.85, sellPct: 50 },
+      { stage: 5, multiplier: 999, sellPct: 100 },
     ],
   };
+
+  // T3: mid-cap tokens ($250k+ liq) — slower, more predictable
   return {
     tier: 3, label: 't3',
-    timeLimitSec: 0,       // disabled — close only via TP or stop-loss
-    stopPct: isFear ? 0.08 : 0.06,
+    timeLimitSec: 0,
+    stopPct: isFear ? 0.07 : 0.05,
     trailPct: 0.12,
-    earlyTrailPct: isFear ? 0.03 : 0.04,
+    earlyTrailPct: isFear ? 0.025 : 0.035,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.55 : isFear ? 1.30 : 1.42, sellPct: 60 },
-      { stage: 2, multiplier: isBull ? 2.50 : isFear ? 1.90 : 2.20, sellPct: 90 },
-      { stage: 3, multiplier: 999, sellPct: 100 },
+      { stage: 1, multiplier: isBull ? 1.10 : isFear ? 1.06 : 1.08, sellPct: 20 },
+      { stage: 2, multiplier: isBull ? 1.22 : isFear ? 1.14 : 1.18, sellPct: 25 },
+      { stage: 3, multiplier: isBull ? 1.40 : isFear ? 1.28 : 1.33, sellPct: 33 },
+      { stage: 4, multiplier: isBull ? 1.80 : isFear ? 1.52 : 1.65, sellPct: 50 },
+      { stage: 5, multiplier: 999, sellPct: 100 },
     ],
   };
 }
@@ -893,8 +907,10 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     // Fresh tokens (<6h): require ≥40 buys in 1h — real organic demand, not dev-pumped price.
     // All tokens: require ≥20 buys in 1h — stale pools with 5-10 buys/h rarely pump.
     // High-liq fresh tokens ($40k+, <6h): require ≥1h age — inflated liq is a common rug setup.
-    const buys1h = (pair.txns?.h1?.buys ?? 0) as number;
+    const buys1h  = (pair.txns?.h1?.buys  ?? 0) as number;
     const sells1h = (pair.txns?.h1?.sells ?? 0) as number;
+    const buys5m  = (pair.txns?.m5?.buys  ?? 0) as number;
+    const sells5m = (pair.txns?.m5?.sells ?? 0) as number;
     const isFreshToken = ageSec >= 0 && ageSec < 6 * 3600;
     if (isFreshToken && liq >= 40000 && ageSec >= 0 && ageSec < 3600) {
       console.debug(`[raydium-scan] ✗hiLiqFresh ${sym.padEnd(10)} liq:$${liq.toFixed(0)} age:${(ageSec/60).toFixed(0)}min (≥$40k fresh needs ≥60min)`);
@@ -915,6 +931,21 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     if (buys1h > 50 && sells1h > 0 && buys1h / sells1h > RAYDIUM_MAX_BUY_SELL_RATIO) {
       console.debug(`[raydium-scan] ✗wash ${sym.padEnd(10)} B/S=${(buys1h/sells1h).toFixed(1)}x (>${RAYDIUM_MAX_BUY_SELL_RATIO}x = wash or late)`);
       skipped.momentum++; continue;
+    }
+
+    // ── Gate 3c: 5-minute buyer dominance — "start of pump" entry signal ──
+    // We want to enter at the BEGINNING of the volume pump, not after it peaked.
+    // Key signal: fresh buy transactions in last 5 min with buyers > sellers.
+    // Without this: bot enters when 1h chart shows +30% (pump already done).
+    if (vol5m > 0) {
+      if (buys5m < 2) {
+        console.debug(`[raydium-scan] ✗5mbuy ${sym.padEnd(10)} buys5m:${buys5m} (need ≥2 — no fresh demand)`);
+        skipped.momentum++; continue;
+      }
+      if (sells5m > buys5m * 1.3) {
+        console.debug(`[raydium-scan] ✗5mdist ${sym.padEnd(10)} buys5m:${buys5m} sells5m:${sells5m} — 5m selling > buying`);
+        skipped.momentum++; continue;
+      }
     }
 
     // For tokens older than 6h, require positive 6h trend — don't buy downtrends.
@@ -972,8 +1003,8 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     const slippage = shield.slippage_bps;
     console.info(
       `[raydium-scan] 🟢 PASS ${pair.baseToken?.symbol ?? mint.slice(0,8)} (${mint.slice(0,8)}) ` +
-      `liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc1h:${pc1h.toFixed(1)}% pc6h:${pc6h.toFixed(1)}% ` +
-      `buys:${buys1h} sells:${sells1h} age:${(ageSec/3600).toFixed(1)}h`
+      `liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc5m:${pc5m.toFixed(1)}% pc1h:${pc1h.toFixed(1)}% ` +
+      `buys5m:${buys5m} sells5m:${sells5m} buys1h:${buys1h} age:${(ageSec/3600).toFixed(1)}h`
     );
 
     try {
