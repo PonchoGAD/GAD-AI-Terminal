@@ -4,7 +4,7 @@ import { sellJetton, getJettonBalance, getPoolPrice } from '@lib/ton';
 // ─── Config ────────────────────────────────────────────────────────────────────
 const STOP_LOSS_PCT    = Number(process.env.TON_STOP_LOSS_PCT   || '8');
 const TRAIL_PCT        = Number(process.env.TON_TRAIL_PCT        || '10');
-const TIME_LIMIT_SEC   = Number(process.env.TON_TIME_LIMIT_SEC  || '600');
+const TIME_LIMIT_SEC   = Number(process.env.TON_TIME_LIMIT_SEC  || '1800');
 const POLL_INTERVAL    = Number(process.env.TON_POLL_INTERVAL_SEC || '15') * 1000;
 
 // 5-stage TP: lock profit fast (TON meme cycles are short)

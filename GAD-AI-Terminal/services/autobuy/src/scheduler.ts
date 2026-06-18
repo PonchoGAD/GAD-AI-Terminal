@@ -568,8 +568,8 @@ async function checkAndExecuteSells(walletAddress: string) {
       const newEarlyPeak = Math.max(prevEarlyPeak, currentPriceSol);
       earlyPeakMap.set(mint, newEarlyPeak);
       const earlyStop = newEarlyPeak * (1 - EARLY_TRAIL_PCT);
-      // Only fire if earlyStop is at least +6% above entry — captures 10%+ peaks before reversal
-      if (currentPriceSol < earlyStop && earlyStop > refEntry * 1.06) {
+      // Fire once trail-stop is ≥2% above entry — recovers small 3-6% peaks that previously fell straight to stop-loss
+      if (currentPriceSol < earlyStop && earlyStop > refEntry * 1.02) {
         const gainPct = ((currentPriceSol / refEntry - 1) * 100).toFixed(1);
         const peakPct = ((newEarlyPeak / refEntry - 1) * 100).toFixed(1);
         console.warn(

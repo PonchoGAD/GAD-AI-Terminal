@@ -201,7 +201,8 @@ function passesFilter(t: BaseToken): string | null {
   if (!TRADEABLE_DEX_IDS.has(t.dex_id)) {
     return `dex:${t.dex_id} (not supported)`;
   }
-  if (t.price_change_1h < MIN_PC1H)         return `pc1h:${t.price_change_1h.toFixed(1)}% < ${MIN_PC1H}%`;
+  // Ultra-fresh tokens (<10 min) don't have 1h history yet — skip pc1h check, use pc5m momentum instead
+  if (t.age_sec >= 600 && t.price_change_1h < MIN_PC1H) return `pc1h:${t.price_change_1h.toFixed(1)}% < ${MIN_PC1H}%`;
   // Fresh launches (< FRESH_AGE_SEC) use higher cap — first-hour spikes are normal on Base
   const maxPc1h = t.age_sec < FRESH_AGE_SEC ? MAX_PC1H_FRESH : MAX_PC1H;
   if (t.price_change_1h > maxPc1h)          return `pc1h:${t.price_change_1h.toFixed(1)}% > ${maxPc1h}% (age:${(t.age_sec/60).toFixed(0)}min)`;
