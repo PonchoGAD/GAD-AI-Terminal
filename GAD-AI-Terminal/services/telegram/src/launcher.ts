@@ -147,7 +147,7 @@ export async function launchToken(cfg: LaunchConfig): Promise<LaunchResult> {
     const mintKp = Keypair.generate();
     const mintAddr = mintKp.publicKey.toBase58();
 
-    const imageBlob = new Blob([cfg.imageBuffer], { type: cfg.imageType });
+    const imageBlob = new Blob([cfg.imageBuffer as unknown as ArrayBuffer], { type: cfg.imageType });
 
     const createResult = await sdk.createAndBuy(
       w1, mintKp,
@@ -155,7 +155,7 @@ export async function launchToken(cfg: LaunchConfig): Promise<LaunchResult> {
         name: cfg.name, symbol: cfg.ticker, description: cfg.description,
         file: imageBlob, twitter: cfg.twitter ?? '', telegram: cfg.telegram ?? '',
         website: cfg.website ?? 'https://gadai.shop', metadataUri: metaUri,
-      },
+      } as any,
       BigInt(Math.round(cfg.devBuySol * 1e9)),
       500n, // 5% slippage
       { unitLimit: 250000, unitPrice: 250000 }
