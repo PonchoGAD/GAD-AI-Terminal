@@ -1,4 +1,4 @@
-import { Collector, runCollectors } from './scanner';
+import { Collector, runCollectors, fetchJson } from './scanner';
 import { discoverPumpTokens, fetchPumpMetrics } from './pump.collector';
 import { discoverGmgnTokens, fetchGmgnMetrics } from './gmgn.collector';
 import { discoverAxiomTokens, fetchAxiomMetrics } from './axiom.collector';
@@ -13,6 +13,7 @@ import {
 } from './pumpportal.collector';
 import { updateMarketRegime } from './regime.updater';
 import { processToken } from './scanner';
+import { query } from '@lib/db';
 
 const intervalMs = Number(process.env.SCANNER_INTERVAL_SECONDS || '30') * 1000;
 const REGIME_INTERVAL_MS = 5 * 60 * 1000;
@@ -127,6 +128,65 @@ const optionalCollectors: Collector[] = [
 // All secondary collectors combined
 const secondaryCollectors: Collector[] = [...primaryCollectors, ...optionalCollectors];
 
+// ─── Metadata enrichment — fill NULL symbol/name in tokens table ─────────────
+
+const ENRICH_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+const SOLANA_RPC    = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.solana.com';
+
+async function fetchMetaFromDexScreener(mint: string): Promise<{ symbol: string; name: string } | null> {
+  try {
+    const data = await fetchJson<any>(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { timeout: 5000 });
+    const pair = (data?.pairs ?? [])[0];
+    if (pair?.baseToken?.symbol && pair.baseToken.address === mint) {
+      return { symbol: pair.baseToken.symbol, name: pair.baseToken.name ?? pair.baseToken.symbol };
+    }
+    return null;
+  } catch { return null; }
+}
+
+async function fetchMetaFromHelius(mint: string): Promise<{ symbol: string; name: string } | null> {
+  if (!HELIUS_API_KEY) return null;
+  try {
+    const rpcUrl = SOLANA_RPC.includes('helius') ? SOLANA_RPC : `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+    const data = await fetchJson<any>(rpcUrl, {
+      method: 'POST',
+      data: { jsonrpc: '2.0', id: 'enrich', method: 'getAsset', params: { id: mint } },
+      timeout: 5000,
+    });
+    const meta = data?.result?.content?.metadata;
+    if (meta?.symbol) return { symbol: meta.symbol, name: meta.name ?? meta.symbol };
+    return null;
+  } catch { return null; }
+}
+
+async function enrichNullTokens(): Promise<void> {
+  try {
+    const { rows } = await query<{ mint_address: string }>(
+      `SELECT mint_address FROM tokens WHERE symbol IS NULL ORDER BY created_at DESC LIMIT 30`
+    );
+    if (!rows.length) return;
+    console.info(`[enrich] Enriching ${rows.length} tokens with NULL symbol`);
+
+    let updated = 0;
+    for (const { mint_address } of rows) {
+      const meta = await fetchMetaFromDexScreener(mint_address)
+                ?? await fetchMetaFromHelius(mint_address);
+      if (meta) {
+        await query(
+          `UPDATE tokens SET symbol=$1, name=$2 WHERE mint_address=$3 AND symbol IS NULL`,
+          [meta.symbol.slice(0, 20), meta.name.slice(0, 100), mint_address]
+        );
+        updated++;
+      }
+      await new Promise(r => setTimeout(r, 150)); // gentle rate limiting
+    }
+    if (updated > 0) console.info(`[enrich] Updated ${updated}/${rows.length} tokens`);
+  } catch (err: any) {
+    console.warn('[enrich] Error:', err.message);
+  }
+}
+
 /** Process PumpPortal tokens first — they come with name/symbol/metadata */
 async function runPumpPortalCycle(): Promise<void> {
   try {
@@ -165,6 +225,12 @@ export async function startScanner() {
     updateMarketRegime().catch(err => console.error('[regime] Update failed:', err));
   }, REGIME_INTERVAL_MS);
 
+  // Metadata enrichment: fill NULL symbol/name every 5 min; start after 60s to avoid startup contention
+  setTimeout(() => enrichNullTokens().catch(() => {}), 60_000);
+  const enrichTimer = setInterval(() => {
+    enrichNullTokens().catch(err => console.warn('[enrich] Interval error:', err.message));
+  }, ENRICH_INTERVAL_MS);
+
   while (!shouldStop) {
     try {
       // 1. PumpPortal first — real-time new launches with metadata
@@ -179,5 +245,6 @@ export async function startScanner() {
   }
 
   clearInterval(regimeTimer);
+  clearInterval(enrichTimer);
   console.info('Scanner shutdown complete.');
 }
