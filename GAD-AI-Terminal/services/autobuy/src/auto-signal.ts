@@ -453,49 +453,55 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
   const isBull = r === 'BULL' || r === 'EUPHORIA';
 
   // T1: pump.fun graduates ($12k–$80k liq) — volatile, fast movers
+  // FEAR: 3-stage — TP1 takes 60% at +15% to lock majority. After TP1 stop→entry (breakeven).
+  //   TP1: 60% at 1.15x → lock big win immediately
+  //   TP2: 50% of remaining (=20% original) at 1.45x → bonus
+  //   TP3: 100% of remaining (=20% original) at 2.00x → moon bag
   if (liqUsd <= 80000) return {
     tier: 1, label: 't1',
     timeLimitSec: 0,
-    stopPct: isFear ? 0.09 : 0.07,         // 7-9% stop — tighter than before
-    trailPct: 0.18,                          // 18% trail after TP1 (moon bag room)
-    earlyTrailPct: isFear ? 0.035 : 0.045,  // pre-TP1 trail (fires only if above entry×1.04)
+    stopPct: isFear ? 0.08 : 0.07,
+    trailPct: isFear ? 0.15 : 0.18,
+    earlyTrailPct: isFear ? 0.035 : 0.045,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.15 : isFear ? 1.10 : 1.12, sellPct: 20 },  // Quick lock → enables breakeven stop
-      { stage: 2, multiplier: isBull ? 1.35 : isFear ? 1.22 : 1.28, sellPct: 25 },  // 25% of 80 remaining = 20% total
-      { stage: 3, multiplier: isBull ? 1.65 : isFear ? 1.45 : 1.55, sellPct: 33 },  // 33% of 60 remaining = 20% total
-      { stage: 4, multiplier: isBull ? 2.30 : isFear ? 1.85 : 2.00, sellPct: 50 },  // 50% of 40 remaining = 20% total
-      { stage: 5, multiplier: 999, sellPct: 100 },                                    // Moon bag — exits via trailing stop
+      { stage: 1, multiplier: isBull ? 1.15 : isFear ? 1.15 : 1.12, sellPct: isFear ? 60 : 20 },
+      { stage: 2, multiplier: isBull ? 1.35 : isFear ? 1.45 : 1.28, sellPct: isFear ? 50 : 25 },
+      { stage: 3, multiplier: isBull ? 1.65 : isFear ? 2.00 : 1.55, sellPct: isFear ? 100 : 33 },
+      { stage: 4, multiplier: isBull ? 2.30 : isFear ? 999  : 2.00, sellPct: 50 },
+      { stage: 5, multiplier: 999, sellPct: 100 },
     ],
   };
 
   // T2: small-cap memecoins ($80k–$250k liq) — steadier movers
+  // FEAR: same 3-stage approach with tighter targets (higher liq = harder to pump)
   if (liqUsd <= 250000) return {
     tier: 2, label: 't2',
     timeLimitSec: 0,
-    stopPct: isFear ? 0.08 : 0.06,
+    stopPct: isFear ? 0.07 : 0.06,
     trailPct: 0.15,
     earlyTrailPct: isFear ? 0.03 : 0.04,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.12 : isFear ? 1.08 : 1.10, sellPct: 20 },
-      { stage: 2, multiplier: isBull ? 1.30 : isFear ? 1.18 : 1.23, sellPct: 25 },
-      { stage: 3, multiplier: isBull ? 1.55 : isFear ? 1.38 : 1.46, sellPct: 33 },
-      { stage: 4, multiplier: isBull ? 2.10 : isFear ? 1.70 : 1.85, sellPct: 50 },
+      { stage: 1, multiplier: isBull ? 1.12 : isFear ? 1.12 : 1.10, sellPct: isFear ? 60 : 20 },
+      { stage: 2, multiplier: isBull ? 1.30 : isFear ? 1.35 : 1.23, sellPct: isFear ? 50 : 25 },
+      { stage: 3, multiplier: isBull ? 1.55 : isFear ? 1.65 : 1.46, sellPct: isFear ? 100 : 33 },
+      { stage: 4, multiplier: isBull ? 2.10 : isFear ? 999  : 1.85, sellPct: 50 },
       { stage: 5, multiplier: 999, sellPct: 100 },
     ],
   };
 
   // T3: mid-cap tokens ($250k+ liq) — slower, more predictable
+  // FEAR: 3-stage with conservative targets
   return {
     tier: 3, label: 't3',
     timeLimitSec: 0,
-    stopPct: isFear ? 0.07 : 0.05,
+    stopPct: isFear ? 0.06 : 0.05,
     trailPct: 0.12,
     earlyTrailPct: isFear ? 0.025 : 0.035,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.10 : isFear ? 1.06 : 1.08, sellPct: 20 },
-      { stage: 2, multiplier: isBull ? 1.22 : isFear ? 1.14 : 1.18, sellPct: 25 },
-      { stage: 3, multiplier: isBull ? 1.40 : isFear ? 1.28 : 1.33, sellPct: 33 },
-      { stage: 4, multiplier: isBull ? 1.80 : isFear ? 1.52 : 1.65, sellPct: 50 },
+      { stage: 1, multiplier: isBull ? 1.10 : isFear ? 1.10 : 1.08, sellPct: isFear ? 60 : 20 },
+      { stage: 2, multiplier: isBull ? 1.22 : isFear ? 1.25 : 1.18, sellPct: isFear ? 50 : 25 },
+      { stage: 3, multiplier: isBull ? 1.40 : isFear ? 1.50 : 1.33, sellPct: isFear ? 100 : 33 },
+      { stage: 4, multiplier: isBull ? 1.80 : isFear ? 999  : 1.65, sellPct: 50 },
       { stage: 5, multiplier: 999, sellPct: 100 },
     ],
   };
