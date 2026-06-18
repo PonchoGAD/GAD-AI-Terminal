@@ -89,6 +89,54 @@ const PRICE_CACHE_MS = 1000;
 const sellCooldownMap = new Map<string, number>(); // stageId → unixMs when cooldown expires
 const SELL_COOLDOWN_MS = 30_000; // 30s after any sell 429
 
+// ─── Market buy gate (inline — avoids @lib/market-data workspace dep) ────────
+// Blocks new position opens when macro conditions are adverse.
+// Fails open: if data fetch errors, buys are allowed.
+
+const MARKET_GATE_CACHE_MS = 5 * 60 * 1000; // 5 min
+let _marketGateCache: { allowed: boolean; reason: string; health: number; at: number } | null = null;
+
+async function checkMarketBuyGate(): Promise<{ allowed: boolean; reason: string; health: number }> {
+  if (_marketGateCache && Date.now() - _marketGateCache.at < MARKET_GATE_CACHE_MS) {
+    return { allowed: _marketGateCache.allowed, reason: _marketGateCache.reason, health: _marketGateCache.health };
+  }
+  try {
+    const [fngRes, globalRes] = await Promise.allSettled([
+      axios.get('https://api.alternative.me/fng/?limit=1', { timeout: 5_000 }),
+      axios.get('https://api.coingecko.com/api/v3/global',  { timeout: 8_000 }),
+    ]);
+
+    const fg = fngRes.status === 'fulfilled'
+      ? Number(fngRes.value.data?.data?.[0]?.value ?? 50) : 50;
+    const gcData = globalRes.status === 'fulfilled' ? (globalRes.value.data?.data ?? {}) : {};
+    const btcDom    = Number(gcData.market_cap_percentage?.btc ?? 50);
+    const mcapChg   = Number(gcData.market_cap_change_percentage_24h_usd ?? 0);
+
+    // Composite health 0-100 (same weights as libs/market-data)
+    const fgScore   = fg;
+    const mcapScore = Math.min(100, Math.max(0, (mcapChg + 10) * 5));
+    const btcScore  = Math.min(100, Math.max(0, (60 - btcDom) * 3.33));
+    const health    = Math.round(fgScore * 0.40 + mcapScore * 0.35 + btcScore * 0.25);
+
+    let allowed = true;
+    let reason  = `health=${health}/100 F&G=${fg} BTC_dom=${btcDom.toFixed(1)}%`;
+
+    if (health < 20) {
+      allowed = false;
+      reason  = `Market gate CLOSED — health ${health}/100 too low (F&G=${fg}, BTC_dom=${btcDom.toFixed(1)}%)`;
+    } else if (btcDom > 62 && mcapChg < 0) {
+      allowed = false;
+      reason  = `Market gate CLOSED — BTC dominance ${btcDom.toFixed(1)}% extreme + market falling`;
+    }
+
+    _marketGateCache = { allowed, reason, health, at: Date.now() };
+    return { allowed, reason, health };
+  } catch {
+    // Fail open — don't block buys when macro data is unavailable
+    return { allowed: true, reason: 'Market data unavailable — fail open', health: 50 };
+  }
+}
+
 // ─── Jupiter Lite price fetch (primary — fast, batch-friendly, no auth) ───────
 // Falls back to DexScreener if Jupiter returns 0.
 async function getPriceSolViaDS(mint: string): Promise<number> {
@@ -1145,7 +1193,15 @@ export async function startAutobuyScheduler() {
     // Only Raydium direct scan is used for new positions.
 
     try {
-      if (walletAddress) await processRaydiumOpportunities(walletAddress);
+      if (walletAddress) {
+        const gate = await checkMarketBuyGate();
+        if (!gate.allowed) {
+          console.warn(`[autobuy] 🚫 Market gate: ${gate.reason}`);
+        } else {
+          console.debug(`[autobuy] ✅ Market gate: ${gate.reason}`);
+          await processRaydiumOpportunities(walletAddress);
+        }
+      }
     } catch (err) {
       console.error('[autobuy] Raydium scan error:', err);
     }
