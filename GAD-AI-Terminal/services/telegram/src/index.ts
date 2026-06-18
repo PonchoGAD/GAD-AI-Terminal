@@ -4,7 +4,6 @@ import axios from 'axios';
 import { query } from '@lib/db';
 import { runTrendCycle, getTopClusters, getClusterById, getIdeasForCluster, generateCoinIdeas, saveCoinIdea, updateIdeaStatus } from '@lib/trend-engine';
 import { startBroadcaster, broadcastAlphaSignal, broadcastPromo } from './broadcaster';
-import { getMarketContext, formatMarketContext } from '@lib/market-data';
 const FUTURES_API = process.env.FUTURES_API_URL || 'http://futures:4003';
 
 dotenv.config();
@@ -1841,14 +1840,58 @@ bot.onText(/^\/rmwallet(?:@\w+)?\s+([1-9A-HJ-NP-Za-km-z]{32,44})$/, (msg, match)
   }
 }));
 
-// /marketdata — macro market context (STARTER+)
+// /marketdata — macro market context: DeFiLlama + CoinGecko + Fear&Greed (STARTER+)
 bot.onText(/^\/marketdata(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
   if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
   const chatId = msg.chat.id;
   await send(chatId, '_Fetching macro data..._');
   try {
-    const ctx = await getMarketContext();
-    await send(chatId, formatMarketContext(ctx));
+    const [llamaRes, globalRes, fngRes] = await Promise.allSettled([
+      axios.get('https://api.llama.fi/v2/chains', { timeout: 8_000 }),
+      axios.get('https://api.coingecko.com/api/v3/global', { timeout: 8_000 }),
+      axios.get('https://api.alternative.me/fng/?limit=1', { timeout: 5_000 }),
+    ]);
+
+    const chains: any[] = llamaRes.status === 'fulfilled' ? (llamaRes.value.data ?? []) : [];
+    const sol = chains.find((c: any) => c.name?.toLowerCase() === 'solana');
+    const solTvl    = Number(sol?.tvl ?? 0);
+    const solChange = Number(sol?.change_1d ?? 0);
+
+    const gData = globalRes.status === 'fulfilled' ? (globalRes.value.data?.data ?? {}) : {};
+    const totalMcap   = Number(gData.total_market_cap?.usd ?? 0);
+    const btcDom      = Number(gData.market_cap_percentage?.btc ?? 50);
+    const ethDom      = Number(gData.market_cap_percentage?.eth ?? 18);
+    const mcapChange  = Number(gData.market_cap_change_percentage_24h_usd ?? 0);
+
+    const fngData = fngRes.status === 'fulfilled' ? (fngRes.value.data?.data?.[0] ?? {}) : {};
+    const fng      = Number(fngData.value ?? 50);
+    const fngLabel = fngData.value_classification ?? 'Neutral';
+
+    const healthScore = Math.round(
+      fng * 0.35 +
+      Math.min(100, Math.max(0, (mcapChange + 10) * 5)) * 0.25 +
+      Math.min(100, Math.max(0, (60 - btcDom) * 3.33)) * 0.25 +
+      Math.min(100, Math.max(0, (solChange + 5) * 10)) * 0.15
+    );
+
+    const solTvlStr = solTvl >= 1e9 ? `$${(solTvl / 1e9).toFixed(2)}B` : `$${(solTvl / 1e6).toFixed(0)}M`;
+    const mcapStr   = totalMcap >= 1e12 ? `$${(totalMcap / 1e12).toFixed(2)}T` : `$${(totalMcap / 1e9).toFixed(0)}B`;
+    const altSignal = btcDom < 45 && mcapChange > 1 ? '🔥 HOT' : btcDom < 52 ? '🌡️ WARM' : '❄️ COLD';
+    const solTrend  = solChange > 3 ? '📈 GROWING' : solChange < -3 ? '📉 SHRINKING' : '➡️ STABLE';
+    const bar       = '█'.repeat(Math.round(healthScore / 10)) + '░'.repeat(10 - Math.round(healthScore / 10));
+
+    await send(chatId,
+      `🌍 *Macro Market Context*\n\n` +
+      `Health: \`${bar}\` ${healthScore}/100\n\n` +
+      `*Crypto Global:*\n` +
+      `Total MCap: ${mcapStr} (${mcapChange >= 0 ? '+' : ''}${mcapChange.toFixed(1)}%/24h)\n` +
+      `BTC Dom: ${btcDom.toFixed(1)}% | ETH: ${ethDom.toFixed(1)}%\n\n` +
+      `*Solana:*\n` +
+      `${solTrend} TVL: ${solTvlStr} (${solChange >= 0 ? '+' : ''}${solChange.toFixed(1)}%/24h)\n\n` +
+      `*Sentiment:*\n` +
+      `Fear & Greed: ${fng}/100 — ${fngLabel}\n` +
+      `${altSignal} Alt Season Signal`
+    );
   } catch (e: any) {
     await send(chatId, `❌ Market data error: ${e.message}`);
   }
