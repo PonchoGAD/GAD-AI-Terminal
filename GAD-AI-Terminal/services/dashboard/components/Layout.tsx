@@ -15,6 +15,7 @@ const NAV = [
   { href: '/portfolio',  label: 'Portfolio',   icon: '💼' },
   { href: '/terminal',   label: 'AI Terminal', icon: '🤖' },
   { href: '/launcher',   label: 'Coin Launcher', icon: '🚀' },
+  { href: '/unified',    label: 'All Chains',    icon: '🌐' },
 ];
 
 export default function Layout({ children }: { children: ReactNode }) {

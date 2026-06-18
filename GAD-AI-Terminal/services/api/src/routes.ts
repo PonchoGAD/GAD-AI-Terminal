@@ -1109,6 +1109,132 @@ export function registerRoutes(app: Application) {
       res.json({ ok: true, intelligence });
     });
   });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // UNIFIED MULTI-CHAIN PORTFOLIO
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** GET /unified-portfolio — aggregate active + closed positions from all 4 chains */
+  app.get('/unified-portfolio', async (_req, res: Response) => {
+    await safeRes(res, async () => {
+      const [solana, base, bsc, ton] = await Promise.all([
+        // Solana — autobuy_jobs (label auto:raydium_scan / auto:bonding / auto:velocity)
+        query(`
+          SELECT
+            id, label AS symbol_raw,
+            COALESCE(
+              (SELECT symbol FROM tokens WHERE mint_address = j.mint_address LIMIT 1),
+              regexp_replace(label, '^auto:[^:]+:([^:]+):.*$', '\\1')
+            ) AS symbol,
+            amount_sol   AS amount_native,
+            COALESCE(total_sold_sol, 0) AS sold_native,
+            entry_price_sol AS entry_price,
+            sell_stage_reached,
+            active AS is_active,
+            bought_at, last_activity_at AS closed_at
+          FROM autobuy_jobs j
+          WHERE label LIKE 'auto:%' AND bought_at IS NOT NULL
+          ORDER BY bought_at DESC LIMIT 200
+        `),
+        // Base — base_positions
+        query(`
+          SELECT
+            id, symbol,
+            amount_eth   AS amount_native,
+            COALESCE(total_sold_eth, 0) AS sold_native,
+            entry_price_eth AS entry_price,
+            tp_index AS sell_stage_reached,
+            is_active,
+            bought_at, sold_at AS closed_at,
+            sell_reason
+          FROM base_positions
+          ORDER BY bought_at DESC LIMIT 100
+        `).catch(() => ({ rows: [] as any[] })),
+        // BSC — bsc_positions
+        query(`
+          SELECT
+            id, symbol,
+            amount_bnb   AS amount_native,
+            COALESCE(total_sold_bnb, 0) AS sold_native,
+            entry_price_bnb AS entry_price,
+            tp_index AS sell_stage_reached,
+            is_active,
+            bought_at, sold_at AS closed_at,
+            sell_reason
+          FROM bsc_positions
+          ORDER BY bought_at DESC LIMIT 100
+        `).catch(() => ({ rows: [] as any[] })),
+        // TON — ton_positions
+        query(`
+          SELECT
+            id, symbol,
+            amount_ton   AS amount_native,
+            COALESCE(total_sold_ton, 0) AS sold_native,
+            entry_price_ton AS entry_price,
+            tp_index AS sell_stage_reached,
+            is_active,
+            bought_at, sold_at AS closed_at,
+            sell_reason
+          FROM ton_positions
+          ORDER BY bought_at DESC LIMIT 100
+        `).catch(() => ({ rows: [] as any[] })),
+      ]);
+
+      const normalize = (rows: any[], chain: string) =>
+        rows.map(r => ({
+          id:           r.id,
+          chain,
+          symbol:       r.symbol ?? '???',
+          amountNative: Number(r.amount_native   ?? 0),
+          soldNative:   Number(r.sold_native     ?? 0),
+          entryPrice:   Number(r.entry_price     ?? 0),
+          pnlNative:    Number(r.sold_native ?? 0) - Number(r.amount_native ?? 0),
+          pnlPct:       r.amount_native > 0
+                          ? ((Number(r.sold_native ?? 0) - Number(r.amount_native)) / Number(r.amount_native)) * 100
+                          : 0,
+          isActive:     Boolean(r.is_active),
+          sellStage:    Number(r.sell_stage_reached ?? 0),
+          exitReason:   r.sell_reason ?? null,
+          openedAt:     r.bought_at,
+          closedAt:     r.closed_at ?? null,
+        }));
+
+      const allPositions = [
+        ...normalize(solana.rows,  'solana'),
+        ...normalize(base.rows,    'base'),
+        ...normalize(bsc.rows,     'bsc'),
+        ...normalize(ton.rows,     'ton'),
+      ].sort((a, b) => new Date(b.openedAt).getTime() - new Date(a.openedAt).getTime());
+
+      // Chain summaries
+      const chainSummary = ['solana', 'base', 'bsc', 'ton'].map(chain => {
+        const rows = allPositions.filter(p => p.chain === chain);
+        const closed = rows.filter(p => !p.isActive);
+        const wins = closed.filter(p => p.pnlNative > 0).length;
+        const totalIn = rows.reduce((s, p) => s + p.amountNative, 0);
+        const totalOut = rows.reduce((s, p) => s + p.soldNative, 0);
+        return {
+          chain,
+          total: rows.length,
+          active: rows.filter(p => p.isActive).length,
+          closed: closed.length,
+          wins,
+          winRate: closed.length ? Math.round(wins * 100 / closed.length) : 0,
+          pnlNative: totalOut - totalIn,
+          totalIn,
+        };
+      });
+
+      const globalPnl = allPositions.reduce((s, p) => s + p.pnlNative, 0);
+
+      res.json({
+        positions: allPositions,
+        chainSummary,
+        globalPnlNative: globalPnl,
+        updatedAt: new Date().toISOString(),
+      });
+    });
+  });
 }
 
 // ─── GAD AI narrative builders ────────────────────────────────────────────────
