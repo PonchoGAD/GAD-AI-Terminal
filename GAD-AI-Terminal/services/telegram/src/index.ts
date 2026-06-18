@@ -3,7 +3,8 @@ import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
 import { query } from '@lib/db';
 import { runTrendCycle, getTopClusters, getClusterById, getIdeasForCluster, generateCoinIdeas, saveCoinIdea, updateIdeaStatus } from '@lib/trend-engine';
-import { startBroadcaster, broadcastAlphaSignal } from './broadcaster';
+import { startBroadcaster, broadcastAlphaSignal, broadcastPromo } from './broadcaster';
+import { getMarketContext, formatMarketContext } from '@lib/market-data';
 const FUTURES_API = process.env.FUTURES_API_URL || 'http://futures:4003';
 
 dotenv.config();
@@ -220,8 +221,10 @@ bot.onText(/\/help/, (msg) => {
     `/journal — your personal trade log\n` +
     `/riskpassport — risk DNA profile\n` +
     `*Trends & Intelligence:*\n` +
+    `/marketdata — macro market context\n` +
     `/trends — GDELT + News meme engine\n` +
     `/ideas — AI-generated coin concepts\n` +
+    `/trend_launches — last launched trend tokens\n` +
     `/xtrends — X/Twitter trend signals\n` +
     `/xsignal — latest X trend + coin\n` +
     `*Futures:*\n` +
@@ -1553,6 +1556,39 @@ bot.onText(/^\/xtrends(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
   }
 }));
 
+// /trend_launches — last 10 tokens launched via auto_launch (STARTER+)
+bot.onText(/^\/trend_launches(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const { rows } = await query<any>(`
+      SELECT mint_address, ticker, name, dev_buy_sol, create_tx, created_at
+      FROM coin_launches
+      ORDER BY created_at DESC
+      LIMIT 10
+    `);
+    if (!rows.length) {
+      return send(chatId,
+        `🚀 *Trend Launches*\n\nNo tokens launched yet via Auto Launch.\n\nUse /trends + /ideas to generate concepts, then /auto\\_launch to deploy.`
+      );
+    }
+    const lines = [`🚀 *Trend-to-Token Launches (last ${rows.length})*`, ``];
+    for (const r of rows) {
+      const ageH = Math.round((Date.now() - new Date(r.created_at).getTime()) / 3_600_000);
+      const ageStr = ageH < 24 ? `${ageH}h ago` : `${Math.round(ageH / 24)}d ago`;
+      lines.push(
+        `*$${r.ticker}* — ${r.name}\n` +
+        `Dev: ${Number(r.dev_buy_sol).toFixed(3)} SOL | ${ageStr}\n` +
+        `[pump.fun](https://pump.fun/coin/${r.mint_address})\n` +
+        `\`${r.mint_address}\``
+      );
+    }
+    await send(chatId, lines.join('\n\n'), { disable_web_page_preview: true });
+  } catch (e: any) {
+    await send(chatId, `❌ trend_launches error: ${e.message}`);
+  }
+}));
+
 // /xsignal — latest actionable X signal (coin with volume found)
 bot.onText(/^\/xsignal(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
   if (!await requirePro(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
@@ -1805,12 +1841,33 @@ bot.onText(/^\/rmwallet(?:@\w+)?\s+([1-9A-HJ-NP-Za-km-z]{32,44})$/, (msg, match)
   }
 }));
 
+// /marketdata — macro market context (STARTER+)
+bot.onText(/^\/marketdata(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
+  if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  await send(chatId, '_Fetching macro data..._');
+  try {
+    const ctx = await getMarketContext();
+    await send(chatId, formatMarketContext(ctx));
+  } catch (e: any) {
+    await send(chatId, `❌ Market data error: ${e.message}`);
+  }
+}));
+
 // ─── Admin: manual signal broadcast ──────────────────────────────────────────
 bot.onText(/\/postsignal/, (msg) => {
   if (String(msg.chat.id) !== String(ADMIN_ID)) return;
   send(msg.chat.id, '📡 Posting alpha signal to channel...');
   broadcastAlphaSignal(bot)
     .then(() => send(msg.chat.id, '✅ Signal posted!'))
+    .catch(e => send(msg.chat.id, `❌ Failed: ${e.message}`));
+});
+
+bot.onText(/\/postpromo/, (msg) => {
+  if (String(msg.chat.id) !== String(ADMIN_ID)) return;
+  send(msg.chat.id, '📣 Posting promo to channel...');
+  broadcastPromo(bot)
+    .then(() => send(msg.chat.id, '✅ Promo posted!'))
     .catch(e => send(msg.chat.id, `❌ Failed: ${e.message}`));
 });
 
