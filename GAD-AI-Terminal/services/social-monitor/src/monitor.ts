@@ -7,6 +7,7 @@ import { query } from '@lib/db';
 import { fetchTweetsForHandle } from './twitter';
 import { scanXTrends, XTrend } from './x-trends';
 import { huntCoinForTheme } from './coin-hunter';
+import { runTrendLaunchCycle } from './trend-launcher';
 import axios from 'axios';
 
 const POLL_INTERVAL_MS = Number(process.env.SOCIAL_POLL_INTERVAL_SECONDS ?? '120') * 1000;
@@ -247,6 +248,16 @@ export async function startSocialMonitor(): Promise<void> {
     };
     runXCycle();
   }, 60_000); // first run 60s after start
+
+  // Trend auto-launch cycle: every 4h, checks cooldown + min engagement internally
+  setTimeout(() => {
+    const runLaunchCycle = async () => {
+      if (shouldStop) return;
+      try { await runTrendLaunchCycle(); } catch (err: any) { console.warn(`[social] Trend launch error: ${err.message}`); }
+      if (!shouldStop) setTimeout(runLaunchCycle, 4 * 60 * 60 * 1000);
+    };
+    runLaunchCycle();
+  }, 3 * 60 * 1000); // first check 3 min after start
 
   while (!shouldStop) {
     try {
