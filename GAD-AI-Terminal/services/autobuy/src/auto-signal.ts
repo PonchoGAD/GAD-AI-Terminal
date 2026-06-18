@@ -828,9 +828,9 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     return;
   }
 
-  // Contrarian buy in FEAR: same momentum threshold in all regimes.
-  // TP targets are already lowered in FEAR (1.18x vs 1.30x) — no need to gate on pc1h.
-  const minPc1hOverride = RAYDIUM_MIN_PC1H;
+  // In FEAR regime: require 10% 1h momentum — a 5% move is easily reversed against bearish market.
+  // Contrarian thesis only works if the token is actively BUCKING the fear, not just drifting up.
+  const minPc1hOverride = regime === 'FEAR' ? Math.max(RAYDIUM_MIN_PC1H, 10) : RAYDIUM_MIN_PC1H;
 
   const dailySpent = await getDailySpent();
   if (dailySpent >= DAILY_MAX_SOL) return;
@@ -890,6 +890,11 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     // ── Gate 1: Liquidity / volume basics ──
     if (liq < RAYDIUM_MIN_LIQUIDITY_USD || liq > RAYDIUM_MAX_LIQUIDITY_USD || vol1h < RAYDIUM_MIN_VOLUME_H1_USD) {
       console.debug(`[raydium-scan] ✗liq  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
+      skipped.liq++; continue;
+    }
+    // FEAR liquidity floor: thin-liq tokens ($12-24k) cause stop-loss slippage in weak markets.
+    if (regime === 'FEAR' && liq < 25000) {
+      console.debug(`[raydium-scan] ✗fear  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} < $25k floor in FEAR`);
       skipped.liq++; continue;
     }
 
@@ -978,6 +983,11 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       skipped.momentum++; continue;
     }
     if (pc6h < -15) { skipped.momentum++; continue; }
+    // In FEAR: fresh tokens must not be in a 6h downtrend — dead cat bounces are common.
+    if (regime === 'FEAR' && ageSec > 0 && ageSec <= 6 * 3600 && pc6h < -5) {
+      console.debug(`[raydium-scan] ✗fear-6h ${sym.padEnd(10)} pc6h:${pc6h.toFixed(1)}% fresh token declining in FEAR`);
+      skipped.momentum++; continue;
+    }
 
     // ── Gate 4: Volume quality ──
     // vol/liq ratio > 10% = real trading activity
