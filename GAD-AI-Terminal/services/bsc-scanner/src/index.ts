@@ -116,6 +116,16 @@ async function handleNewBscToken(token: BscToken): Promise<void> {
   if (!AUTO_BUY) return;
   if (buyFailBlacklist.get(token.contract_address) ?? 0 > Date.now()) return;
 
+  // ПРОМТ-4: Check for existing active position (prevents duplicate buys like ELITE)
+  const existing = await query(
+    'SELECT id FROM bsc_positions WHERE contract_address = $1 AND is_active = true',
+    [token.contract_address]
+  );
+  if (existing.rows.length > 0) {
+    console.info(`[bsc-scanner] ⏭️ Skip ${token.symbol} — already have active position`);
+    return;
+  }
+
   const openCount = await query(
     `SELECT COUNT(*) as cnt FROM bsc_positions WHERE sold_at IS NULL AND is_active=true`
   );

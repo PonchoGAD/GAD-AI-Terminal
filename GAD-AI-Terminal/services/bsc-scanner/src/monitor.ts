@@ -3,24 +3,22 @@ import { ethers } from 'ethers';
 import { query } from '@lib/db';
 import { sellBscToken, getBscTokenBalance, getBnbBalance } from '@lib/bsc';
 
-// ─── Config — Dip Buyer Strategy ─────────────────────────────────────────────
-// Buy established $20M+ mcap tokens on dips. Hold until 2x, then sell 50%.
-// Remaining 50% runs with trailing stop — can recover further or exit at trail.
+// ─── Config — Momentum Strategy ──────────────────────────────────────────────
+// Buy BSC meme coins $500k-$10M on upward momentum.
+// TP1: 1.3x → sell 70% (lock profit fast), TP2: 2.5x → sell 100%.
+// Breakeven stop activates after TP1 (entry-2%), trail 12% from ATH.
 
-const STOP_LOSS_PCT   = Number(process.env.BSC_STOP_LOSS_PCT   || '35');   // 35% stop — give established coins room to recover
-const TRAIL_PCT       = Number(process.env.BSC_TRAIL_PCT       || '25');   // 25% trailing stop after first TP fires
-const TIME_LIMIT_SEC  = Number(process.env.BSC_TIME_LIMIT_SEC  || '2592000'); // 30 days — portfolio hold, not a quick trade
-const POLL_INTERVAL   = Number(process.env.BSC_POLL_INTERVAL_MS || '60000'); // 60s poll — established tokens, no rush
+const STOP_LOSS_PCT   = Number(process.env.BSC_STOP_LOSS_PCT   || '8');    // 8% — tight stop for meme momentum
+const TRAIL_PCT       = Number(process.env.BSC_TRAIL_PCT       || '12');   // 12% trailing stop
+const TIME_LIMIT_SEC  = Number(process.env.BSC_TIME_LIMIT_SEC  || '3600'); // 1 hour — meme momentum is short
+const POLL_INTERVAL   = Number(process.env.BSC_POLL_INTERVAL_MS || '15000'); // 15s poll — meme moves fast
 
-// Pyramid scale-out: each 2x from entry doubles the multiplier, sell 50% each time.
-// After 3 TPs, ~10% "неснижаемый остаток" (non-reducible moon bag) remains.
-//   TP1: 2x → sell 50%  → 50% left
-//   TP2: 4x → sell 50%  → 25% left
-//   TP3: 8x → sell 60%  → ~10% left (moon bag, exits via TRAIL_STOP only)
+//   TP1: 1.3x → sell 70% — capture most profit on typical meme spike
+//   TP2: 2.5x → sell 100% — close remainder if continues
+//   After TP1: breakeven stop (entry-2%) — never give back the win
 const BSC_TPS = [
-  { mult: 2.0, sellPct: 50 },  // 2x: sell 50% — recover initial investment
-  { mult: 4.0, sellPct: 50 },  // 4x: sell 50% of remaining — lock +300% on that portion
-  { mult: 8.0, sellPct: 60 },  // 8x: sell 60% of remaining → ~10% moon bag left
+  { mult: 1.3, sellPct: 70  },  // 1.3x: sell 70% — immediate profit lock
+  { mult: 2.5, sellPct: 100 },  // 2.5x: sell 100% — moon target
 ];
 
 interface BscPosition {
@@ -166,12 +164,14 @@ async function checkPosition(pos: BscPosition): Promise<void> {
     ` liq:$${data.liqUsd.toFixed(0)} hold:${holdDays.toFixed(1)}d`
   );
 
-  // Stop loss — hard floor to prevent catastrophic losses.
-  // 35% gives established tokens room to recover from dip without stopping prematurely.
-  if (mult <= (1 - STOP_LOSS_PCT / 100)) {
-    console.info(`[bsc-monitor] 🔴 STOP ${pos.symbol} ${mult.toFixed(3)}x (stop:${STOP_LOSS_PCT}%) — selling 100%`);
+  // Stop loss — after TP1 fires (tp_index >= 1), switch to breakeven stop (entry-2%)
+  // This ensures we never give back a win once TP1 is locked.
+  const effectiveStopPct = pos.tp_index >= 1 ? 2 : STOP_LOSS_PCT;
+  if (mult <= (1 - effectiveStopPct / 100)) {
+    const stopLabel = pos.tp_index >= 1 ? 'BREAKEVEN_STOP' : 'STOP_LOSS';
+    console.info(`[bsc-monitor] 🔴 ${stopLabel} ${pos.symbol} ${mult.toFixed(3)}x (stop:${effectiveStopPct}%) — selling 100%`);
     sellInProgress.add(pos.id);
-    await sellPosition(pos, 'STOP_LOSS', 100).finally(() => sellInProgress.delete(pos.id));
+    await sellPosition(pos, stopLabel, 100).finally(() => sellInProgress.delete(pos.id));
     return;
   }
 

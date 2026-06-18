@@ -2,21 +2,22 @@ import axios from 'axios';
 import { query } from '@lib/db';
 import { checkBscTokenSafety } from '@lib/bsc';
 
-// ─── Config — Dip Buyer Strategy ─────────────────────────────────────────────
-// Target: established BSC tokens ($20M+ mcap) bought on significant dips.
-// Exit: sell 50% at 2x from entry, hold rest with trailing stop.
+// ─── Config — Momentum Strategy ──────────────────────────────────────────────
+// Target: BSC meme coins $500k-$10M mcap with active upward momentum.
+// Entry: pc1h >= 3%, pc5m >= 0.5%, vol/liq momentum visible.
+// Exit: TP1 at 1.3x (sell 70%), TP2 at 2.5x (sell 100%), trail 12%, stop 8%.
 
-const MIN_MCAP_USD   = Number(process.env.BSC_DIP_MIN_MCAP_USD  || '20000000');  // $20M min market cap
-const MAX_MCAP_USD   = Number(process.env.BSC_DIP_MAX_MCAP_USD  || '300000000'); // $300M max (smaller caps move more)
-const MIN_VOL_24H    = Number(process.env.BSC_DIP_MIN_VOL_24H   || '200000');    // $200k 24h volume — must have real liquidity
-const MIN_LIQ_USD    = Number(process.env.BSC_DIP_MIN_LIQ_USD   || '100000');    // $100k min pool liquidity (execute our buy cleanly)
-const DIP_PC24H_MIN  = Number(process.env.BSC_DIP_PC24H_MIN     || '-60');       // not in free-fall
-const DIP_PC24H_MAX  = Number(process.env.BSC_DIP_PC24H_MAX     || '-10');       // must actually be on a dip (-10% min)
-const STAB_PC1H_MIN  = Number(process.env.BSC_DIP_PC1H_MIN      || '-12');       // not still crashing fast
-const STAB_PC1H_MAX  = Number(process.env.BSC_DIP_PC1H_MAX      || '25');        // not already recovered 25%+ in 1h
-const MAX_BUY_TAX    = Number(process.env.BSC_MAX_BUY_TAX       || '5');
-const MAX_SELL_TAX   = Number(process.env.BSC_MAX_SELL_TAX       || '5');
-const MIN_SAFE_SCORE = Number(process.env.BSC_MIN_SAFE_SCORE     || '40');
+const MIN_MCAP_USD   = Number(process.env.BSC_MIN_MCAP_USD    || '500000');    // $500k min
+const MAX_MCAP_USD   = Number(process.env.BSC_MAX_MCAP_USD    || '10000000');  // $10M max (pre-pump range)
+const MIN_VOL_24H    = Number(process.env.BSC_MIN_VOL_24H     || '50000');     // $50k 24h volume
+const MIN_LIQ_USD    = Number(process.env.BSC_MIN_LIQUIDITY_USD || '50000');   // $50k liquidity
+const MIN_PC1H       = Number(process.env.BSC_MIN_PC1H        || '3');         // 3%+ momentum in 1h
+const MAX_PC1H       = Number(process.env.BSC_MAX_PC1H        || '80');        // not already pumped 80%
+const MIN_PC5M       = Number(process.env.BSC_MIN_PC5M        || '0.5');       // 0.5%+ in last 5m
+const MIN_BS_RATIO   = Number(process.env.BSC_MIN_BS_RATIO    || '1.2');       // buyers dominating
+const MAX_BUY_TAX    = Number(process.env.BSC_MAX_BUY_TAX     || '5');
+const MAX_SELL_TAX   = Number(process.env.BSC_MAX_SELL_TAX    || '5');
+const MIN_SAFE_SCORE = Number(process.env.BSC_MIN_SAFE_SCORE  || '40');
 
 export interface BscToken {
   contract_address: string;
@@ -29,7 +30,7 @@ export interface BscToken {
   volume_1h:        number;
   volume_24h:       number;
   price_change_1h:  number;
-  price_change_24h: number;  // key dip signal
+  price_change_24h: number;
   price_change_5m:  number;
   price_bnb:        number;
   mcap_usd:         number;
@@ -62,8 +63,6 @@ function mapDexPair(p: any): BscToken | null {
     price_change_24h: Number(p.priceChange?.h24 ?? 0),
     price_change_5m:  Number(p.priceChange?.m5  ?? 0),
     price_bnb:        Number(p.priceNative       ?? 0),
-    // Use marketCap (circulating) first, not FDV — FDV can be 3-10x circulating for BSC tokens.
-    // FDV-based mcap filter passes tokens with tiny circulating supply that fail the $20M threshold.
     mcap_usd:         Math.max(0, Number(p.marketCap ?? p.fdv ?? 0)),
     age_sec:          Math.max(0, createdAt),
     buy_sell_ratio:   Number(p.txns?.h1?.buys ?? 1) / Math.max(1, Number(p.txns?.h1?.sells ?? 1)),
@@ -77,18 +76,16 @@ function mapDexPair(p: any): BscToken | null {
 }
 
 // ─── Token Discovery ──────────────────────────────────────────────────────────
-// Strategy: find established BSC tokens that have recently dropped -10% to -60%.
-// We look at multiple angle to build a universe of $20M+ mcap BSC tokens,
-// then filter them for dip conditions.
-async function fetchBscDipCandidates(): Promise<BscToken[]> {
-  const seen  = new Set<string>();
+// Strategy: find BSC meme coins $500k-$10M mcap with active momentum.
+// Multiple search angles to build a universe of candidates.
+async function fetchBscMomentumCandidates(): Promise<BscToken[]> {
+  const seen    = new Set<string>();
   const results: BscToken[] = [];
 
-  // Source 1: DexScreener BSC pairs with broad keyword searches.
-  // These queries return many established BSC tokens across DeFi, gaming, meme sectors.
+  // Source 1: DexScreener BSC meme/trending keyword searches
   const queries = [
-    'bnb defi', 'pancakeswap bsc', 'bsc gaming', 'bnb meme', 'bsc ai token',
-    'bsc metaverse', 'bnb yield', 'bsc nft', 'bnb ecosystem', 'cake bsc',
+    'bsc meme', 'bnb meme coin', 'bsc pepe', 'bsc doge', 'bsc shib',
+    'bsc trending', 'bnb viral', 'bsc ai token', 'bsc new meme', 'bnb pump',
   ];
   for (const q of queries) {
     try {
@@ -108,7 +105,7 @@ async function fetchBscDipCandidates(): Promise<BscToken[]> {
     } catch { continue; }
   }
 
-  // Source 2: DexScreener top-boosted BSC tokens — often established projects with communities.
+  // Source 2: DexScreener top-boosted BSC tokens — often recently trending memes
   try {
     const boostR = await axios.get('https://api.dexscreener.com/token-boosts/top/v1', { timeout: 6_000 });
     const bscAddrs = ((Array.isArray(boostR.data) ? boostR.data : []) as any[])
@@ -130,73 +127,50 @@ async function fetchBscDipCandidates(): Promise<BscToken[]> {
     }
   } catch { }
 
-  // Source 3: CoinGecko BNB Chain ecosystem — top tokens by volume, includes established projects.
+  // Source 3: DexScreener latest BSC token profiles — new projects being promoted
   try {
-    const cgR = await axios.get(
-      'https://api.coingecko.com/api/v3/coins/markets' +
-      '?vs_currency=usd&category=bnb-chain-ecosystem' +
-      '&order=volume_desc&per_page=100&sparkline=false' +
-      '&price_change_percentage=24h',
-      { timeout: 10_000, headers: { 'Accept': 'application/json' } }
-    );
-    const cgTokens: any[] = cgR.data ?? [];
-    // For tokens matching our criteria, look up BSC pair on DexScreener
-    const candidates = cgTokens
-      .filter(t =>
-        (t.market_cap ?? 0) >= MIN_MCAP_USD &&
-        (t.total_volume ?? 0) >= MIN_VOL_24H &&
-        (t.price_change_percentage_24h ?? 0) <= DIP_PC24H_MAX &&
-        (t.price_change_percentage_24h ?? 0) >= DIP_PC24H_MIN
-      )
-      .slice(0, 20);
-
-    if (candidates.length > 0) {
-      const symbols = candidates.map(t => t.symbol?.toUpperCase()).filter(Boolean);
-      console.info(`[bsc-scan] CoinGecko: ${candidates.length} BSC dip candidates: ${symbols.slice(0, 5).join(', ')}`);
-      for (const cg of candidates) {
-        try {
-          const searchR = await axios.get(
-            `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(cg.symbol + ' bsc')}`,
-            { timeout: 5_000 }
-          );
-          for (const p of (searchR.data?.pairs ?? []) as any[]) {
-            if (p.chainId !== 'bsc') continue;
-            const addr = p.baseToken?.address?.toLowerCase();
-            if (!addr || seen.has(addr)) continue;
-            seen.add(addr);
-            const t = mapDexPair(p);
-            if (t) results.push(t);
-          }
-          await new Promise(r => setTimeout(r, 300));
-        } catch { continue; }
+    const profileR = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 6_000 });
+    const bscProfiles = ((Array.isArray(profileR.data) ? profileR.data : []) as any[])
+      .filter(p => p.chainId === 'bsc' && p.tokenAddress)
+      .map(p => p.tokenAddress as string)
+      .filter(a => !seen.has(a.toLowerCase()))
+      .slice(0, 15);
+    if (bscProfiles.length) {
+      bscProfiles.forEach(a => seen.add(a.toLowerCase()));
+      const pr = await axios.get(
+        `https://api.dexscreener.com/latest/dex/tokens/${bscProfiles.join(',')}`,
+        { timeout: 6_000 }
+      );
+      for (const p of (pr.data?.pairs ?? []) as any[]) {
+        if (p.chainId !== 'bsc') continue;
+        const t = mapDexPair(p);
+        if (t && !seen.has(t.contract_address)) { seen.add(t.contract_address); results.push(t); }
       }
     }
-  } catch (e: any) {
-    console.debug(`[bsc-scan] CoinGecko fetch failed: ${e.message?.slice(0, 60)}`);
-  }
+  } catch { }
 
   console.info(`[bsc-scan] Discovery: ${results.length} BSC pairs found`);
   return results;
 }
 
-// ─── Dip Filter ──────────────────────────────────────────────────────────────
-// Passes ONLY established tokens in clear dip that may recover.
-function passesDipFilter(t: BscToken): string | null {
-  // Must have real market cap (established token)
-  if (t.mcap_usd < MIN_MCAP_USD) return `mcap:$${(t.mcap_usd/1e6).toFixed(1)}M < $${(MIN_MCAP_USD/1e6).toFixed(0)}M`;
-  if (t.mcap_usd > MAX_MCAP_USD) return `mcap:$${(t.mcap_usd/1e6).toFixed(0)}M > $${(MAX_MCAP_USD/1e6).toFixed(0)}M`;
+// ─── Momentum Filter ─────────────────────────────────────────────────────────
+// Passes ONLY tokens with active upward momentum in the meme mcap range.
+function passesMomentumFilter(t: BscToken): string | null {
+  // mcap range: meme coins $500k-$10M
+  if (t.mcap_usd < MIN_MCAP_USD) return `mcap:$${(t.mcap_usd/1000).toFixed(0)}k < $${(MIN_MCAP_USD/1000).toFixed(0)}k`;
+  if (t.mcap_usd > MAX_MCAP_USD) return `mcap:$${(t.mcap_usd/1e6).toFixed(1)}M > $${(MAX_MCAP_USD/1e6).toFixed(0)}M`;
 
   // Must have real liquidity and volume
   if (t.liquidity_usd < MIN_LIQ_USD) return `liq:$${t.liquidity_usd.toFixed(0)} < $${MIN_LIQ_USD}`;
   if (t.volume_24h < MIN_VOL_24H)    return `vol24h:$${t.volume_24h.toFixed(0)} < $${MIN_VOL_24H}`;
 
-  // Must be on a dip (24h decline required)
-  if (t.price_change_24h > DIP_PC24H_MAX) return `pc24h:${t.price_change_24h.toFixed(1)}% not a dip (need ≤${DIP_PC24H_MAX}%)`;
-  if (t.price_change_24h < DIP_PC24H_MIN) return `pc24h:${t.price_change_24h.toFixed(1)}% free-fall (min:${DIP_PC24H_MIN}%)`;
+  // Momentum: must be moving up right now
+  if (t.price_change_1h < MIN_PC1H) return `pc1h:${t.price_change_1h.toFixed(1)}% < ${MIN_PC1H}% (no momentum)`;
+  if (t.price_change_1h > MAX_PC1H) return `pc1h:${t.price_change_1h.toFixed(1)}% > ${MAX_PC1H}% (already pumped)`;
+  if (t.price_change_5m < MIN_PC5M) return `pc5m:${t.price_change_5m.toFixed(1)}% < ${MIN_PC5M}% (stalling)`;
 
-  // Must be stabilizing (not still in free-fall in the last 1h)
-  if (t.price_change_1h < STAB_PC1H_MIN) return `pc1h:${t.price_change_1h.toFixed(1)}% still falling (min:${STAB_PC1H_MIN}%)`;
-  if (t.price_change_1h > STAB_PC1H_MAX) return `pc1h:${t.price_change_1h.toFixed(1)}% already recovering too fast`;
+  // Buyers dominating
+  if (t.buy_sell_ratio < MIN_BS_RATIO) return `bs_ratio:${t.buy_sell_ratio.toFixed(2)} < ${MIN_BS_RATIO} (sellers dominating)`;
 
   return null;
 }
@@ -226,14 +200,13 @@ export async function loadBscRecentBuys(): Promise<void> {
 
 // ─── Main scan cycle ─────────────────────────────────────────────────────────
 export async function runBscScanCycle(): Promise<BscToken[]> {
-  const candidates = await fetchBscDipCandidates();
-
+  const candidates = await fetchBscMomentumCandidates();
   const passed: BscToken[] = [];
 
   for (const token of candidates) {
-    const dipReason = passesDipFilter(token);
-    if (dipReason) {
-      console.debug(`[bsc-scan] ✗dip  ${token.symbol.padEnd(10)} ${dipReason}`);
+    const momentumReason = passesMomentumFilter(token);
+    if (momentumReason) {
+      console.debug(`[bsc-scan] ✗mom  ${token.symbol.padEnd(10)} ${momentumReason}`);
       continue;
     }
     if (recentScanned.has(token.contract_address)) {
@@ -242,20 +215,18 @@ export async function runBscScanCycle(): Promise<BscToken[]> {
     }
 
     console.info(
-      `[bsc-scan] 🎯 DIP CANDIDATE ${token.symbol} ` +
-      `mcap:$${(token.mcap_usd/1e6).toFixed(1)}M ` +
-      `vol24h:$${(token.volume_24h/1000).toFixed(0)}k ` +
-      `pc24h:${token.price_change_24h.toFixed(1)}% ` +
+      `[bsc-scan] 🎯 MOMENTUM ${token.symbol} ` +
+      `mcap:$${(token.mcap_usd/1000).toFixed(0)}k ` +
       `pc1h:${token.price_change_1h.toFixed(1)}% ` +
+      `pc5m:${token.price_change_5m.toFixed(1)}% ` +
+      `bs:${token.buy_sell_ratio.toFixed(2)} ` +
       `liq:$${(token.liquidity_usd/1000).toFixed(0)}k`
     );
 
-    // Safety check: honeypot.is + GoPlus — FAIL-CLOSED: if API unavailable, skip token.
-    // Bug fix: previous code defaulted safe_score=50 (pass) when safety API failed.
-    // Now: failed safety check = rejected, not silently passed.
+    // Safety: fail-closed — skip if API unavailable
     const safety = await checkBscTokenSafety(token.contract_address).catch(() => null);
     if (!safety) {
-      console.info(`[bsc-scan] ✗safe ${token.symbol} — safety API unavailable, skipping (fail-closed)`);
+      console.info(`[bsc-scan] ✗safe ${token.symbol} — safety API unavailable, skipping`);
       continue;
     }
     token.is_honeypot = safety.is_honeypot;
@@ -275,8 +246,8 @@ export async function runBscScanCycle(): Promise<BscToken[]> {
 
     console.info(
       `[bsc-scan] ✅ BUY SIGNAL ${token.symbol} ` +
-      `mcap:$${(token.mcap_usd/1e6).toFixed(1)}M ` +
-      `pc24h:${token.price_change_24h.toFixed(1)}% ` +
+      `mcap:$${(token.mcap_usd/1000).toFixed(0)}k ` +
+      `pc1h:${token.price_change_1h.toFixed(1)}% pc5m:${token.price_change_5m.toFixed(1)}% ` +
       `tax:${token.buy_tax.toFixed(1)}/${token.sell_tax.toFixed(1)}% ` +
       `score:${token.safe_score}`
     );
