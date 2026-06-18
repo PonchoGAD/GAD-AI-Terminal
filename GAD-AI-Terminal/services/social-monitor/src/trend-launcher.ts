@@ -304,6 +304,8 @@ export async function runTrendLaunchCycle(): Promise<void> {
     const mintKp   = Keypair.generate();
     const mintAddr = mintKp.publicKey.toBase58();
 
+    // pump.fun added global_volume_accumulator account — old SDK buy instruction fails.
+    // Workaround: create with BigInt(0) (no SDK buy), then buy via PumpPortal separately.
     const createResult = await sdk.createAndBuy(
       w1, mintKp,
       {
@@ -315,16 +317,25 @@ export async function runTrendLaunchCycle(): Promise<void> {
         telegram:    'https://t.me/gadfamilytg',
         website:     'https://gadai.shop',
       },
-      BigInt(Math.round(DEV_BUY_SOL * 1e9)),
-      500n, // 5% slippage
+      BigInt(0), // 0 = create only, no SDK buy (avoids global_volume_accumulator error)
+      500n,
       { unitLimit: 250000, unitPrice: 250000 }
     );
 
     if (!createResult.success) {
-      throw new Error('pumpdotfun-sdk createAndBuy returned success=false');
+      throw new Error('pumpdotfun-sdk create returned success=false');
     }
 
     console.info(`[trend-launch] ✅ Token created: ${mintAddr} | TX: ${createResult.signature}`);
+
+    // Dev buy via PumpPortal (handles current pump.fun program correctly)
+    await new Promise(r => setTimeout(r, 5000)); // wait 5s for mint to settle
+    try {
+      const buySig = await pumpBuy(conn, w1, mintAddr, DEV_BUY_SOL);
+      console.info(`[trend-launch] Dev buy ✅ ${DEV_BUY_SOL} SOL: ${buySig}`);
+    } catch (buyErr: any) {
+      console.warn(`[trend-launch] Dev buy failed (token still live): ${buyErr.message}`);
+    }
 
     // 6. Record in DB
     await recordLaunch(trend.id, concept.ticker, concept.name, concept.description, mintAddr, trend.tweet_url);

@@ -135,7 +135,7 @@ async function fromTrendClusters(): Promise<XTrend[]> {
     const { rows } = await query<any>(`
       SELECT id, main_title, meme_score, trend_score, final_score, total_mentions
       FROM trend_clusters
-      WHERE final_score >= 55
+      WHERE final_score >= 30
         AND created_at > now() - interval '2 hours'
       ORDER BY final_score DESC
       LIMIT 5
