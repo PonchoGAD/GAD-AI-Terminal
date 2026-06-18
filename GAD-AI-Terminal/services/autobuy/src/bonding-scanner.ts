@@ -158,7 +158,9 @@ const SOL_VELOCITY_DECAY_SOL    = Number(process.env.SOL_VELOCITY_DECAY_SOL     
 const GRADUATION_THRESHOLD_SOL  = 588;                                                          // pump.fun graduation threshold
 const GRADUATION_SAFETY_MARGIN  = 100;                                                          // refuse buy if within 100 SOL of graduation
 const VELOCITY_TPS = [
-  { mult: 1.5, sellPct: 100 },  // take 100% at 1.5x — bonding curve spikes dump fast
+  { mult: 1.2, sellPct: 70  },  // lock 70% at 1.2x — captures typical bonding spike (avg winner: 1.07-1.88x)
+  { mult: 1.6, sellPct: 67  },  // sell 67% of remaining (~20% original) at 1.6x
+  { mult: 2.5, sellPct: 100 },  // moon bag: sell rest at 2.5x
 ];
 
 // Live SOL price (updated every 5 min)
@@ -574,6 +576,11 @@ async function checkPositionExits(
       }
       pos.isSelling = false;
       pos.tpIndex++;
+      // After TP1: tighten stop to 2% below entry — profit secured, protect remaining
+      if (pos.tpIndex === 1 && (pos.stopPct ?? stopPct) > 0.02) {
+        pos.stopPct = 0.02;
+        console.info(`[bonding-scan] 📌 Breakeven stop activated ${pos.symbol} — stop now entry-2%`);
+      }
       if (pos.tpIndex >= tpLevels.length) {
         pos.allTpsDone = true;
         console.info(`[bonding-scan] 🌙 All TPs done ${pos.symbol} — moon bag mode, trail ${MOON_BAG_TRAIL_PCT * 100}%`);
