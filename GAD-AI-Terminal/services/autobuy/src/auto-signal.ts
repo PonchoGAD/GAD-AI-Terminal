@@ -235,6 +235,7 @@ async function previouslyLost(mint: string): Promise<boolean> {
      WHERE mint_address = $1
        AND active = false
        AND amount_sol > 0
+       AND entry_price_sol IS NOT NULL
        AND total_sold_sol < amount_sol * 0.90
        AND created_at > now() - interval '14 days'`,
     [mint]
@@ -786,32 +787,10 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     }
   }
 
-  // Source 6: Dedicated PumpSwap graduates — freshly graduated pump.fun tokens on PumpSwap AMM.
-  // These are 1-48h old with real liquidity and strong community momentum post-graduation.
-  // Jupiter routes through PumpSwap natively, so buy+sell work the same as Raydium.
-  for (const psQuery of ['pumpswap', 'graduated pumpswap', 'pump fun graduated']) {
-    try {
-      const psR = await axios.get(
-        `${DEXSCREENER_BASE}/search?q=${encodeURIComponent(psQuery)}`,
-        { timeout: 6_000 }
-      );
-      const pairs: any[] = psR.data?.pairs ?? [];
-      let added = 0;
-      for (const p of pairs) {
-        if (p.chainId !== 'solana') continue;
-        if ((p.dexId?.toLowerCase() ?? '') !== 'pumpswap') continue;
-        const mint = p.baseToken?.address;
-        if (!mint || seen.has(mint)) continue;
-        seen.add(mint);
-        results.push(p);
-        added++;
-      }
-      if (added > 0) console.debug(`[raydium-scan] PumpSwap graduates "${psQuery}": ${added} pairs`);
-      await new Promise(r => setTimeout(r, 300));
-    } catch (e: any) {
-      console.debug(`[raydium-scan] PumpSwap source error: ${(e as any).message?.slice(0, 40)}`);
-    }
-  }
+  // Source 6 (REMOVED): PumpSwap graduates were included here but caused Token-2022
+  // simulation failures. PumpSwap tokens use Token-2022 format; Jupiter's simulation
+  // invokes GetAccountDataSize on the Token-2022 program and fails with custom error 0x1.
+  // PumpSwap graduates are only tradeable via PumpPortal (disabled) — skip entirely.
 
   const dxCount = results.length - raydiumDexCount;
   console.debug(`[raydium-scan] total: ${results.length} unique candidates (${raydiumDexCount} raydium-dex + ${dxCount} dx)`);

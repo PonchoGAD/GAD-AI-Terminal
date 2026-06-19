@@ -12,6 +12,7 @@ import { PublicKey } from '@solana/web3.js';
 import { processAutoSignals, processRaydiumOpportunities, AUTO_BUY_ENABLED, getLiqTier } from './auto-signal';
 import { startGraduationScanner } from './graduation-scanner';
 import { startBondingScanner } from './bonding-scanner';
+import { startBondingSmart } from './bonding-smart';
 import { startCopyTrader } from './copy-trader';
 
 const POLL_MS    = Number(process.env.AUTOBUY_POLL_SECONDS  || '15') * 1000;
@@ -1161,6 +1162,10 @@ export async function startAutobuyScheduler() {
 
   // Start bonding curve scanner — buys tokens BEFORE graduation using PUMPFUN_WALLET
   startBondingScanner();
+
+  // Start smart bonding scanner — real-time WebSocket PumpFun trading (disabled by default)
+  // Enable with: BONDING_SMART_ENABLED=true in .env (DO NOT enable without backtesting)
+  startBondingSmart();
 
   // Start copy-trader — mirrors buys from curated profitable wallets via Helius
   if (keypair) {
