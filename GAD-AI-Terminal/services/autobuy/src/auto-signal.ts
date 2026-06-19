@@ -398,10 +398,11 @@ const DEXSCREENER_BASE = 'https://api.dexscreener.com/latest/dex';
 const GECKO_BASE = 'https://api.geckoterminal.com/api/v2';
 const GECKO_HEADERS = { 'Accept': 'application/json;version=20230302' };
 
-// Min liquidity — calibrated from 72h analysis of real pump.fun graduates that hit >$50k mcap.
-// Liq $20-25k at listing = dev buy ~0.3-0.8 SOL (lowest quality tier, high rug risk).
-// Liq $25k+ = dev buy ~0.8+ SOL (real skin in the game). 22k default filters cheapest rugs.
-const RAYDIUM_MIN_LIQUIDITY_USD = Number(process.env.RAYDIUM_MIN_LIQUIDITY_USD || '22000');
+// Min liquidity — raised to $30k based on 7-day audit (37 wins, 101 real buys).
+// Avg liq of winning trades = $34k. Tokens $12-25k cause stop-loss slippage of -16.7%
+// even with -8% programmatic stop (thin pool moves price on our own 0.02 SOL sell).
+// $30k floor = dev buy ~1.0+ SOL, real skin in the game, enough depth for exit.
+const RAYDIUM_MIN_LIQUIDITY_USD = Number(process.env.RAYDIUM_MIN_LIQUIDITY_USD || '30000');
 // Max liquidity — avoid large-cap tokens (slow movers)
 // T2 ($80k+) has 0% win rate across 79-trade audit — default excludes T2/T3.
 // Override in .env: RAYDIUM_MAX_LIQUIDITY_USD=250000 to allow T2 after backtesting.
@@ -881,9 +882,10 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       console.debug(`[raydium-scan] ✗liq  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
       skipped.liq++; continue;
     }
-    // FEAR liquidity floor: thin-liq tokens ($12-24k) cause stop-loss slippage in weak markets.
-    if (regime === 'FEAR' && liq < 25000) {
-      console.debug(`[raydium-scan] ✗fear  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} < $25k floor in FEAR`);
+    // FEAR liquidity floor: min liq is now $30k globally, but in FEAR we require $35k.
+    // Thin pools cause stop-loss slippage amplified when market sentiment is weak.
+    if (regime === 'FEAR' && liq < 35000) {
+      console.debug(`[raydium-scan] ✗fear  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} < $35k floor in FEAR`);
       skipped.liq++; continue;
     }
 
@@ -929,8 +931,15 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     const buys5m  = (pair.txns?.m5?.buys  ?? 0) as number;
     const sells5m = (pair.txns?.m5?.sells ?? 0) as number;
     const isFreshToken = ageSec >= 0 && ageSec < 6 * 3600;
-    if (isFreshToken && liq >= 40000 && ageSec >= 0 && ageSec < 3600) {
-      console.debug(`[raydium-scan] ✗hiLiqFresh ${sym.padEnd(10)} liq:$${liq.toFixed(0)} age:${(ageSec/60).toFixed(0)}min (≥$40k fresh needs ≥60min)`);
+    // Age gate for all tokens liq < $45k: require ≥60 min.
+    // Microcap tokens ($30-45k liq) are still vulnerable to dev dump in the first hour.
+    // Tokens $45k+ liq need ≥60 min too (expanded from old $40k floor).
+    if (ageSec >= 0 && ageSec < 3600 && liq < 45000) {
+      console.debug(`[raydium-scan] ✗microcap1h ${sym.padEnd(10)} liq:$${liq.toFixed(0)} age:${(ageSec/60).toFixed(0)}min (liq<$45k needs ≥60min)`);
+      skipped.age++; continue;
+    }
+    if (isFreshToken && liq >= 45000 && ageSec >= 0 && ageSec < 3600) {
+      console.debug(`[raydium-scan] ✗hiLiqFresh ${sym.padEnd(10)} liq:$${liq.toFixed(0)} age:${(ageSec/60).toFixed(0)}min (≥$45k fresh needs ≥60min)`);
       skipped.age++; continue;
     }
     if (isFreshToken && buys1h < 40) {
@@ -961,6 +970,19 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       }
       if (sells5m > buys5m * 1.3) {
         console.debug(`[raydium-scan] ✗5mdist ${sym.padEnd(10)} buys5m:${buys5m} sells5m:${sells5m} — 5m selling > buying`);
+        skipped.momentum++; continue;
+      }
+    }
+
+    // ── Gate 3d: Volume Velocity — active money flowing in RIGHT NOW ──
+    // vol5m / liq ≥ 15% means: 15% pool turnover in last 5 minutes = real demand.
+    // Prevents buying "sleeping" tokens: up 20% in 1h but completely stale in last 5 min.
+    // Default: disabled (0.0). Enable with RAYDIUM_MIN_VOL5M_LIQ=0.15 in .env.
+    const MIN_VOL5M_LIQ_RATIO = Number(process.env.RAYDIUM_MIN_VOL5M_LIQ || '0.0');
+    if (MIN_VOL5M_LIQ_RATIO > 0 && vol5m > 0 && liq > 0) {
+      const vel = vol5m / liq;
+      if (vel < MIN_VOL5M_LIQ_RATIO) {
+        console.debug(`[raydium-scan] ✗vel  ${sym.padEnd(10)} vol5m/liq:${(vel*100).toFixed(1)}% < ${(MIN_VOL5M_LIQ_RATIO*100).toFixed(0)}% (stale momentum)`);
         skipped.momentum++; continue;
       }
     }

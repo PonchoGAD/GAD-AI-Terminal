@@ -91,11 +91,16 @@ const SEARCH_QUERIES = [
 let queryIndex = 0;
 
 // Stop-words for DexScreener word frequency analysis
+// URL fragments and CDN paths pollute token descriptions: "https://cdn.dex.ag/..." splits to
+// ["https","cdn","dex","com"] — all pass length>2 check. Add explicit URL noise words.
 const STOP_WORDS = new Set([
   'the','a','an','is','to','and','of','in','on','for','with','at','by','this','that',
   'it','as','be','has','not','or','sol','solana','token','coin','pump','fun','meme',
   'inu','swap','crypto','web3','nft','dao','defi','block','chain','new','are','you',
   'your','our','its','we','can','will','get','have','just','all','from','was','com',
+  // URL-derived noise (token descriptions contain CDN image URLs):
+  'https','http','www','cdn','api','img','png','jpg','gif','jpeg','svg','webp',
+  'net','xyz','io','app','pro','auto','bot','dev','dex','via','buy','let',
 ]);
 
 function detectNarrative(text: string): { theme: string; keywords: string[] } {
@@ -275,7 +280,7 @@ async function fetchDexScreenerNarratives(): Promise<XTrend[]> {
     const urls: Record<string, string> = {};
     for (const { text, xUrl } of tokens) {
       const words = text.toLowerCase()
-        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/[^a-z\s]/g, ' ')  // strip numbers too — "300 SOL" → "    SOL", "100x" → "x"
         .split(/\s+/)
         .filter(w => w.length > 2 && !STOP_WORDS.has(w));
       for (const w of words) {
@@ -295,7 +300,10 @@ async function fetchDexScreenerNarratives(): Promise<XTrend[]> {
 
     for (const word of topWords) {
       const { theme, keywords } = detectNarrative(word);
-      const finalTheme = theme === 'GENERAL' ? word.toUpperCase() : theme;
+      // Skip GENERAL matches — they produce garbage themes ("AUTO", "300", "CDN") that
+      // coin-hunter then searches for, always returning NO_COIN. Only emit known narratives.
+      if (theme === 'GENERAL') continue;
+      const finalTheme = theme;
       if (seen.has(finalTheme)) continue;
       seen.add(finalTheme);
       results.push({
