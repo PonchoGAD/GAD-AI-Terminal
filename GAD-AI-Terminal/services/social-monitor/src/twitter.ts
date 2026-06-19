@@ -21,7 +21,17 @@ export interface RawTweet {
 }
 
 const TWITTER_BEARER = process.env.TWITTER_BEARER_TOKEN ?? '';
-const NITTER_HOST    = process.env.NITTER_HOST ?? 'nitter.net';
+
+// Browser UA required by Nitter to serve RSS without Cloudflare block
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+// Multiple Nitter instances — tried in order until one responds
+const NITTER_INSTANCES = [
+  'https://nitter.net',
+  'https://nitter.poast.org',
+  'https://nitter.1d4.us',
+  'https://nitter.privacydev.net',
+];
 
 // ─── Twitter API v2 ───────────────────────────────────────────────────────────
 
@@ -57,37 +67,42 @@ async function fetchViaTwitterApi(handle: string, sinceId?: string): Promise<Raw
   return tweets;
 }
 
-// ─── Nitter fallback (RSS/JSON) ───────────────────────────────────────────────
+// ─── Nitter RSS fallback (no API key, browser UA required) ───────────────────
 
 async function fetchViaNitter(handle: string): Promise<RawTweet[]> {
-  // Nitter exposes an RSS feed at /handle/rss
-  const res = await axios.get(`https://${NITTER_HOST}/${handle}/rss`, {
-    timeout: 10000,
-    headers: { 'User-Agent': 'GAD-AI-Terminal/1.0' }
-  });
+  for (const host of NITTER_INSTANCES) {
+    try {
+      const res = await axios.get(`${host}/${handle}/rss`, {
+        timeout: 8000,
+        headers: { 'User-Agent': BROWSER_UA, Accept: 'application/rss+xml, text/xml' },
+        responseType: 'text',
+      });
 
-  // Parse RSS XML manually (minimal, no dependencies)
-  const items: RawTweet[] = [];
-  const raw: string = res.data;
-  const itemBlocks  = raw.match(/<item>([\s\S]*?)<\/item>/g) ?? [];
+      const raw: string = typeof res.data === 'string' ? res.data : '';
+      if (!raw || raw.includes('Verifying your browser') || raw.length < 200) continue;
 
-  for (const block of itemBlocks.slice(0, 20)) {
-    const title  = (block.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/) ?? [])[1] ?? '';
-    const pubDate = (block.match(/<pubDate>(.*?)<\/pubDate>/) ?? [])[1] ?? '';
-    const link   = (block.match(/<link>(.*?)<\/link>/) ?? [])[1] ?? '';
-    const id     = link.split('/').pop() ?? String(Date.now());
+      const items: RawTweet[] = [];
+      const itemBlocks = raw.match(/<item>([\s\S]*?)<\/item>/g) ?? [];
 
-    items.push({
-      id,
-      author:    handle,
-      text:      title,
-      likes:     0,
-      retweets:  0,
-      replies:   0,
-      createdAt: pubDate ? new Date(pubDate) : new Date()
-    });
+      for (const block of itemBlocks.slice(0, 20)) {
+        const getCDATA = (tag: string) =>
+          (block.match(new RegExp(`<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]></${tag}>`)) ?? [])[1] ??
+          (block.match(new RegExp(`<${tag}[^>]*>([^<]*)</${tag}>`)) ?? [])[1] ?? '';
+        const title   = getCDATA('title').replace(/<[^>]+>/g, '').trim();
+        const pubDate = getCDATA('pubDate');
+        const link    = getCDATA('link');
+        const id      = link.split('/').pop() ?? String(Date.now());
+        if (!title) continue;
+        items.push({
+          id, author: handle, text: title,
+          likes: 0, retweets: 0, replies: 0,
+          createdAt: pubDate ? new Date(pubDate) : new Date()
+        });
+      }
+      return items;
+    } catch { continue; }
   }
-  return items;
+  return [];
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -99,9 +114,23 @@ export interface ParsedTweet extends RawTweet {
 }
 
 export async function fetchTweetsForHandle(handle: string, sinceId?: string): Promise<ParsedTweet[]> {
-  const raw = TWITTER_BEARER
-    ? await fetchViaTwitterApi(handle, sinceId)
-    : await fetchViaNitter(handle);
+  let raw: RawTweet[] = [];
+
+  if (TWITTER_BEARER) {
+    try {
+      raw = await fetchViaTwitterApi(handle, sinceId);
+    } catch (err: any) {
+      const status = err.response?.status;
+      if (status === 402 || status === 403) {
+        // Twitter API requires paid plan — fall back to Nitter silently
+        raw = await fetchViaNitter(handle);
+      } else {
+        throw err;
+      }
+    }
+  } else {
+    raw = await fetchViaNitter(handle);
+  }
 
   return raw.map(t => ({
     ...t,
