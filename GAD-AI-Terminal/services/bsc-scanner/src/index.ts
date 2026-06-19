@@ -199,8 +199,8 @@ if (AUTO_BUY) {
 getBnbBalance()
   .then(bal => {
     console.info(`[bsc-scanner] 💰 Wallet ${WALLET} — Balance: ${bal.toFixed(4)} BNB`);
-    if (AUTO_BUY && bal < BUY_BNB * 1.1) {
-      console.warn(`[bsc-scanner] ⚠️  Insufficient BNB! Need ${(BUY_BNB * 1.1).toFixed(4)} BNB for trading. Auto-buy will be skipped until funded.`);
+    if (AUTO_BUY && bal < BUY_BNB + GAS_RESERVE) {
+      console.warn(`[bsc-scanner] ⚠️  Insufficient BNB! Need ${(BUY_BNB + GAS_RESERVE).toFixed(4)} BNB (${BUY_BNB} buy + ${GAS_RESERVE} gas reserve). Auto-buy will be skipped until funded.`);
     }
   })
   .catch(e => console.warn(`[bsc-scanner] Could not check BNB balance: ${e.message}`));
