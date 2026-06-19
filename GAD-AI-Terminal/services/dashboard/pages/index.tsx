@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import Link from 'next/link';
 import ScoreBadge from '../components/ScoreBadge';
 
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
+const API    = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
+const WS_URL = API.replace(/^http/, 'ws') + '/ws';
 
 function StatCard({ label, value, color = 'text-white' }: { label: string; value: string | number; color?: string }) {
   return (
@@ -14,11 +15,14 @@ function StatCard({ label, value, color = 'text-white' }: { label: string; value
 }
 
 export default function Overview() {
-  const [tokens, setTokens]     = useState<any[]>([]);
-  const [alerts, setAlerts]     = useState<any[]>([]);
-  const [highscore, setHighscore] = useState<any[]>([]);
+  const [tokens, setTokens]         = useState<any[]>([]);
+  const [alerts, setAlerts]         = useState<any[]>([]);
+  const [highscore, setHighscore]   = useState<any[]>([]);
+  const [positions, setPositions]   = useState<any[]>([]);
+  const [wsLive, setWsLive]         = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     const [t, a, h] = await Promise.all([
       fetch(`${API}/tokens/trending`).then(r => r.json()).catch(() => ({ tokens: [] })),
       fetch(`${API}/alerts`).then(r => r.json()).catch(() => ({ alerts: [] })),
@@ -27,13 +31,48 @@ export default function Overview() {
     setTokens(t.tokens ?? []);
     setAlerts(a.alerts ?? []);
     setHighscore(h.tokens ?? []);
-  };
+  }, []);
 
+  // WebSocket — real-time trade updates (5s push from server)
+  useEffect(() => {
+    let reconnectTimer: ReturnType<typeof setTimeout>;
+
+    function connect() {
+      try {
+        const ws = new WebSocket(WS_URL);
+        wsRef.current = ws;
+
+        ws.onopen  = () => setWsLive(true);
+        ws.onclose = () => {
+          setWsLive(false);
+          reconnectTimer = setTimeout(connect, 5_000); // auto-reconnect
+        };
+        ws.onerror = () => ws.close();
+
+        ws.onmessage = (e) => {
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.event === 'live_state') {
+              setPositions(msg.data.positions ?? []);
+            }
+          } catch { /* ignore malformed */ }
+        };
+      } catch { /* WS not available — fallback to polling */ }
+    }
+
+    connect();
+    return () => {
+      clearTimeout(reconnectTimer);
+      wsRef.current?.close();
+    };
+  }, []);
+
+  // Polling fallback for tokens/alerts (30s; WS covers positions)
   useEffect(() => {
     load();
     const id = setInterval(load, 30_000);
     return () => clearInterval(id);
-  }, []);
+  }, [load]);
 
   return (
     <div className="space-y-6">
@@ -42,9 +81,50 @@ export default function Overview() {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard label="Tokens Tracked"   value={tokens.length} />
         <StatCard label="High Score (≥80)" value={highscore.length} color="text-green-400" />
-        <StatCard label="Active Alerts"    value={alerts.filter((a: any) => !a.resolved).length} color="text-yellow-400" />
-        <StatCard label="Updated"          value={new Date().toLocaleTimeString()} color="text-gray-400" />
+        <StatCard label="Active Positions" value={positions.length} color="text-purple-400" />
+        <StatCard label="Live" value={wsLive ? '● Connected' : '○ Polling'} color={wsLive ? 'text-green-400' : 'text-gray-500'} />
       </div>
+
+      {positions.length > 0 && (
+        <section>
+          <h3 className="text-sm font-semibold text-gray-300 mb-2">⚡ Live Positions</h3>
+          <div className="overflow-x-auto rounded-lg border border-[#2a2a35]">
+            <table className="w-full text-xs">
+              <thead className="bg-[#18181f] text-gray-500">
+                <tr>
+                  <th className="px-3 py-2 text-left">Token</th>
+                  <th className="px-3 py-2 text-right">Spent</th>
+                  <th className="px-3 py-2 text-right">Received</th>
+                  <th className="px-3 py-2 text-right">P&L</th>
+                  <th className="px-3 py-2 text-right">Age</th>
+                </tr>
+              </thead>
+              <tbody>
+                {positions.map((p: any) => {
+                  const spent = Number(p.total_spent_sol ?? 0);
+                  const recv  = Number(p.total_sold_sol ?? 0);
+                  const pnl   = recv - spent;
+                  const ageSec = Math.floor((Date.now() - new Date(p.bought_at).getTime()) / 1000);
+                  const ageStr = ageSec < 60 ? `${ageSec}s` : `${Math.floor(ageSec / 60)}m`;
+                  const labelParts = (p.label ?? '').split(':');
+                  const symbol = labelParts[2] ?? p.mint_address?.slice(0, 8);
+                  return (
+                    <tr key={p.mint_address} className="border-t border-[#2a2a35] hover:bg-[#18181f]">
+                      <td className="px-3 py-2 font-mono text-white">{symbol}</td>
+                      <td className="px-3 py-2 text-right text-gray-300">{spent.toFixed(3)}</td>
+                      <td className="px-3 py-2 text-right text-gray-300">{recv.toFixed(3)}</td>
+                      <td className={`px-3 py-2 text-right font-bold ${pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {pnl >= 0 ? '+' : ''}{pnl.toFixed(3)}
+                      </td>
+                      <td className="px-3 py-2 text-right text-gray-500">{ageStr}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
       <section>
         <div className="flex items-center justify-between mb-3">

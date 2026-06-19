@@ -2,6 +2,9 @@ import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
+import http from 'http';
+import { WebSocketServer, WebSocket } from 'ws';
+import { query } from '@lib/db';
 import { registerRoutes } from './routes';
 import { registerSubscriptionRoutes } from './subscription.routes';
 import { registerTgUserRoutes } from './tg-user.routes';
@@ -38,7 +41,66 @@ registerRoutes(app);
 registerSubscriptionRoutes(app);
 registerTgUserRoutes(app);
 
-app.listen(port, () => {
-  console.log(`GAD AI API listening on port ${port}`);
+// ─── HTTP server + WebSocket ──────────────────────────────────────────────────
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+export function broadcastUpdate(event: string, data: unknown): void {
+  const msg = JSON.stringify({ event, data, ts: Date.now() });
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  });
+}
+
+// Push live trade data to dashboard clients every 5 seconds
+async function broadcastLiveState(): Promise<void> {
+  if (wss.clients.size === 0) return;
+  try {
+    const [posRes, soldRes, statsRes] = await Promise.all([
+      query<any>(`
+        SELECT mint_address, label, amount_sol, bought_at, last_activity_at,
+               total_spent_sol, total_sold_sol
+        FROM autobuy_jobs
+        WHERE active = true AND label LIKE 'auto:%'
+        ORDER BY bought_at DESC LIMIT 20
+      `),
+      query<any>(`
+        SELECT mint_address, label, total_spent_sol, total_sold_sol,
+               bought_at, last_activity_at
+        FROM autobuy_jobs
+        WHERE active = false AND label LIKE 'auto:%'
+          AND last_activity_at > now() - interval '24h'
+        ORDER BY last_activity_at DESC LIMIT 10
+      `),
+      query<any>(`
+        SELECT
+          (SELECT COUNT(*) FROM tokens)::int AS total_tokens,
+          (SELECT COUNT(*) FROM autobuy_jobs WHERE active=true)::int AS active_positions,
+          (SELECT COALESCE(SUM(total_sold_sol),0) FROM autobuy_jobs
+           WHERE bought_at >= CURRENT_DATE)::float AS pnl_today_sol,
+          (SELECT COALESCE(SUM(total_spent_sol),0) FROM autobuy_jobs
+           WHERE bought_at >= CURRENT_DATE)::float AS spent_today_sol
+      `),
+    ]);
+    broadcastUpdate('live_state', {
+      positions:  posRes.rows,
+      recentSold: soldRes.rows,
+      stats:      statsRes.rows[0] ?? {},
+    });
+  } catch { /* ignore — DB may be momentarily busy */ }
+}
+
+wss.on('connection', (ws) => {
+  console.log('[api-ws] Client connected');
+  // Send current state immediately on connect
+  broadcastLiveState().catch(() => {});
+  ws.on('close', () => console.log('[api-ws] Client disconnected'));
+});
+
+setInterval(() => broadcastLiveState().catch(() => {}), 5_000);
+
+server.listen(port, () => {
+  console.log(`GAD AI API listening on port ${port} (WS: ws://localhost:${port}/ws)`);
   startLauncherPriceRefresh();
 });
