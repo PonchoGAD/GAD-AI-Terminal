@@ -243,6 +243,37 @@ console.warn('[sell] ...')
   - PostgreSQL падал с "could not write lock file postmaster.pid: No space left on device"
   - Hot-patch метод деплоя: `scp .ts → docker cp → docker exec build → docker restart` (без пересборки образа)
   - КРИТИЧНО: нужно добавить Hetzner Volume или перейти на тип с большим диском
+- [x] **W2/W3 PumpFun кошельки: ТОЛЬКО запуск монет, НЕ трейдинг (19.06.2026):**
+  - `BONDING_HOT_ENABLED=false`, `SOL_VELOCITY_ENABLED=false` — навсегда отключены в VPS .env
+  - W2 (CFmHWpmQ) и W3 (DJ8Tq8vi) = ТОЛЬКО для triple-launch новых токенов
+  - Trейдинг на pump.fun кошельках слил все SOL в 0 — запрет абсолютный
+  - **Правило:** W2/W3 участвуют только как создатели монет в `launchTriple()`, никаких buy/sell токенов
+- [x] **Triple-launch (3-wallet simultaneous token creation, 19.06.2026):**
+  - `services/telegram/src/launcher.ts`: `launchTriple(cfg)` — все 3 кошелька создают ОДНУ И ТУ ЖЕ монету одновременно
+  - Pinata image+metadata загружаются ОДИН РАЗ → `Promise.all()` для 3 независимых createAndBuy
+  - Каждый кошелёк получает СВОЙ mintKp → свой уникальный CA на pump.fun
+  - `createSingleToken(wallet, alias, ...)` — создаёт одну монету для одного кошелька
+  - `coin_launches` таблица: добавлены `wallet_alias` (W1/W2/W3) и `wallet_address` колонки
+  - `coin_ideas` таблица: добавлены `image_url` и `auto_launch_at` колонки (миграция на VPS ✅)
+- [x] **24h holder check + auto-sell (19.06.2026):**
+  - `runLaunchedCoinMaintenance()` — раз в час проверяет монеты возрастом 22-30ч
+  - `checkHolderCount(mint)` — Birdeye → Helius → DexScreener fallback
+  - Если holders < 10 (MIN_HOLDERS_24H) → `pumpSellAll()` — полная продажа позиции
+  - Scheduler в index.ts: `setInterval(runLaunchedCoinMaintenance, 60*60*1000)` 
+- [x] **Auto-launch scheduler (19.06.2026):**
+  - `runAutoLaunchCycle()` — каждые 3 часа, лимит 5 монет в день (DAILY_LAUNCH_LIMIT=5)
+  - Ищет в coin_ideas: `status='approved'` AND `image_url IS NOT NULL`
+  - Загружает изображение → вызывает `launchTriple()` → записывает wallet_alias в coin_launches
+  - `setTimeout(runAutoLaunchCycle, 10*60*1000)` — первый запуск через 10 мин после старта бота
+- [x] **trend-launcher.ts обновлён (19.06.2026):**
+  - Теперь сохраняет `image_url` в coin_ideas (Pinata CID)
+  - Идеи из X трендов теперь включают URL изображения → auto-launch cycle может их использовать
+- [x] **Raydium filters tightened (19.06.2026):**
+  - `RAYDIUM_MIN_LIQUIDITY_USD=22000` (было 12k)
+  - `RAYDIUM_MAX_PC1H=25` (было 80%) — не покупаем уже пампанувшие
+  - `RAYDIUM_MIN_PC1H=10` (было 5%) — минимальный momentum
+  - `RAYDIUM_MIN_PC5M=3` (было 1%)
+  - `RAYDIUM_MIN_VOL_LIQ_RATIO=0.20` (было 0.15)
 
 ---
 
@@ -251,10 +282,10 @@ console.warn('[sell] ...')
 | Кошелёк | Адрес | Роль | Баланс |
 |---|---|---|---|
 | W1 WALLET_PRIVATE_KEY | EL4mS7Xg | Главный/казна/dev launch/Raydium autobuy | ~0.29 SOL (14.06.26) |
-| W2 PUMPFUN_WALLET_PRIVATE_KEY | CFmHWpmQ | **ОТКЛЮЧЁН** (WebSocket scanner off) | 0.244 SOL (14.06.26) |
-| W3 PUMPFUN_WALLET_PRIVATE_KEY_2 | DJ8Tq8vi | HOT poller (активен) | **0.13 SOL ✅ (14.06.26 — пополнен)** |
+| W2 PUMPFUN_WALLET_PRIVATE_KEY | CFmHWpmQ | **ТОЛЬКО ЗАПУСК МОНЕТ** (трейдинг ОТКЛЮЧЁН навсегда) | ~0.244 SOL (14.06.26) |
+| W3 PUMPFUN_WALLET_PRIVATE_KEY_2 | DJ8Tq8vi | **ТОЛЬКО ЗАПУСК МОНЕТ** (трейдинг ОТКЛЮЧЁН навсегда) | ~0.13 SOL (19.06.26) |
 
-> **W3 пополнен (14.06.2026):** DJ8Tq8vi теперь 0.13 SOL — достаточно для HOT trades (BONDING_BUY_SOL=0.015).
+> **ВАЖНО (19.06.2026):** W2 и W3 = ТОЛЬКО для `launchTriple()`. Трейдинг (BONDING_HOT, SOL_VELOCITY) на них слил все SOL в 0 несколько раз. Hardcoded: `BONDING_HOT_ENABLED=false`, `SOL_VELOCITY_ENABLED=false` в VPS .env.
 > **Адреса:** W1=EL4mS7XgNPWRLca38vHu8JHPhpZcupLKuMipPNJeNwqt | W3=DJ8Tq8viRtMPb3HsK9NwoM2yhVgUdcwuxxePuQ1zPF6e | W2=CFmHWpmQki6dDhV9G82JWCq68x2axTwdnKDQvu7dPTcL
 
 ---
@@ -283,7 +314,7 @@ console.warn('[sell] ...')
 - `scripts/launch-fte.ts` — FTE launch скрипт
 
 **Что нужно для полной 24/7 автоматизации:**
-- [ ] Telegram команда `/auto_launch` на VPS — берёт coin_idea из тренд-движка, запускает через pumpdotfun-sdk + PINATA_JWT (уже в .env VPS)
+- [x] ~~Telegram команда `/auto_launch` на VPS~~ — реализовано (19.06.2026): тройной запуск + авто-цикл 5/день ✅
 - [ ] Автопостинг в X после запуска — перенести twitter-post.ts логику в social-monitor
 
 ---
@@ -408,6 +439,19 @@ console.warn('[sell] ...')
 **Деплой сайта:** `cd C:\Users\gafit\saas-landing-demo && git push gadai main` (НЕ `git push gad main`!).
 **Launcher форма** на сайте: submit-to-queue (без Phantom wallet) → `/api/proxy/launcher/submit` → VPS:4000 → coin_ideas → `/auto_launch` в TG боте.
 **Если Vercel не деплоит автоматически:** Зайти на vercel.com, найти проект `gadai`, нажать "Redeploy" вручную.
+
+---
+
+### 2026-06 — W2/W3 только для запуска монет (19.06.2026)
+**Решение:** W2 и W3 кошельки ПОЛНОСТЬЮ отключены от любого трейдинга. `BONDING_HOT_ENABLED=false`, `SOL_VELOCITY_ENABLED=false` — hardcoded в VPS .env.
+**Почему:** W2/W3 несколько раз полностью слили SOL до 0 через bonding scanner и velocity trader. Ни одна из этих стратегий не была прибыльной — 100% потерь. Единственное применение W2/W3 — создавать монеты через `launchTriple()`.
+**Не включать** трейдинг на pump.fun кошельках до создания полноценного backtesting pipeline.
+
+### 2026-06 — Triple-launch: все 3 кошелька создают одну монету (19.06.2026)
+**Решение:** `launchTriple()` загружает image+metadata в Pinata ОДИН РАЗ, затем 3 кошелька одновременно (Promise.all) создают ОДНУ И ТУ ЖЕ монету (одинаковое имя/тикер/описание/изображение) — но каждый получает СВОЙ уникальный CA.
+**Почему:** Pump.fun — это создание нового токена при каждом вызове createAndBuy. Нельзя "купить" в уже созданный токен другого кошелька через SDK (нужен PumpPortal buy). Поэтому каждый кошелёк = отдельный листинг на pump.fun.
+**Auto-cycle:** `runAutoLaunchCycle()` запускается каждые 3 часа, максимум 5 раз в день (DAILY_LAUNCH_LIMIT). Ищет `coin_ideas` с `status='approved'` AND `image_url IS NOT NULL`.
+**24h check:** `runLaunchedCoinMaintenance()` раз в час смотрит монеты 22-30ч возраста. Если holders < 10 → продать.
 
 ---
 
