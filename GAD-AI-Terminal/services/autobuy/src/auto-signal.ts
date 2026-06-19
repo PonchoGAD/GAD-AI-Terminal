@@ -403,7 +403,9 @@ const GECKO_HEADERS = { 'Accept': 'application/json;version=20230302' };
 // Liq $25k+ = dev buy ~0.8+ SOL (real skin in the game). 22k default filters cheapest rugs.
 const RAYDIUM_MIN_LIQUIDITY_USD = Number(process.env.RAYDIUM_MIN_LIQUIDITY_USD || '22000');
 // Max liquidity — avoid large-cap tokens (slow movers)
-const RAYDIUM_MAX_LIQUIDITY_USD = Number(process.env.RAYDIUM_MAX_LIQUIDITY_USD || '500000');
+// T2 ($80k+) has 0% win rate across 79-trade audit — default excludes T2/T3.
+// Override in .env: RAYDIUM_MAX_LIQUIDITY_USD=250000 to allow T2 after backtesting.
+const RAYDIUM_MAX_LIQUIDITY_USD = Number(process.env.RAYDIUM_MAX_LIQUIDITY_USD || '80000');
 // No separate vol1h floor — Gate 4 vol/liq ratio check is the real stale-pool filter
 const RAYDIUM_MIN_VOLUME_H1_USD = Number(process.env.RAYDIUM_MIN_VOLUME_H1_USD || '0');
 // Min 1h price change — real pump.fun winners show 0.5-20% in 1h at optimal entry
@@ -465,8 +467,9 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
     trailPct: isFear ? 0.15 : 0.18,
     earlyTrailPct: isFear ? 0.035 : 0.045,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.15 : isFear ? 1.15 : 1.12, sellPct: isFear ? 60 : 20 },
-      { stage: 2, multiplier: isBull ? 1.35 : isFear ? 1.45 : 1.28, sellPct: isFear ? 50 : 25 },
+      // FEAR TP1 raised 1.15→1.22: avg win on T1 FEAR = 1.22x, 1.15 fires too early on noise
+      { stage: 1, multiplier: isBull ? 1.15 : isFear ? 1.22 : 1.12, sellPct: isFear ? 60 : 20 },
+      { stage: 2, multiplier: isBull ? 1.35 : isFear ? 1.48 : 1.28, sellPct: isFear ? 50 : 25 },
       { stage: 3, multiplier: isBull ? 1.65 : isFear ? 2.00 : 1.55, sellPct: isFear ? 100 : 33 },
       { stage: 4, multiplier: isBull ? 2.30 : isFear ? 999  : 2.00, sellPct: 50 },
       { stage: 5, multiplier: 999, sellPct: 100 },
@@ -482,8 +485,9 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
     trailPct: 0.15,
     earlyTrailPct: isFear ? 0.03 : 0.04,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.12 : isFear ? 1.12 : 1.10, sellPct: isFear ? 60 : 20 },
-      { stage: 2, multiplier: isBull ? 1.30 : isFear ? 1.35 : 1.23, sellPct: isFear ? 50 : 25 },
+      // FEAR TP1 raised 1.12→1.20: T2 avg win = 1.25x (when profitable), 1.12 fired too soon
+      { stage: 1, multiplier: isBull ? 1.12 : isFear ? 1.20 : 1.10, sellPct: isFear ? 60 : 20 },
+      { stage: 2, multiplier: isBull ? 1.30 : isFear ? 1.38 : 1.23, sellPct: isFear ? 50 : 25 },
       { stage: 3, multiplier: isBull ? 1.55 : isFear ? 1.65 : 1.46, sellPct: isFear ? 100 : 33 },
       { stage: 4, multiplier: isBull ? 2.10 : isFear ? 999  : 1.85, sellPct: 50 },
       { stage: 5, multiplier: 999, sellPct: 100 },

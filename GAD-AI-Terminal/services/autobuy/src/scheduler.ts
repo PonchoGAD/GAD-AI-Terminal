@@ -1124,6 +1124,24 @@ async function deactivateStuckJobs() {
 
 // ─── Main scheduler ───────────────────────────────────────────────────────────
 
+// Startup cleanup: mark old phantom positions (buy TX never confirmed) as inactive.
+// These inflate the "loss count" in P&L stats and block previouslyLost() mint cooldowns.
+// Runs once on startup — periodic version is deactivateStuckJobs() (runs every 30s).
+async function cleanupPhantomPositions(): Promise<void> {
+  const { rows } = await query<{ id: string; mint_address: string }>(
+    `UPDATE autobuy_jobs
+     SET active = false
+     WHERE active = true
+       AND entry_price_sol IS NULL
+       AND bought_at IS NULL
+       AND created_at < now() - interval '1 hour'
+     RETURNING id, mint_address`
+  );
+  if (rows.length > 0) {
+    console.info(`[autobuy] 🧹 Startup cleanup: ${rows.length} phantom positions marked inactive`);
+  }
+}
+
 export async function startAutobuyScheduler() {
   console.info(`[autobuy] Scheduler started. Poll every ${POLL_MS / 1000}s.`);
   // Show example stages for T1 in current-regime context (actual stages are dynamic per getLiqTier)
@@ -1135,6 +1153,9 @@ export async function startAutobuyScheduler() {
   console.info(`[autobuy] Early trail: ${earlyTrailPct}% from peak (fires when trail-stop > entry, pre-TP1)`);
   console.info(`[autobuy] Time limit: ${TIME_LIMIT_SECONDS / 60}min (activity threshold: ${(TIME_LIMIT_ACTIVITY_PCT * 100).toFixed(1)}% UP-only)`);
   console.info(`[autobuy] Auto-signal: ${AUTO_BUY_ENABLED ? 'ENABLED' : 'disabled'}`);
+
+  // One-time cleanup of phantom positions (buy TX never confirmed)
+  await cleanupPhantomPositions().catch(e => console.error('[autobuy] Phantom cleanup error:', e.message));
 
   let shouldStop = false;
   process.on('SIGINT',  () => { shouldStop = true; });

@@ -4,11 +4,14 @@ import { getBnbBalance, buyBscToken, getBscStatus, checkBscTokenSafety } from '@
 import { runBscScanCycle, loadBscRecentBuys, BscToken } from './scanner';
 import { startBscMonitor, getBscPositionSummary } from './monitor';
 
-const PORT     = Number(process.env.PORT          || '4006');
-const BUY_BNB  = Number(process.env.BSC_BUY_BNB  || '0.03');
-const MAX_POS  = Number(process.env.BSC_MAX_POSITIONS || '3');
-const AUTO_BUY = process.env.BSC_AUTO_BUY !== 'false';
-const WALLET   = process.env.BSC_WALLET_PUBLIC_KEY ?? 'unknown';
+const PORT        = Number(process.env.PORT              || '4006');
+const BUY_BNB     = Number(process.env.BSC_BUY_BNB       || '0.03');
+const MAX_POS     = Number(process.env.BSC_MAX_POSITIONS  || '3');
+const AUTO_BUY    = process.env.BSC_AUTO_BUY !== 'false';
+const WALLET      = process.env.BSC_WALLET_PUBLIC_KEY ?? 'unknown';
+// Gas reserve: minimum BNB to keep for sell TX gas after each buy.
+// SPACEMOON reached 4.955x but couldn't be sold: "insufficient funds for intrinsic TX cost".
+const GAS_RESERVE = Number(process.env.BSC_GAS_RESERVE_BNB || '0.005');
 
 const app = express();
 app.use(express.json());
@@ -135,8 +138,10 @@ async function handleNewBscToken(token: BscToken): Promise<void> {
   }
 
   const bnbBal = await getBnbBalance().catch(() => 0);
-  if (bnbBal < BUY_BNB * 1.05) {
-    console.warn(`[bsc-scanner] Insufficient BNB: ${bnbBal.toFixed(4)} (need ${BUY_BNB})`);
+  // Require buy amount + gas reserve to guarantee we can sell after buying.
+  // Old check (BUY_BNB * 1.05) only reserved 0.00015 BNB — not enough for BSC gas.
+  if (bnbBal < BUY_BNB + GAS_RESERVE) {
+    console.warn(`[bsc-scanner] Insufficient BNB: ${bnbBal.toFixed(4)} (need ${(BUY_BNB + GAS_RESERVE).toFixed(4)}: ${BUY_BNB} buy + ${GAS_RESERVE} gas reserve)`);
     return;
   }
 
