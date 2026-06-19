@@ -20,7 +20,7 @@
 import axios from 'axios';
 import FormData from 'form-data';
 import bs58 from 'bs58';
-import { Keypair, Connection, VersionedTransaction } from '@solana/web3.js';
+import { Keypair, Connection, VersionedTransaction, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { query } from '@lib/db';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -349,7 +349,18 @@ async function launchOneToken(
   }
 }
 
+// ─── Check wallet SOL balance ─────────────────────────────────────────────────
+async function getWalletSolBalance(kp: Keypair): Promise<number> {
+  try {
+    const conn = new Connection(SOLANA_RPC, 'confirmed');
+    const bal = await conn.getBalance(kp.publicKey);
+    return bal / LAMPORTS_PER_SOL;
+  } catch { return 0; }
+}
+
 // ─── Main export: each wallet launches its own token from its own trend ───────
+// Launches are sequential with 8s stagger to avoid Pinata rate limits.
+// Each wallet must have ≥ 0.025 SOL to cover metadata rent + buy.
 
 export async function runTrendLaunchCycle(): Promise<void> {
   if (!ENABLED) return;
@@ -373,15 +384,28 @@ export async function runTrendLaunchCycle(): Promise<void> {
   // Lock before launching
   lastLaunchAt = Date.now();
 
-  console.info(`[trend-launch] Launching ${trends.length} token(s) with ${trends.length} wallet(s) independently`);
+  console.info(`[trend-launch] Found ${trends.length} trend(s) — checking wallet balances`);
 
-  // All launches are independent — each wallet creates its own token, no cross-buying
-  await Promise.all(
-    trends.map((trend, i) => launchOneToken(
-      WALLET_CONFIGS[i].envKey,
-      WALLET_CONFIGS[i].alias,
-      WALLET_CONFIGS[i].buySol,
-      trend
-    ))
-  );
+  // Sequential launch with 8s stagger between wallets (avoids Pinata rate limits).
+  // Each wallet must have ≥ 0.025 SOL (metadata rent ~0.016 + buy amount + gas).
+  for (let i = 0; i < trends.length; i++) {
+    const cfg = WALLET_CONFIGS[i];
+    const kp = loadKp(cfg.envKey);
+    if (!kp) { console.warn(`[trend-launch] ${cfg.alias}: key not configured — skipping`); continue; }
+
+    const bal = await getWalletSolBalance(kp);
+    const minRequired = 0.025;
+    if (bal < minRequired) {
+      console.warn(`[trend-launch] ${cfg.alias}: balance ${bal.toFixed(4)} SOL < ${minRequired} SOL minimum — skipping`);
+      await tgNotify(`⚠️ *${cfg.alias} skipped* — balance ${bal.toFixed(4)} SOL (need ≥${minRequired} SOL)`);
+      continue;
+    }
+
+    console.info(`[trend-launch] ${cfg.alias} balance: ${bal.toFixed(4)} SOL ✅`);
+    await launchOneToken(cfg.envKey, cfg.alias, cfg.buySol, trends[i]);
+
+    if (i < trends.length - 1) {
+      await new Promise(r => setTimeout(r, 8000)); // 8s stagger for Pinata rate limit
+    }
+  }
 }
