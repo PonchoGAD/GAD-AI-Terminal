@@ -196,12 +196,19 @@ async function getLastLaunchTimestamp(): Promise<number> {
   return 0;
 }
 
-// ─── Get best qualifying trend from DB ───────────────────────────────────────
+// ─── Wallet configs — each wallet creates its OWN token independently ────────
+// RULE: no wallet ever buys into a token created by a different wallet.
+const WALLET_CONFIGS = [
+  { envKey: 'WALLET_PRIVATE_KEY',           alias: 'W1', buySol: DEV_BUY_SOL },
+  { envKey: 'PUMPFUN_WALLET_PRIVATE_KEY',   alias: 'W2', buySol: 0.02 },
+  { envKey: 'PUMPFUN_WALLET_PRIVATE_KEY_2', alias: 'W3', buySol: 0.01 },
+];
 
-async function getBestTrend(): Promise<TrendSignal | null> {
+// ─── Get top N qualifying trends (deduped by theme) ──────────────────────────
+
+async function getTopTrends(limit: number): Promise<TrendSignal[]> {
   try {
     // Tier1 signals (engagement≥40k = elonmusk/cz_binance) valid for 12h; others 4h.
-    // Widened from flat 2h to keep Nitter signals usable when instances are down.
     const { rows } = await query<TrendSignal>(`
       SELECT id, theme, keywords, tweet_url, engagement
       FROM x_trend_signals
@@ -212,12 +219,22 @@ async function getBestTrend(): Promise<TrendSignal | null> {
         )
         AND (action IS NULL OR action NOT LIKE 'LAUNCHED%')
       ORDER BY engagement DESC
-      LIMIT 1
-    `, [MIN_ENGAGEMENT]);
-    return rows[0] ?? null;
+      LIMIT $2
+    `, [MIN_ENGAGEMENT, limit * 4]); // fetch more to dedup by theme
+
+    const seen = new Set<string>();
+    const result: TrendSignal[] = [];
+    for (const row of rows) {
+      if (!seen.has(row.theme)) {
+        seen.add(row.theme);
+        result.push(row);
+        if (result.length >= limit) break;
+      }
+    }
+    return result;
   } catch (err: any) {
     console.warn('[trend-launch] DB query failed:', err.message);
-    return null;
+    return [];
   }
 }
 
@@ -225,130 +242,96 @@ async function getBestTrend(): Promise<TrendSignal | null> {
 
 async function recordLaunch(
   signalId: string, ticker: string, name: string, description: string,
-  mintAddr: string, tweetUrl: string
+  mintAddr: string, tweetUrl: string, walletAlias: string, walletAddress: string
 ): Promise<void> {
   await query(`UPDATE x_trend_signals SET action = $1 WHERE id = $2`, [`LAUNCHED:${mintAddr}`, signalId]).catch(() => {});
 
   await query(`
-    INSERT INTO coin_ideas (ticker, name, description, source, status, created_at)
-    VALUES ($1, $2, $3, 'trend_auto_launch', 'launched', now())
+    INSERT INTO coin_ideas (ticker, name, description, score, status, created_at)
+    VALUES ($1, $2, $3, 0, 'launched', now())
     ON CONFLICT DO NOTHING
-  `, [ticker, name, `Auto-launched from X trend: ${tweetUrl}`]).catch(() => {});
+  `, [ticker, name, `Auto-launched [${walletAlias}] from X trend: ${tweetUrl}`]).catch(() => {});
 
-  // Also record in coin_launches if that table exists
   await query(`
-    INSERT INTO coin_launches (mint_address, ticker, name, dev_buy_sol, create_tx, created_at)
-    VALUES ($1,$2,$3,$4,'auto_launch',now())
+    INSERT INTO coin_launches (mint_address, ticker, name, dev_buy_sol, create_tx, wallet_alias, wallet_address, created_at)
+    VALUES ($1,$2,$3,$4,'auto_launch',$5,$6,now())
     ON CONFLICT DO NOTHING
-  `, [mintAddr, ticker, name, DEV_BUY_SOL]).catch(() => {});
+  `, [mintAddr, ticker, name, WALLET_CONFIGS.find(w => w.alias === walletAlias)?.buySol ?? 0.01,
+      walletAlias, walletAddress]).catch(() => {});
 }
 
-// ─── Main export: runs one launch cycle ──────────────────────────────────────
+// ─── Launch one token with one wallet ─────────────────────────────────────────
 
-export async function runTrendLaunchCycle(): Promise<void> {
-  if (!ENABLED) return;
-  if (!PINATA_JWT) { console.warn('[trend-launch] PINATA_JWT not configured — skipping'); return; }
-
-  const w1 = loadKp('WALLET_PRIVATE_KEY');
-  if (!w1) { console.warn('[trend-launch] WALLET_PRIVATE_KEY not set — skipping'); return; }
-
-  // Cooldown check
-  const lastTs = await getLastLaunchTimestamp();
-  const hoursAgo = (Date.now() - lastTs) / 3_600_000;
-  if (hoursAgo < COOLDOWN_H) {
-    const remaining = (COOLDOWN_H - hoursAgo).toFixed(1);
-    console.info(`[trend-launch] Cooldown active — ${remaining}h until next launch`);
+async function launchOneToken(
+  walletEnvKey: string, walletAlias: string, buySol: number, trend: TrendSignal
+): Promise<void> {
+  const kp = loadKp(walletEnvKey);
+  if (!kp) {
+    console.warn(`[trend-launch] ${walletAlias}: private key not configured — skipping`);
     return;
   }
 
-  // Find qualifying trend
-  const trend = await getBestTrend();
-  if (!trend) {
-    console.info(`[trend-launch] No qualifying trends (need engagement ≥ ${MIN_ENGAGEMENT})`);
-    return;
-  }
-
-  console.info(`[trend-launch] 🚀 Auto-launch triggered — theme: ${trend.theme}, engagement: ${trend.engagement}`);
-
-  // Lock immediately to prevent concurrent launches
-  lastLaunchAt = Date.now();
+  console.info(`[trend-launch] ${walletAlias} 🚀 — theme: ${trend.theme}, engagement: ${trend.engagement}`);
 
   try {
-    // 1. Generate coin concept
-    const kws        = Array.isArray(trend.keywords) ? trend.keywords.join(' ') : '';
-    const trendText  = `${trend.theme} ${kws}`.trim();
-    const concept    = await generateCoinConcept(trendText, trend.tweet_url);
+    const kws       = Array.isArray(trend.keywords) ? trend.keywords.join(' ') : '';
+    const trendText = `${trend.theme} ${kws}`.trim();
+    const concept   = await generateCoinConcept(trendText, trend.tweet_url);
 
-    // 2. Generate logo (Pollinations.ai)
+    console.info(`[trend-launch] ${walletAlias} concept: $${concept.ticker} — "${concept.name}"`);
+
     const logoBuffer = await generateLogo(concept.imagePrompt);
+    console.info(`[trend-launch] ${walletAlias} Logo ready (${logoBuffer.length} bytes)`);
 
-    // 3. Upload image to Pinata
     const imageCid = await pinataUploadBuffer(logoBuffer, `${concept.ticker}_logo.png`, 'image/png');
     const imageUrl = `https://ipfs.io/ipfs/${imageCid}`;
-    console.info(`[trend-launch] Image → ${imageUrl}`);
 
-    // 4. Upload metadata JSON to Pinata
-    const metaCid = await pinataUploadJson({
+    await pinataUploadJson({
       name: concept.name, symbol: concept.ticker, description: concept.description,
       image: imageUrl,
-      website:  'https://gadai.shop',
-      twitter:  trend.tweet_url || '',
-      telegram: 'https://t.me/gadfamilytg',
-      showName: true, createdOn: 'https://pump.fun',
+      website: 'https://gadai.shop', twitter: trend.tweet_url || '',
+      telegram: 'https://t.me/gadfamilytg', showName: true, createdOn: 'https://pump.fun',
     }, `${concept.ticker}_metadata`);
-    const metaUri = `${PINATA_GATEWAY}${metaCid}`;
 
-    // 5. Create token via pumpdotfun-sdk
     const conn = new Connection(SOLANA_RPC, 'confirmed');
-    const { PumpFunSDK }   = await import('pumpdotfun-sdk');
+    const { PumpFunSDK }    = await import('pumpdotfun-sdk');
     const { AnchorProvider } = await import('@coral-xyz/anchor');
     const NodeWallet         = (await import('@coral-xyz/anchor/dist/cjs/nodewallet')).default;
 
-    const provider = new AnchorProvider(conn, new NodeWallet(w1), { commitment: 'confirmed' });
+    const provider = new AnchorProvider(conn, new NodeWallet(kp), { commitment: 'confirmed' });
     const sdk      = new PumpFunSDK(provider);
     const mintKp   = Keypair.generate();
     const mintAddr = mintKp.publicKey.toBase58();
 
-    // pump.fun added global_volume_accumulator account — old SDK buy instruction fails.
-    // Workaround: create with BigInt(0) (no SDK buy), then buy via PumpPortal separately.
+    // BigInt(0) = create-only; buy below via PumpPortal (avoids global_volume_accumulator error)
     const createResult = await sdk.createAndBuy(
-      w1, mintKp,
+      kp, mintKp,
       {
-        name:        concept.name,
-        symbol:      concept.ticker,
-        description: concept.description,
-        file:        (() => { const ab = new ArrayBuffer(logoBuffer.length); new Uint8Array(ab).set(logoBuffer); return new Blob([ab], { type: 'image/png' }); })(),
-        twitter:     trend.tweet_url || '',
-        telegram:    'https://t.me/gadfamilytg',
-        website:     'https://gadai.shop',
+        name: concept.name, symbol: concept.ticker, description: concept.description,
+        file: (() => { const ab = new ArrayBuffer(logoBuffer.length); new Uint8Array(ab).set(logoBuffer); return new Blob([ab], { type: 'image/png' }); })(),
+        twitter: trend.tweet_url || '', telegram: 'https://t.me/gadfamilytg', website: 'https://gadai.shop',
       },
-      BigInt(0), // 0 = create only, no SDK buy (avoids global_volume_accumulator error)
-      500n,
-      { unitLimit: 250000, unitPrice: 250000 }
+      BigInt(0), 500n, { unitLimit: 250000, unitPrice: 250000 }
     );
 
-    if (!createResult.success) {
-      throw new Error('pumpdotfun-sdk create returned success=false');
-    }
+    if (!createResult.success) throw new Error('pumpdotfun-sdk create returned success=false');
+    console.info(`[trend-launch] ${walletAlias} ✅ Created: ${mintAddr}`);
 
-    console.info(`[trend-launch] ✅ Token created: ${mintAddr} | TX: ${createResult.signature}`);
-
-    // Dev buy via PumpPortal (handles current pump.fun program correctly)
-    await new Promise(r => setTimeout(r, 5000)); // wait 5s for mint to settle
+    // ONLY this wallet buys — no other wallet touches this token
+    await new Promise(r => setTimeout(r, 5000));
     try {
-      const buySig = await pumpBuy(conn, w1, mintAddr, DEV_BUY_SOL);
-      console.info(`[trend-launch] Dev buy ✅ ${DEV_BUY_SOL} SOL: ${buySig}`);
-    } catch (buyErr: any) {
-      console.warn(`[trend-launch] Dev buy failed (token still live): ${buyErr.message}`);
+      const sig = await pumpBuy(conn, kp, mintAddr, buySol);
+      console.info(`[trend-launch] ${walletAlias} buy ✅ ${buySol} SOL: ${sig}`);
+    } catch (e: any) {
+      console.warn(`[trend-launch] ${walletAlias} buy failed (token still live): ${e.message}`);
     }
 
-    // 6. Record in DB
-    await recordLaunch(trend.id, concept.ticker, concept.name, concept.description, mintAddr, trend.tweet_url);
+    await recordLaunch(trend.id, concept.ticker, concept.name, concept.description,
+      mintAddr, trend.tweet_url, walletAlias, kp.publicKey.toBase58());
 
-    // 7. Notify admin via Telegram
     const pumpUrl = `https://pump.fun/coin/${mintAddr}`;
     await tgNotify(
-      `🚀 *AUTO-LAUNCHED* \\$${concept.ticker}\n` +
+      `🚀 *AUTO-LAUNCHED* \\$${concept.ticker} [${walletAlias}]\n` +
       `Name: *${concept.name}*\n` +
       `Theme: *${trend.theme}* (engagement: ${trend.engagement})\n\n` +
       `${concept.description}\n\n` +
@@ -356,24 +339,49 @@ export async function runTrendLaunchCycle(): Promise<void> {
       (trend.tweet_url ? `[Source tweet](${trend.tweet_url})` : '')
     );
 
-    console.info(`[trend-launch] 🎉 Complete: $${concept.ticker} → ${mintAddr}`);
-
-    // 8. Small W3 support buy after 5 min (non-blocking, optional)
-    const w3 = loadKp('PUMPFUN_WALLET_PRIVATE_KEY_2');
-    if (w3) {
-      setTimeout(async () => {
-        try {
-          const sig = await pumpBuy(conn, w3, mintAddr, 0.01);
-          console.info(`[trend-launch] W3 support buy ✅ ${sig}`);
-        } catch (e: any) { console.warn(`[trend-launch] W3 buy failed: ${e.message}`); }
-      }, 5 * 60 * 1000);
-    }
+    console.info(`[trend-launch] ${walletAlias} 🎉 Complete: $${concept.ticker} → ${mintAddr}`);
 
   } catch (err: any) {
-    console.error(`[trend-launch] Launch failed: ${err.message}`);
-    lastLaunchAt = 0; // reset cooldown so we can retry next cycle
+    console.error(`[trend-launch] ${walletAlias} failed: ${err.message}`);
     await tgNotify(
-      `❌ *Trend auto-launch failed*\nTheme: ${trend.theme}\nError: \`${err.message.slice(0, 200)}\``
+      `❌ *${walletAlias} launch failed*\nTheme: ${trend.theme}\nError: \`${err.message.slice(0, 200)}\``
     );
   }
+}
+
+// ─── Main export: each wallet launches its own token from its own trend ───────
+
+export async function runTrendLaunchCycle(): Promise<void> {
+  if (!ENABLED) return;
+  if (!PINATA_JWT) { console.warn('[trend-launch] PINATA_JWT not configured'); return; }
+
+  // Cooldown check
+  const lastTs = await getLastLaunchTimestamp();
+  const hoursAgo = (Date.now() - lastTs) / 3_600_000;
+  if (hoursAgo < COOLDOWN_H) {
+    console.info(`[trend-launch] Cooldown active — ${(COOLDOWN_H - hoursAgo).toFixed(1)}h remaining`);
+    return;
+  }
+
+  // Get up to 3 different themes — one per wallet
+  const trends = await getTopTrends(3);
+  if (!trends.length) {
+    console.info(`[trend-launch] No qualifying trends (need engagement ≥ ${MIN_ENGAGEMENT})`);
+    return;
+  }
+
+  // Lock before launching
+  lastLaunchAt = Date.now();
+
+  console.info(`[trend-launch] Launching ${trends.length} token(s) with ${trends.length} wallet(s) independently`);
+
+  // All launches are independent — each wallet creates its own token, no cross-buying
+  await Promise.all(
+    trends.map((trend, i) => launchOneToken(
+      WALLET_CONFIGS[i].envKey,
+      WALLET_CONFIGS[i].alias,
+      WALLET_CONFIGS[i].buySol,
+      trend
+    ))
+  );
 }
