@@ -79,12 +79,14 @@ const NARRATIVE_KEYWORDS: Record<string, string[]> = {
 };
 
 // Twitter API v2 search queries (5 queries, rotating; activate when Basic plan purchased)
+// Thresholds set for TRULY VIRAL posts (реально массовые):
+// min_retweets:500 = top 0.1% of crypto posts, min_faves:5000 = proven viral
 const SEARCH_QUERIES = [
-  '"just launched" (sol OR solana OR "pump fun") -is:retweet min_retweets:50',
-  '"100x" (memecoin OR meme) solana -is:retweet min_faves:200',
-  'site:pump.fun -is:retweet min_retweets:30',
-  '(meme coin OR memecoin OR solana) lang:en -is:retweet min_retweets:50',
-  '(#solana OR #sol OR #memecoins) (100x OR moon OR launch) lang:en -is:retweet min_retweets:30',
+  '"just launched" (sol OR solana OR "pump fun") -is:retweet min_retweets:500',
+  '"100x" (memecoin OR meme) solana -is:retweet min_faves:5000',
+  'site:pump.fun -is:retweet min_retweets:200',
+  '(meme coin OR memecoin OR solana) lang:en -is:retweet min_retweets:500',
+  '(#solana OR #sol OR #memecoins) (100x OR moon OR launch) lang:en -is:retweet min_retweets:200',
 ];
 let queryIndex = 0;
 
@@ -155,20 +157,19 @@ async function fetchNitterRSS(handle: string): Promise<NitterTweet[]> {
       if (!xml || xml.includes('Verifying your browser') || xml.length < 200) continue;
 
       const rawItems = parseRssItems(xml);
-      return rawItems.slice(0, 10).map(it => {
-        const desc = it.description ?? '';
-        // Nitter embeds engagement stats in description HTML: "❤ 1.2k" / "🔁 500"
-        const likeM = desc.match(/(?:♥|❤|likes?)[^\d]*(\d[\d,\.kmKM]*)/i);
-        const rtM   = desc.match(/(?:retweet|RT|🔁)[^\d]*(\d[\d,\.kmKM]*)/i);
-        // Clean twitter.com link from nitter domain
-        const twitterLink = it.link.replace(new RegExp(`^https?://${host.replace(/https?:\/\//, '')}`), 'https://twitter.com');
+      return rawItems.slice(0, 15).map(it => {
+        // Nitter RSS does NOT include engagement stats in the feed — only pubDate + text.
+        // Engagement numbers (likes/retweets) are synthesized from account tier in scanInfluencers().
+        const twitterLink = it.link
+          .replace(/^https?:\/\/[^/]+/, 'https://twitter.com')
+          .replace('https://twitter.com/https://twitter.com', 'https://twitter.com');
         return {
           handle,
-          title:    it.title.replace(/<[^>]+>/g, '').trim(),
+          title:    it.title.replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim(),
           link:     twitterLink,
-          pubDate:  new Date(it.pubDate || Date.now()),
-          likes:    parseStat(likeM?.[1] ?? ''),
-          retweets: parseStat(rtM?.[1] ?? ''),
+          pubDate:  it.pubDate ? new Date(it.pubDate) : new Date(),
+          likes:    0,    // not available in Nitter RSS
+          retweets: 0,    // not available in Nitter RSS
         } as NitterTweet;
       }).filter(t => t.title.length > 10);
     } catch { continue; }
@@ -178,40 +179,58 @@ async function fetchNitterRSS(handle: string): Promise<NitterTweet[]> {
 
 let nitterCycleCount = 0;
 
+// Minimum follower-tier engagement score (synthetic — based on account importance since
+// Nitter RSS does not expose engagement stats). These values represent expected audience reach.
+// "Реально массовые" = posts that matter at a global scale:
+//   Tier 1 (@elonmusk, @cz_binance): every post reaches millions — all crypto-relevant accepted
+//   Tier 2 (Solana official): high signal for SOL ecosystem news
+//   Tier 3 (crypto KOLs): only posts with strong crypto narrative signals
+const TIER_BASE_ENGAGEMENT = { 1: 50000, 2: 5000, 3: 2000 };
+
+// Cutoff: how far back to look (tier 1 = 24h, others = 12h)
+const TIER_CUTOFF_HOURS    = { 1: 24, 2: 12, 3: 12 };
+
+// Tier 3 require strong narrative to be included (avoid signal noise)
+const TIER3_REQUIRED_THEMES = new Set(['AI_AGENT','DOG','CAT','PEPE','TRUMP','ELON','MEME','CRYPTO','DEFI','GAMING']);
+
 async function scanInfluencers(): Promise<XTrend[]> {
   nitterCycleCount++;
-  const cutoff = new Date(Date.now() - 6 * 3600 * 1000);
-  // Tier 1 always scanned; tier 2/3 scanned on alternate cycles to reduce requests
+  // Tier 1 always scanned; tier 2/3 scanned on alternate cycles
   const accounts = INFLUENCER_ACCOUNTS.filter(a => a.tier === 1 || nitterCycleCount % 2 === 0);
   const results: XTrend[] = [];
 
   for (const account of accounts) {
     try {
       const tweets = await fetchNitterRSS(account.handle);
+      const cutoffMs = Date.now() - TIER_CUTOFF_HOURS[account.tier as 1|2|3] * 3600 * 1000;
+
       for (const t of tweets) {
-        if (t.pubDate < cutoff) continue;
-        const engagement = t.retweets * 3 + t.likes;
-        // Minimum engagement thresholds by tier
-        const minEng = account.tier === 1 ? 0 : account.tier === 2 ? 200 : 500;
-        if (engagement < minEng && account.tier > 1) continue;
+        const pubMs = t.pubDate.getTime();
+        if (isNaN(pubMs) || pubMs < cutoffMs) continue;
+
         const { theme, keywords } = detectNarrative(t.title);
-        const finalTheme = (theme === 'GENERAL' || theme === 'CRYPTO') ? account.theme : theme;
-        // Boost tier-1 influencers so they rank above DexScreener signals
-        const tierBoost = account.tier === 1 ? 10000 : account.tier === 2 ? 1000 : 0;
+        const finalTheme = (theme === 'GENERAL') ? account.theme : theme;
+
+        // Tier 3: skip posts with no strong crypto narrative (too much noise)
+        if (account.tier === 3 && !TIER3_REQUIRED_THEMES.has(theme)) continue;
+
+        // Synthetic engagement score based on account tier — since Nitter has no engagement data,
+        // we use tiered base values so tier 1 accounts always rank above tier 2/3.
+        const syntheticEngagement = TIER_BASE_ENGAGEMENT[account.tier as 1|2|3];
+
         results.push({
           theme: finalTheme,
           keywords: keywords.length ? keywords : [account.handle],
           topTweet:   `@${account.handle}: ${t.title}`,
           tweetUrl:   t.link,
-          engagement: engagement + tierBoost,
-          retweets:   t.retweets,
-          likes:      t.likes,
+          engagement: syntheticEngagement,
+          retweets:   0,
+          likes:      0,
           authorId:   account.handle,
-          tweetId:    t.link.split('/').pop() ?? '',
+          tweetId:    t.link.split('/').pop() ?? String(pubMs),
           detectedAt: new Date(),
         });
       }
-      // Small delay to not overwhelm Nitter
       await new Promise(r => setTimeout(r, 300));
     } catch { /* ignore per-account errors */ }
   }
@@ -369,7 +388,8 @@ async function scanTwitterAPI(): Promise<XTrend[]> {
       const likes = m.like_count ?? 0;
       const rep = m.reply_count ?? 0;
       const engagement = rt * 3 + likes + rep * 2;
-      if (engagement < 50) continue;
+      // "Реально массовые" threshold: 500 retweets OR 5k likes = truly viral
+      if (engagement < 500 * 3 + 0) continue; // min_retweets:500 equivalent
       const { theme, keywords } = detectNarrative(t.text);
       trends.push({
         theme, keywords,

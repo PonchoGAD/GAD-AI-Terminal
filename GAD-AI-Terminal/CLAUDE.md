@@ -274,6 +274,18 @@ console.warn('[sell] ...')
   - `RAYDIUM_MIN_PC1H=10` (было 5%) — минимальный momentum
   - `RAYDIUM_MIN_PC5M=3` (было 1%)
   - `RAYDIUM_MIN_VOL_LIQ_RATIO=0.20` (было 0.15)
+- [x] **Raydium FRESH-ONLY стратегия (19.06.2026):** анализ 79 pump.fun + Raydium трейдов
+  - Данные: FRESH (<6h) win rate 41.4% (+0.012 SOL net), AGED (>6h) win rate 21.9% (-0.049 SOL net)
+  - VPS .env: `RAYDIUM_MAX_AGE_SEC=21600` (было 172800=48h) — только токены до 6ч
+  - VPS .env: `RAYDIUM_MIN_PC5M=5` (было 1%) — тighter momentum filter
+  - Файл с полным аудитом: `PUMPFUN_TRADING_AUDIT.md` (79 сделок, 3 победы, -1.077 SOL)
+- [x] **X Trends multi-source fix (19.06.2026):**
+  - `services/social-monitor/src/x-trends.ts` — переписан: Nitter RSS + DexScreener + CoinGecko (нет xml2js)
+  - Исправлено: Nitter RSS НЕ содержит лайки/ретвиты → synthetic tier engagement (Tier1=50k, Tier2=5k, Tier3=2k)
+  - Исправлено: cutoff расширен с 6h → 24h для Tier1 (elonmusk посты старше 6h не появлялись)
+  - Twitter API viral thresholds: min_retweets:500, min_faves:5000 (реально массовые, Basic план нужен)
+  - `services/social-monitor/src/twitter.ts` — добавлен BROWSER_UA + 4 Nitter instances, fallback 402/403
+  - Подтверждено на VPS: "Nitter influencers: 2 signals from 3 accounts" (было 0)
 
 ---
 
@@ -335,15 +347,38 @@ console.warn('[sell] ...')
 - [ ] **Health checks** для scanner, telegram, autobuy, whale-tracker
 - [ ] **Futures LIVE MODE:** отключён по умолчанию (FUTURES_LIVE_MODE=false → paper trading). Для real Drift Protocol включить через .env + депозит USDC на Drift аккаунт
 - [ ] **PumpSwap graduated token sells** — HOT токены > $8k mcap нужно продавать через Jupiter, не PumpPortal. Сейчас ограничено max $8k в HOT poller.
-- [ ] **Auto-launch на VPS** — токены сейчас запускаются только локально через scripts/. Нужна Telegram /auto_launch команда.
-- [ ] **Velocity Tracker — 50 трейдов перед масштабированием:** собрать P&L отчёт, сравнить с -37% baseline, тогда решать увеличивать ли позицию с 0.012 SOL
+- [x] ~~Auto-launch на VPS~~ — реализовано (19.06.2026): `/auto_launch` в TG боте + `launchTriple()` + авто-цикл 5/день ✅
+- [x] ~~Velocity Tracker~~ — ОТКЛЮЧЁН навсегда (19.06.2026). `SOL_VELOCITY_ENABLED=false`. W2/W3 только для запуска монет.
 
-### ВАЖНО
-- [ ] **Unit-тесты** для rug, gad-score, narrative, survival, dna, social, lifecycle, regime
-- [ ] **Rate limit на API** (express-rate-limit)
+### СЛЕДУЮЩИЕ ПРИОРИТЕТЫ (структурированный план)
+
+#### P1 — Raydium прибыльность (главная задача)
+- [ ] **Остановить T2 покупки:** `RAYDIUM_MAX_LIQUIDITY_USD=80000` — T2 ($80k+) 0% win rate
+- [ ] **Поднять FEAR TP:** FEAR режим TP1=1.10x слишком мало (avg win=1.19x) → поднять до 1.20-1.25x в `auto-signal.ts`
+- [ ] **NULL bought_at phantom позиции:** 15 трейдов с `bought_at=NULL, active=false, received=0` — inflate loss count; добавить cleanup при старте autobuy
+- [ ] **Backtesting pipeline:** собрать 200+ DexScreener сигналов без покупки → симулировать → доказать прибыльность фильтров перед изменением
+
+#### P2 — Инфраструктура (КРИТИЧНО)
+- [ ] **⚠️ ДИСК VPS 100% (17.06.2026):** добавить Hetzner Volume 20GB ($5/мес) ИЛИ перейти на CPX41 (160GB). Текущий фикс (tune2fs) даёт 291MB — не хватит надолго
+- [ ] **ANTHROPIC_API_KEY** в VPS .env — нужен для trend-engine AI генерации идей (GDELT→cluster→AI idea)
+- [ ] **Миграции на VPS:** проверить что все (011-020) применены: `docker compose exec postgres psql -U gad -d gad_ai -c "\dt"`
+
+#### P3 — X/Twitter Trends
+- [ ] **Twitter Basic план ($100/мес)** — для реальных engagement metrics (сейчас Nitter = synthetic данные без лайков/ретвитов)
+- [ ] **Автопостинг в X** — перенести `scripts/twitter-post.ts` в `social-monitor` → постить при каждом `/auto_launch`
+- [ ] **Verify coin-hunter→DexScreener:** убедиться что `coin-hunter.ts` получает токены с liq $15k+, vol24h $30k+, pc5m 1%+
+
+#### P4 — Качество кода
+- [ ] **Health checks** для scanner, telegram, autobuy, whale-tracker в docker-compose.yml
+- [ ] **Rate limit на API** (express-rate-limit) — защита от DDoS
+- [ ] **Unit-тесты** для rug, gad-score, narrative, survival, dna, lifecycle
 - [ ] **Redis кеширование** (trending/new на 30с, tg/status на 60с)
-- [ ] **Dashboard WebSocket** — нет real-time обновлений
+- [ ] **Dashboard WebSocket** — real-time обновления позиций
+
+### ВАЖНО (вторичные)
 - [ ] **GMGN** недоступен с VPS (Cloudflare) — нужен residential proxy ($15/мес)
+- [ ] **Metadata enrichment** — tokens.symbol/name остаются NULL в scanner
+- [ ] **Futures LIVE MODE:** `FUTURES_LIVE_MODE=false` → paper trading. Для Drift Protocol: USDC депозит + env флаг
 
 ---
 
@@ -480,7 +515,7 @@ docker logs gad-ai-autobuy --tail=20
 
 ---
 
-## Текущие параметры бота (VPS .env — 17.06.2026)
+## Текущие параметры бота (VPS .env — 19.06.2026)
 
 ```bash
 AUTO_BUY_ENABLED=true
@@ -488,41 +523,33 @@ AUTO_BUY_SOL=0.02               # позиция 0.02 SOL
 MAX_AUTO_POSITIONS=10
 DAILY_MAX_SOL=1.0               # max 1 SOL в день
 
-# Фильтры Raydium scanner (обновлено 14.06.2026):
-RAYDIUM_MIN_LIQUIDITY_USD=12000  # снижено с 22k → больше сигналов
-RAYDIUM_MAX_LIQUIDITY_USD=300000
-RAYDIUM_MIN_PC1H=5              # 5% momentum за 1ч (было 1%)
+# Фильтры Raydium scanner (обновлено 19.06.2026 — FRESH ONLY стратегия):
+RAYDIUM_MIN_LIQUIDITY_USD=12000  # мин лик (22k=кодовый default, 12k на VPS для большего потока)
+RAYDIUM_MAX_LIQUIDITY_USD=300000 # T3 исключён, T2 ($80-250k) убыточен — рассмотреть MAX=80000
+RAYDIUM_MIN_PC1H=5              # 5% momentum за 1ч
 RAYDIUM_MAX_PC1H=80
-RAYDIUM_MIN_PC5M=1
-RAYDIUM_MIN_VOL_LIQ_RATIO=0.15  # 15% hourly vol/liq (было 8%)
+RAYDIUM_MIN_PC5M=5              # ↑ с 1% → 5% (19.06.2026) — тighter momentum
+RAYDIUM_MIN_VOL_LIQ_RATIO=0.15  # 15% hourly vol/liq
 RAYDIUM_MAX_BUY_SELL_RATIO=3.5  # wash trading filter
-RAYDIUM_MAX_AGE_SEC=172800      # 48 часов max
+RAYDIUM_MAX_AGE_SEC=21600       # ↓ с 172800 (48h) → 21600 (6h) — FRESH ONLY (19.06.2026)
+                                 # Данные: FRESH 41.4% win rate vs AGED 21.9% win rate
 
 # Sell параметры (Raydium scheduler):
 STOP_LOSS_PCT=8                 # глобальный стоп
 TRAIL_PCT=12
 EARLY_TRAIL_PCT=4
 
-# Bonding Scanner (обновлено 14.06.2026):
-BONDING_SCANNER_ENABLED=false   # W2 WebSocket выключен!
-BONDING_HOT_ENABLED=true        # HOT poller через DexScreener (W3 только)
-BONDING_BUY_SOL=0.02            # 0.02 SOL позиция
+# Bonding Scanner (19.06.2026 — ВСЁ ОТКЛЮЧЕНО):
+BONDING_SCANNER_ENABLED=false   # W2 WebSocket навсегда выключен
+BONDING_HOT_ENABLED=false       # ↓ с true → false (19.06.2026) — W3 только для запуска монет
+BONDING_BUY_SOL=0.02
 BONDING_MAX_SOL_DAILY=0.3
-BONDING_MIN_BUYERS=50           # мин уникальных покупателей
-BONDING_MIN_DEV_BUY=0.5         # мин SOL dev купил
-BONDING_HOT_INTERVAL_SEC=60     # каждые 60 секунд
-BONDING_STOP_PCT=0.12           # 12% stop-loss (было 17%)
-BONDING_TIME_LIMIT_SEC=300      # 5 мин time limit (было 10 мин)
-BONDING_HOT_MAX_MCAP_USD=8000   # max mcap при покупке $8k (было $12k)
 
-# HOT filter параметры (в коде, не в .env):
-# buys5m >= 10, vol5m >= $800, pc5m 1-8%, B/S ratio >= 1.5
-
-# Кошельки:
-# PUMPFUN_WALLET_ADDRESS=CFmHWpmQ...   (wallet 1 — ОТКЛЮЧЁН)
+# Кошельки W2/W3 — ТОЛЬКО ЗАПУСК МОНЕТ (трейдинг слил SOL в 0):
+# PUMPFUN_WALLET_ADDRESS=CFmHWpmQ...   (W2 — только launchTriple)
 # PUMPFUN_WALLET_PRIVATE_KEY=...
-# PUMPFUN_WALLET_ADDRESS_2=DJ8Tq8vi... (wallet 2 — HOT poller, нужна пополнение!)
-# PUMPFUN_WALLET_PRIVATE_KEY_2=...     (добавлен 13.06.2026)
+# PUMPFUN_WALLET_ADDRESS_2=DJ8Tq8vi... (W3 — только launchTriple)
+# PUMPFUN_WALLET_PRIVATE_KEY_2=...
 
 # Birdeye:
 BIRDEYE_MIN_HOLDERS=70
@@ -533,17 +560,13 @@ PUMP_PORTAL_ENABLED=true
 PUMP_MIN_LIQUIDITY_USD=9000
 PUMP_MIN_TOKEN_AGE_SEC=1200
 
-# SOL Velocity Tracker (добавлено 17.06.2026 — АКТИВЕН):
-SOL_VELOCITY_ENABLED=true
-SOL_VELOCITY_BUY_SOL=0.012         # 0.012 SOL на сделку (тестовый размер)
-SOL_VELOCITY_MIN_SOL=25            # минимум SOL в кривой (7% от graduation)
-SOL_VELOCITY_MAX_SOL=80            # максимум (безопасно от graduation)
-SOL_VELOCITY_MIN_SOL_PER_60S=3    # минимальный поток SOL за 60 сек
-SOL_VELOCITY_MIN_UNIQUE_BUYERS=8  # мин уникальных покупателей
-SOL_VELOCITY_MAX_SINGLE_BUY=5     # anti-whale: пропуск если 1 покупка > 5 SOL
-SOL_VELOCITY_MAX_LAST_TRADE_GAP_SEC=30  # momentum умер если нет трейдов 30s
-SOL_VELOCITY_TIME_LIM_SEC=90      # 90s жёсткий лимит
-SOL_VELOCITY_STOP_PCT=0.12        # 12% stop-loss
+# SOL Velocity Tracker — ОТКЛЮЧЁН НАВСЕГДА (19.06.2026):
+SOL_VELOCITY_ENABLED=false      # ↓ с true → false. 26 трейдов, 1 победа (3.8%), -0.455 SOL
+                                 # НЕ ВКЛЮЧАТЬ до backtesting на симуляции
+
+# Token Launcher:
+DAILY_LAUNCH_LIMIT=5            # max 5 монет в день через auto-launch цикл
+MIN_HOLDERS_24H=10              # min holders через 24ч — иначе продать
 ```
 
 ---
@@ -579,6 +602,21 @@ SOL_VELOCITY_STOP_PCT=0.12        # 12% stop-loss
 **Почему HOT/MOVER терял деньги:** DexScreener лаг 30-60с. Спайк происходил → через 60с DexScreener обновлялся → мы покупали ТОП спайка, откат = стоп-лосс.
 **Velocity:** сумма solAmount за 60с, не delta marketCapSol — это реальный поток денег в кривую.
 **Anti-whale:** пропуск если 1 покупка > 5 SOL — whale spike виден как искусственный памп, не органическое накопление.
+
+### 2026-06 — Raydium FRESH-ONLY: только токены <6ч (19.06.2026)
+**Решение:** `RAYDIUM_MAX_AGE_SEC=21600` (6ч) на VPS. До этого было 172800 (48ч).
+**Данные из 79-трейд аудита:**
+- FRESH (<6ч): 41.4% win rate, avg ROI 1.23x, net +0.012 SOL → ПРИБЫЛЬНО
+- AGED (>6ч): 21.9% win rate, avg ROI 0.87x, net -0.049 SOL → УБЫТОЧНО
+- T1 liq ($12-80k) FEAR режим: 46.2% win rate, avg ROI 1.25x → лучшее окно
+**Почему aged проигрывает:** Meme токен делает главный памп в первые 2-4ч. После 6ч — либо уже 2-5x и на распределении, либо умер. Mы входим в момент, когда holders начинают фиксировать прибыль.
+**Не менять** обратно на 48h без данных доказывающих прибыльность aged токенов.
+
+### 2026-06 — X Viral Thresholds (19.06.2026)
+**Решение:** Twitter API (Basic, $100/мес) запросы требуют min_retweets:500 / min_faves:5000.
+**Почему:** "Популярный пост" = реально массовый. Ниже 500 RT / 5000 лайков = нишевый контент, не вирусный. Nitter RSS не возвращает engagement метрики вообще — only tweet text + pubDate. Synthetic engagement: Tier1=50k, Tier2=5k, Tier3=2k как прокси.
+**До Basic плана:** Nitter RSS = информация о контенте без engagement. Фильтровать по narrative detection (AI_AGENT/DOG/PEPE/MEME и т.д.) — единственный доступный сигнал.
+**Cutoff:** Tier1 = 24ч (elonmusk твитит редко), Tier2/3 = 12ч.
 
 ### 2026-06 — Hot-patch деплой при заполненном диске (17.06.2026)
 **Проблема:** Docker build требует ~500MB+ временного пространства (node_modules содержит Next.js ~300MB). Диск 38GB = 100%.
