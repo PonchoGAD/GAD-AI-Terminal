@@ -334,6 +334,45 @@ async function sellOnBondingCurve(
   return { success: false };
 }
 
+// ─── Jupiter fallback sell — last resort when token graduated past PumpSwap ───
+// Used after pump → pumpswap both return 0 SOL. Sells ALL tokens via Jupiter.
+
+async function sellViaJupiterFallback(
+  mint: string, keypair: Keypair, connection: Connection, symbol: string
+): Promise<boolean> {
+  try {
+    const conn = getConnection() ?? connection;
+    const tokenAccounts = await conn.getParsedTokenAccountsByOwner(
+      keypair.publicKey, { mint: new PublicKey(mint) }
+    );
+    const rawAmount = BigInt(
+      (tokenAccounts.value[0]?.account?.data as any)?.parsed?.info?.tokenAmount?.amount ?? '0'
+    );
+    if (rawAmount === 0n) {
+      console.warn(`[bonding-scan] Jupiter fallback: 0 token balance for ${symbol}`);
+      return false;
+    }
+    const jupResult = await executeAutoSell(
+      { mintAddress: mint, tokenAmount: rawAmount, slippageBps: 1000 },
+      conn, keypair
+    );
+    if (jupResult.success) {
+      await query(
+        `UPDATE autobuy_jobs SET total_sold_sol=COALESCE(total_sold_sol,0)+$1, active=false
+         WHERE mint_address=$2 AND label LIKE 'auto:bonding%' AND active=true`,
+        [jupResult.solReceived ?? 0, mint]
+      ).catch(() => {});
+      console.info(`[bonding-scan] ✅ Jupiter SOLD ${symbol} → ${(jupResult.solReceived ?? 0).toFixed(5)} SOL`);
+      return true;
+    }
+    console.warn(`[bonding-scan] Jupiter sell failed for ${symbol}`);
+    return false;
+  } catch (err: any) {
+    console.warn(`[bonding-scan] Jupiter fallback error ${symbol}: ${err.message?.slice(0, 60)}`);
+    return false;
+  }
+}
+
 // ─── Watchlist (candidates before entry) ─────────────────────────────────────
 
 interface BondingCandidate {
@@ -539,7 +578,11 @@ async function checkPositionExits(
     const stopResult = await sellOnBondingCurve(mint, 100, keypair, connection, pool);
     if (!stopResult.success && pool === 'pump') {
       console.warn(`[bonding-scan] 🔴 STOP ${pos.symbol} pump=0 — trying pumpswap (graduated?)`);
-      await sellOnBondingCurve(mint, 100, keypair, connection, 'pumpswap');
+      const psStop = await sellOnBondingCurve(mint, 100, keypair, connection, 'pumpswap');
+      if (!psStop.success || (psStop.solReceived ?? 0) === 0) {
+        console.warn(`[bonding-scan] 🔴 STOP ${pos.symbol} pumpswap=0 — trying Jupiter`);
+        await sellViaJupiterFallback(mint, keypair, connection, pos.symbol);
+      }
     }
     return;
   }
@@ -556,7 +599,11 @@ async function checkPositionExits(
       const trailResult = await sellOnBondingCurve(mint, 100, keypair, connection, pool);
       if (!trailResult.success && pool === 'pump') {
         console.warn(`[bonding-scan] 🌙 TRAIL ${pos.symbol} pump=0 — trying pumpswap (graduated?)`);
-        await sellOnBondingCurve(mint, 100, keypair, connection, 'pumpswap');
+        const psTrail = await sellOnBondingCurve(mint, 100, keypair, connection, 'pumpswap');
+        if (!psTrail.success || (psTrail.solReceived ?? 0) === 0) {
+          console.warn(`[bonding-scan] 🌙 TRAIL ${pos.symbol} pumpswap=0 — trying Jupiter`);
+          await sellViaJupiterFallback(mint, keypair, connection, pos.symbol);
+        }
       }
     }
     return;
