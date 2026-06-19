@@ -200,11 +200,16 @@ async function getLastLaunchTimestamp(): Promise<number> {
 
 async function getBestTrend(): Promise<TrendSignal | null> {
   try {
+    // Tier1 signals (engagement≥40k = elonmusk/cz_binance) valid for 12h; others 4h.
+    // Widened from flat 2h to keep Nitter signals usable when instances are down.
     const { rows } = await query<TrendSignal>(`
       SELECT id, theme, keywords, tweet_url, engagement
       FROM x_trend_signals
       WHERE engagement >= $1
-        AND created_at > now() - interval '2 hours'
+        AND (
+          (engagement >= 40000 AND created_at > now() - interval '12 hours')
+          OR created_at > now() - interval '4 hours'
+        )
         AND (action IS NULL OR action NOT LIKE 'LAUNCHED%')
       ORDER BY engagement DESC
       LIMIT 1

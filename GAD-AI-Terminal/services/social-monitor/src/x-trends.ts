@@ -26,6 +26,10 @@ let lastCGAt      = 0;
 const NITTER_INSTANCES = [
   'https://nitter.net',
   'https://nitter.poast.org',
+  'https://nitter.cz',
+  'https://nitter.it',
+  'https://xcancel.com',
+  'https://nitter.kavin.rocks',
   'https://nitter.1d4.us',
   'https://nitter.privacydev.net',
 ];
@@ -104,6 +108,13 @@ const STOP_WORDS = new Set([
   // DexScreener API response noise (token description fields contain these):
   'dexscreener','cms','images','width','height','size','style','color','type',
   'data','src','href','alt','div','span','class','id',
+  // Generic English words from token descriptions (no narrative value):
+  'fit','crop','quality','format','earn','launch','market','price','trade','hold',
+  'image','icon','logo','fund','based','life','love','real','big','top','old',
+  'one','two','man','day','way','use','run','set','make','win','best','fast',
+  'next','last','high','low','off','out','first','only','more','even','also',
+  'over','join','now','here','time','like','than','into','then','they','been',
+  'when','who','how','what','which','some','any','most','many','very','may',
 ]);
 
 function detectNarrative(text: string): { theme: string; keywords: string[] } {
@@ -293,7 +304,7 @@ async function fetchDexScreenerNarratives(): Promise<XTrend[]> {
     }
 
     const topWords = Object.entries(freq)
-      .filter(([, c]) => c >= 3)
+      .filter(([, c]) => c >= 5)  // raised from 3: requires word in ≥5 token descriptions
       .sort(([, a], [, b]) => b - a)
       .slice(0, 10)
       .map(([w]) => w);
@@ -436,7 +447,7 @@ async function fromTrendClusters(): Promise<XTrend[]> {
       SELECT id, main_title, final_score, total_mentions
       FROM trend_clusters
       WHERE final_score >= 55
-        AND created_at > now() - interval '2 hours'
+        AND created_at > now() - interval '8 hours'
       ORDER BY final_score DESC
       LIMIT 5
     `);
