@@ -101,6 +101,9 @@ const STOP_WORDS = new Set([
   // URL-derived noise (token descriptions contain CDN image URLs):
   'https','http','www','cdn','api','img','png','jpg','gif','jpeg','svg','webp',
   'net','xyz','io','app','pro','auto','bot','dev','dex','via','buy','let',
+  // DexScreener API response noise (token description fields contain these):
+  'dexscreener','cms','images','width','height','size','style','color','type',
+  'data','src','href','alt','div','span','class','id',
 ]);
 
 function detectNarrative(text: string): { theme: string; keywords: string[] } {
