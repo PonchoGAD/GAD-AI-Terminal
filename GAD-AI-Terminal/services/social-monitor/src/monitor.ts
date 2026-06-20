@@ -127,7 +127,12 @@ async function runMonitorCycle(): Promise<void> {
         console.info(`[social] @${account.handle}: ${count} new signals stored`);
       }
     } catch (err: any) {
-      console.warn(`[social] @${account.handle} failed: ${err.message}`);
+      const status = (err as any).response?.status;
+      if (status === 402 || status === 403 || status === 429) {
+        console.debug(`[social] @${account.handle} unavailable (${status}) — Nitter/Twitter rate-limited, skipping`);
+      } else {
+        console.warn(`[social] @${account.handle} failed: ${err.message}`);
+      }
     } finally {
       await markChecked(account.id);
     }

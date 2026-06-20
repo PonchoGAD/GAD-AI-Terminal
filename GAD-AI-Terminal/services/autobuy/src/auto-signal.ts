@@ -27,6 +27,10 @@ import { detectBotActivity, randomTradeDelay } from '@lib/botshield';
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 export const AUTO_BUY_ENABLED   = process.env.AUTO_BUY_ENABLED === 'true';
+// DRY_RUN: scanner runs fully (all filters, all checks) but does NOT insert into autobuy_jobs.
+// Set RAYDIUM_DRY_RUN=true to simulate trading without spending real SOL.
+// Logs "[PAPER]" lines for every signal that would have been bought.
+const RAYDIUM_DRY_RUN           = process.env.RAYDIUM_DRY_RUN === 'true';
 const MAX_AUTO_POSITIONS        = Number(process.env.MAX_AUTO_POSITIONS    || '5');
 const AUTO_BUY_SOL              = Number(process.env.AUTO_BUY_SOL          || '0.02');
 const DAILY_MAX_SOL             = Number(process.env.DAILY_MAX_SOL         || '0.3');
@@ -750,7 +754,7 @@ async function fetchRaydiumPairs(): Promise<any[]> {
   if (BIRDEYE_API_KEY) {
     try {
       const birdR = await axios.get(
-        'https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20&min_liquidity=5000',
+        'https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20',
         {
           headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' },
           timeout: 6_000,
@@ -1066,6 +1070,21 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       const ageTag = isFresh ? `fresh${Math.round(ageSec / 3600)}h` : `aged`;
       const tier = getLiqTier(liq, regime);
       const label = `auto:raydium_scan:liq${Math.round(liq / 1000)}k:${ageTag}:${tier.label}:${regime.toLowerCase()}`;
+
+      if (RAYDIUM_DRY_RUN) {
+        // DRY_RUN mode: log what would have been bought, skip TX
+        console.info(
+          `[raydium-scan] 📝 [PAPER] Would buy ${pair.baseToken?.symbol ?? mint.slice(0,8)} (${mint.slice(0,8)}) ` +
+          `${AUTO_BUY_SOL} SOL [TIER${tier.tier} ${tier.timeLimitSec/60}min/${(tier.stopPct*100).toFixed(0)}%stop] ` +
+          `dex:${pair.dexId} liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} ` +
+          `5m:${pc5m.toFixed(1)}% 1h:${pc1h.toFixed(1)}% age:${(ageSec/3600).toFixed(1)}h ` +
+          `holders:${holderCheck.holders ?? 'n/a'} ` +
+          `trend:${trend.stage} hype:${hype.hype_stage}(${hype.hype_score}) slip:${slippage}bps`
+        );
+        newJobs++;
+        continue;
+      }
+
       await query(
         `INSERT INTO autobuy_jobs
            (mint_address, label, amount_sol, slippage_bps, interval_seconds,
