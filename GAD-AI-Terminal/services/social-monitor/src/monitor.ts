@@ -8,6 +8,7 @@ import { fetchTweetsForHandle } from './twitter';
 import { scanXTrends, XTrend } from './x-trends';
 import { huntCoinForTheme } from './coin-hunter';
 import { runTrendLaunchCycle } from './trend-launcher';
+import { runFreeAlphaCycle } from './free-aggregator';
 import axios from 'axios';
 
 const POLL_INTERVAL_MS = Number(process.env.SOCIAL_POLL_INTERVAL_SECONDS ?? '120') * 1000;
@@ -263,6 +264,16 @@ export async function startSocialMonitor(): Promise<void> {
     };
     runLaunchCycle();
   }, 3 * 60 * 1000); // first check 3 min after start
+
+  // Free Alpha Aggregator: Reddit + DexScreener profiles + Telegram web — every 5 min, zero API cost
+  setTimeout(() => {
+    const runAlphaCycle = async () => {
+      if (shouldStop) return;
+      try { await runFreeAlphaCycle(); } catch (err: any) { console.debug(`[social] Free alpha error: ${err.message}`); }
+      if (!shouldStop) setTimeout(runAlphaCycle, 5 * 60 * 1000);
+    };
+    runAlphaCycle();
+  }, 2 * 60 * 1000); // first run 2 min after start
 
   while (!shouldStop) {
     try {
