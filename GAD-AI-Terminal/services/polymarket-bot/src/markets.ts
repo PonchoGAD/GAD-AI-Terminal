@@ -21,16 +21,28 @@ export async function fetchActiveMarkets(minVolume = 50000): Promise<Market[]> {
     const { data } = await axios.get(`${GAMMA_API}/markets`, {
       params: { active: true, closed: false, limit: 200, _ts: Date.now() },
       timeout: 20000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+        'Accept': 'application/json',
+      },
     });
 
     const markets: Market[] = [];
     for (const m of (data ?? [])) {
-      if (!Array.isArray(m.clobTokenIds) || m.clobTokenIds.length < 2) continue;
-      const vol = Number(m.volume ?? m.volumeClob ?? 0);
+      // clobTokenIds comes as a JSON-encoded string from Gamma API
+      const clobIds: string[] = typeof m.clobTokenIds === 'string'
+        ? JSON.parse(m.clobTokenIds)
+        : (m.clobTokenIds ?? []);
+      if (!Array.isArray(clobIds) || clobIds.length < 2) continue;
+
+      const outcomePrices: string[] = typeof m.outcomePrices === 'string'
+        ? JSON.parse(m.outcomePrices)
+        : (m.outcomePrices ?? ['0.5', '0.5']);
+
+      const vol = Number(m.volumeNum ?? m.volumeClob ?? m.volume ?? 0);
       if (vol < minVolume) continue;
 
       const endsAt = new Date(m.endDate ?? Date.now() + 86400000 * 7);
-      // Skip markets ending within 2 hours
       if (endsAt.getTime() < Date.now() + 7200000) continue;
 
       markets.push({
@@ -39,10 +51,10 @@ export async function fetchActiveMarkets(minVolume = 50000): Promise<Market[]> {
         category:   (m.category ?? 'general').toLowerCase(),
         volumeUsd:  vol,
         endsAt,
-        tokenIdYes: m.clobTokenIds[0],
-        tokenIdNo:  m.clobTokenIds[1],
-        priceYes:   Number(m.outcomePrices?.[0] ?? 0.5),
-        priceNo:    Number(m.outcomePrices?.[1] ?? 0.5),
+        tokenIdYes: clobIds[0],
+        tokenIdNo:  clobIds[1],
+        priceYes:   Number(outcomePrices[0] ?? 0.5),
+        priceNo:    Number(outcomePrices[1] ?? 0.5),
       });
     }
     return markets;
