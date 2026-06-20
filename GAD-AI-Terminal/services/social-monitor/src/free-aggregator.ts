@@ -91,16 +91,31 @@ async function enrichWithLLM(title: string, body: string): Promise<{ score: numb
   }
 }
 
-// ─── Source 1: Reddit ─────────────────────────────────────────────────────────
+// ─── Source 1: Reddit RSS ─────────────────────────────────────────────────────
+// Uses Reddit's public RSS feeds (/r/sub/new.rss) — avoids JSON API 403 on datacenter IPs
 
-interface RedditPost { id: string; title: string; selftext: string; score: number; url: string; created_utc: number }
-
-async function fetchReddit(subreddit: string, limit = 15): Promise<RedditPost[]> {
-  const res = await axios.get(`https://www.reddit.com/r/${subreddit}/new.json?limit=${limit}`, {
-    headers: { 'User-Agent': 'GAD-Alpha-Bot/1.0' },
+async function fetchRedditRss(subreddit: string): Promise<Array<{ id: string; title: string; body: string }>> {
+  const res = await axios.get(`https://www.reddit.com/r/${subreddit}/new.rss?limit=15`, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; RssBot/1.0)' },
     timeout: 8000,
   });
-  return (res.data?.data?.children ?? []).map((c: any) => c.data);
+  const xml = res.data as string;
+  const items: Array<{ id: string; title: string; body: string }> = [];
+
+  const titleRe   = /<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/g;
+  const idRe      = /<id>([\s\S]*?)<\/id>/g;
+  const contentRe = /<content[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/content>/g;
+
+  const titles   = [...xml.matchAll(titleRe)].map(m => m[1].trim()).slice(1);   // skip feed title
+  const ids      = [...xml.matchAll(idRe)].map(m => m[1].trim()).slice(1);
+  const contents = [...xml.matchAll(contentRe)].map(m => m[1].replace(/<[^>]+>/g, ' ').trim());
+
+  for (let i = 0; i < titles.length; i++) {
+    if (!titles[i]) continue;
+    const postId = ids[i]?.split('/').filter(Boolean).pop() ?? `${subreddit}_${i}`;
+    items.push({ id: postId, title: titles[i], body: (contents[i] ?? '').slice(0, 500) });
+  }
+  return items;
 }
 
 async function processReddit(): Promise<number> {
@@ -108,23 +123,20 @@ async function processReddit(): Promise<number> {
   let saved = 0;
 
   for (const sub of SUBS) {
-    let posts: RedditPost[] = [];
-    try { posts = await fetchReddit(sub); } catch (err: any) {
+    let posts: Array<{ id: string; title: string; body: string }> = [];
+    try { posts = await fetchRedditRss(sub); } catch (err: any) {
       console.debug(`[free-alpha] Reddit r/${sub} unavailable: ${err.message}`);
       continue;
     }
 
     for (const p of posts) {
-      // Skip posts older than 4 hours
-      if (Date.now() / 1000 - p.created_utc > 4 * 3600) continue;
-
-      const full      = `${p.title} ${p.selftext}`;
+      const full      = `${p.title} ${p.body}`;
       const narrative = classifyNarrative(full);
       const mints     = extractMints(full);
-      let   score     = Math.min(100, p.score);
+      let   score     = narrative !== 'GENERAL' ? 40 : 10;
 
       if (LLM_WORTHY.has(narrative)) {
-        const enriched = await enrichWithLLM(p.title, p.selftext).catch(() => ({ score: 0, reason: '' }));
+        const enriched = await enrichWithLLM(p.title, p.body).catch(() => ({ score: 0, reason: '' }));
         score = enriched.score;
       }
 
@@ -133,12 +145,12 @@ async function processReddit(): Promise<number> {
           `INSERT INTO raw_alpha_feeds (source, source_id, title, body, narrative, mentioned_mints, mentioned_symbols, engagement, score)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
            ON CONFLICT (source, source_id) DO NOTHING`,
-          ['reddit', p.id, p.title.slice(0, 400), p.selftext.slice(0, 2000),
-           narrative, mints, [], p.score, score]
+          ['reddit', p.id, p.title.slice(0, 400), p.body.slice(0, 2000),
+           narrative, mints, [], 0, score]
         ).catch(() => {});
         saved++;
-      } else if (score > 50 || mints.length > 0) {
-        console.debug(`[free-alpha] Reddit r/${sub}: "${p.title.slice(0,60)}" narrative=${narrative} score=${score} mints=${mints.length}`);
+      } else if (score > 30 || mints.length > 0) {
+        console.debug(`[free-alpha] Reddit r/${sub}: "${p.title.slice(0,60)}" narrative=${narrative} mints=${mints.length}`);
       }
     }
 
