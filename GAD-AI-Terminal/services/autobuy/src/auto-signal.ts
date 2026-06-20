@@ -582,6 +582,10 @@ function geckoPoolToPair(pool: any): any | null {
 let lastRaydiumScan = 0;
 const RAYDIUM_SCAN_INTERVAL_MS = 120_000;
 
+// Birdeye Source 5 backoff — skip for 60min after 3 consecutive API errors (quota/400)
+let birdeyeFailCount = 0;
+let birdeyeBackoffUntil = 0;
+
 // ─── Fetch pairs from multiple sources ────────────────────────────────────────
 // Sources ordered by signal quality (most actionable first):
 //  1. DexScreener gainers     — tokens already moving UP now (highest signal)
@@ -750,16 +754,18 @@ async function fetchRaydiumPairs(): Promise<any[]> {
   }
 
   // Source 5: Birdeye trending tokens — high-volume Solana tokens with real momentum.
-  // Uses the same BIRDEYE_API_KEY as holder checks. Skip if no key configured.
-  if (BIRDEYE_API_KEY) {
+  // Uses the same BIRDEYE_API_KEY as holder checks. Skip if no key configured or quota exceeded.
+  // Backoff: after 3 consecutive errors (400/quota), skip for 60min to avoid log spam.
+  if (BIRDEYE_API_KEY && birdeyeBackoffUntil < Date.now()) {
     try {
       const birdR = await axios.get(
-        'https://public-api.birdeye.so/defi/token_trending?sort_by=rank&sort_type=asc&offset=0&limit=20',
+        'https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=20&min_liquidity=5000',
         {
           headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' },
           timeout: 6_000,
         }
       );
+      birdeyeFailCount = 0; // reset on success
       const birdTokens: any[] = birdR.data?.data?.tokens ?? birdR.data?.data ?? [];
       const birdMints: string[] = birdTokens
         .filter((t: any) => t.address && !seen.has(t.address))
@@ -792,7 +798,12 @@ async function fetchRaydiumPairs(): Promise<any[]> {
         if (birdAdded > 0) console.debug(`[raydium-scan] Birdeye trending: ${birdAdded} new Raydium pairs`);
       }
     } catch (e: any) {
-      console.debug(`[raydium-scan] Birdeye trending error: ${e.message?.slice(0, 50)}`);
+      birdeyeFailCount++;
+      if (birdeyeFailCount >= 3) {
+        birdeyeBackoffUntil = Date.now() + 60 * 60 * 1000; // 60min backoff
+        birdeyeFailCount = 0;
+        console.info(`[raydium-scan] Birdeye Source 5 disabled for 60min (quota/API error: ${e.message?.slice(0, 40)})`);
+      }
     }
   }
 
