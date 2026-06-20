@@ -34,6 +34,10 @@ const PINATA_JWT     = process.env.PINATA_JWT ?? '';
 const PINATA_GATEWAY = process.env.PINATA_GATEWAY ?? 'https://gateway.pinata.cloud/ipfs/';
 const TG_TOKEN       = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const ADMIN_CHAT     = process.env.ADMIN_CHAT_ID ?? process.env.TELEGRAM_ADMIN_CHAT_ID ?? '';
+// Private chat for errors/warnings — never shown to public channel.
+// Set TG_PRIVATE_CHAT_ID to your personal Telegram user ID.
+// If not set, errors are only logged (not sent to TG at all).
+const PRIVATE_CHAT   = process.env.TG_PRIVATE_CHAT_ID ?? '';
 
 // In-process cooldown guard — blocks duplicate launches during the async operation
 let lastLaunchAt = 0;
@@ -158,27 +162,105 @@ function loadKp(envKey: string): Keypair | null {
 
 // ─── PumpPortal buy ───────────────────────────────────────────────────────────
 
-async function pumpBuy(conn: Connection, wallet: Keypair, mintAddr: string, amountSol: number): Promise<string> {
+// Wait until pump.fun bonding curve is visible on the network (max 20s).
+// PumpPortal builds TXs from their own RPC — if they can't find the mint, TX will fail.
+async function waitForMintVisible(conn: Connection, mintAddr: string, maxWaitMs = 20000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const info = await conn.getAccountInfo(new PublicKey(mintAddr));
+      if (info) return; // mint account is on-chain
+    } catch {}
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  // Proceed anyway — don't block the buy, just warn
+  console.warn(`[trend-launch] mint ${mintAddr.slice(0, 12)}... not visible after ${maxWaitMs / 1000}s — trying buy anyway`);
+}
+
+async function pumpBuyOnce(conn: Connection, wallet: Keypair, mintAddr: string, amountSol: number, slippage: number): Promise<string> {
   const r = await axios.post('https://pumpportal.fun/api/trade-local', {
     publicKey: wallet.publicKey.toBase58(), action: 'buy', mint: mintAddr,
-    amount: amountSol, denominatedInSol: 'true', slippage: 30, priorityFee: 0.003, pool: 'pump',
-  }, { responseType: 'arraybuffer', timeout: 25000 });
+    amount: amountSol, denominatedInSol: 'true', slippage, priorityFee: 0.003, pool: 'pump',
+  }, { responseType: 'arraybuffer', timeout: 30000 });
 
+  // PumpPortal returns JSON error if mint not found (not arraybuffer)
   const bytes = new Uint8Array(r.data as ArrayBuffer);
+  if (bytes[0] === 123) { // '{' = JSON error response
+    const errText = Buffer.from(bytes).toString('utf8');
+    throw new Error(`PumpPortal rejected buy: ${errText.slice(0, 200)}`);
+  }
+
   const tx = VersionedTransaction.deserialize(bytes);
   tx.sign([wallet]);
-  const sig = await conn.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 });
-  await conn.confirmTransaction(sig, 'confirmed');
+  const sig = await conn.sendTransaction(tx, { skipPreflight: true, maxRetries: 2 });
+
+  // confirmTransaction only tells us the TX was included — check .err for on-chain failure
+  const result = await conn.confirmTransaction(sig, 'confirmed');
+  if (result.value.err) {
+    throw new Error(`Buy TX failed on-chain (Custom:1=SlippageExceeded): ${JSON.stringify(result.value.err)}`);
+  }
   return sig;
+}
+
+async function pumpBuy(conn: Connection, wallet: Keypair, mintAddr: string, amountSol: number): Promise<string> {
+  // Escalating slippage: 30% → 50% → 80% → 90%
+  // Custom:1 = TooFewTokensToReceive (slippage) — freshly created bonding curves are at 0 virtual SOL
+  // Higher slippage = accept fewer tokens per SOL → passes threshold
+  const slippages = [30, 50, 80, 90];
+  let lastError: Error = new Error('no attempts');
+
+  for (let i = 0; i < slippages.length; i++) {
+    try {
+      const sig = await pumpBuyOnce(conn, wallet, mintAddr, amountSol, slippages[i]);
+      if (i > 0) console.info(`[trend-launch] buy succeeded on retry ${i + 1} (slippage=${slippages[i]}%)`);
+      return sig;
+    } catch (e: any) {
+      lastError = e;
+      const isPumpPortalNotFound = e.message?.includes('PumpPortal rejected') && e.message?.includes('not found');
+      console.warn(`[trend-launch] buy attempt ${i + 1}/${slippages.length} failed (slippage=${slippages[i]}%): ${e.message.slice(0, 150)}`);
+      if (i < slippages.length - 1) {
+        const delay = isPumpPortalNotFound ? 5000 : 3000; // longer wait if mint not yet indexed
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+// Verify tokens landed in wallet after buy — prevents silent swap failures
+async function verifyTokensReceived(conn: Connection, wallet: Keypair, mintAddr: string): Promise<number> {
+  try {
+    const atas = await conn.getParsedTokenAccountsByOwner(
+      wallet.publicKey,
+      { mint: new PublicKey(mintAddr) }
+    );
+    if (!atas.value.length) return 0;
+    const uiAmt = (atas.value[0].account.data as any)?.parsed?.info?.tokenAmount?.uiAmount ?? 0;
+    return Number(uiAmt);
+  } catch { return 0; }
 }
 
 // ─── Telegram notify ──────────────────────────────────────────────────────────
 
+// Public channel — launch announcements only (everyone sees this)
 async function tgNotify(text: string): Promise<void> {
   if (!TG_TOKEN || !ADMIN_CHAT) return;
   await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
     chat_id: ADMIN_CHAT, text, parse_mode: 'Markdown', disable_web_page_preview: true,
   }, { timeout: 8000 }).catch((e: any) => console.warn('[trend-launch] TG notify failed:', e.message));
+}
+
+// Private only — errors, warnings, balance alerts (never sent to public channel)
+async function tgNotifyPrivate(text: string): Promise<void> {
+  if (!TG_TOKEN) return;
+  const chatId = PRIVATE_CHAT || ADMIN_CHAT; // fallback to admin chat only if private not configured
+  if (!chatId) return;
+  // If private chat not separately configured and ADMIN_CHAT is public — skip silently
+  if (!PRIVATE_CHAT && !ADMIN_CHAT) return;
+  await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+    chat_id: chatId, text, parse_mode: 'Markdown', disable_web_page_preview: true,
+  }, { timeout: 8000 }).catch(() => {}); // silent — don't log errors about error notifications
 }
 
 // ─── Cooldown check ───────────────────────────────────────────────────────────
@@ -285,13 +367,16 @@ async function launchOneToken(
 
     const imageCid = await pinataUploadBuffer(logoBuffer, `${concept.ticker}_logo.png`, 'image/png');
     const imageUrl = `https://ipfs.io/ipfs/${imageCid}`;
+    console.info(`[trend-launch] ${walletAlias} Image → ${imageUrl}`);
 
-    await pinataUploadJson({
+    const metaCid = await pinataUploadJson({
       name: concept.name, symbol: concept.ticker, description: concept.description,
       image: imageUrl,
       website: 'https://gadai.shop', twitter: trend.tweet_url || '',
       telegram: 'https://t.me/gadfamilytg', showName: true, createdOn: 'https://pump.fun',
     }, `${concept.ticker}_metadata`);
+    const metaUri = `${PINATA_GATEWAY}${metaCid}`;
+    console.info(`[trend-launch] ${walletAlias} Meta → ${metaUri}`);
 
     const conn = new Connection(SOLANA_RPC, 'confirmed');
     const { PumpFunSDK }    = await import('pumpdotfun-sdk');
@@ -303,14 +388,17 @@ async function launchOneToken(
     const mintKp   = Keypair.generate();
     const mintAddr = mintKp.publicKey.toBase58();
 
-    // BigInt(0) = create-only; buy below via PumpPortal (avoids global_volume_accumulator error)
+    const imageBlob = (() => { const ab = new ArrayBuffer(logoBuffer.length); new Uint8Array(ab).set(logoBuffer); return new Blob([ab], { type: 'image/png' }); })();
+
+    // metadataUri = Pinata URI (bypasses pump.fun/api/ipfs which returns 403 from VPS)
     const createResult = await sdk.createAndBuy(
       kp, mintKp,
       {
         name: concept.name, symbol: concept.ticker, description: concept.description,
-        file: (() => { const ab = new ArrayBuffer(logoBuffer.length); new Uint8Array(ab).set(logoBuffer); return new Blob([ab], { type: 'image/png' }); })(),
-        twitter: trend.tweet_url || '', telegram: 'https://t.me/gadfamilytg', website: 'https://gadai.shop',
-      },
+        file: imageBlob, twitter: trend.tweet_url || '',
+        telegram: 'https://t.me/gadfamilytg', website: 'https://gadai.shop',
+        metadataUri: metaUri,
+      } as any,
       BigInt(0), 500n, { unitLimit: 250000, unitPrice: 250000 }
     );
 
@@ -318,12 +406,21 @@ async function launchOneToken(
     console.info(`[trend-launch] ${walletAlias} ✅ Created: ${mintAddr}`);
 
     // ONLY this wallet buys — no other wallet touches this token
-    await new Promise(r => setTimeout(r, 5000));
+    // Wait for bonding curve to propagate across the network (checks every 1.5s, max 20s)
+    await waitForMintVisible(conn, mintAddr);
     try {
       const sig = await pumpBuy(conn, kp, mintAddr, buySol);
-      console.info(`[trend-launch] ${walletAlias} buy ✅ ${buySol} SOL: ${sig}`);
+      // Verify tokens actually landed — pumpBuy confirms TX but TX could fail on-chain
+      const tokenAmt = await verifyTokensReceived(conn, kp, mintAddr);
+      if (tokenAmt > 0) {
+        console.info(`[trend-launch] ${walletAlias} buy ✅ ${buySol} SOL → ${tokenAmt.toLocaleString()} tokens: ${sig}`);
+      } else {
+        console.warn(`[trend-launch] ${walletAlias} buy TX ok (${sig}) but 0 tokens in wallet — bonding curve may have reverted. SOL NOT deducted (Solana atomic).`);
+        await tgNotifyPrivate(`⚠️ *${walletAlias} buy TX ok but 0 tokens received*\n$${concept.ticker} \`${mintAddr}\`\nToken created but dev buy failed — check pump.fun manually.`);
+      }
     } catch (e: any) {
-      console.warn(`[trend-launch] ${walletAlias} buy failed (token still live): ${e.message}`);
+      console.warn(`[trend-launch] ${walletAlias} buy failed after 3 attempts: ${e.message}`);
+      await tgNotifyPrivate(`⚠️ *${walletAlias} dev buy failed* — token created but not bought\n$${concept.ticker} \`${mintAddr}\`\nError: \`${(e.message as string).slice(0, 150)}\``);
     }
 
     await recordLaunch(trend.id, concept.ticker, concept.name, concept.description,
@@ -343,7 +440,7 @@ async function launchOneToken(
 
   } catch (err: any) {
     console.error(`[trend-launch] ${walletAlias} failed: ${err.message}`);
-    await tgNotify(
+    await tgNotifyPrivate(
       `❌ *${walletAlias} launch failed*\nTheme: ${trend.theme}\nError: \`${err.message.slice(0, 200)}\``
     );
   }
@@ -397,7 +494,7 @@ export async function runTrendLaunchCycle(): Promise<void> {
     const minRequired = 0.025;
     if (bal < minRequired) {
       console.warn(`[trend-launch] ${cfg.alias}: balance ${bal.toFixed(4)} SOL < ${minRequired} SOL minimum — skipping`);
-      await tgNotify(`⚠️ *${cfg.alias} skipped* — balance ${bal.toFixed(4)} SOL (need ≥${minRequired} SOL)`);
+      await tgNotifyPrivate(`⚠️ *${cfg.alias} skipped* — balance ${bal.toFixed(4)} SOL (need ≥${minRequired} SOL)`);
       continue;
     }
 
