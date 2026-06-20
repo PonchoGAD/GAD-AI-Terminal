@@ -1,17 +1,11 @@
 {
+  "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "target":           "ES2020",
-    "module":           "commonjs",
-    "lib":              ["ES2020"],
-    "outDir":           "./dist",
-    "rootDir":          "./src",
-    "strict":           false,
-    "esModuleInterop":  true,
-    "skipLibCheck":     true,
-    "resolveJsonModule": true,
+    "outDir": "dist",
+    "strict": false,
+    "baseUrl": "../..",
     "paths": {
-      "@lib/db":  ["../../libs/db/src"],
-      "@lib/db/*":["../../libs/db/src/*"]
+      "@lib/*": ["libs/*/src"]
     }
   },
   "include": ["src/**/*"],
