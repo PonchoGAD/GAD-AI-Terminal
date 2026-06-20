@@ -59,7 +59,7 @@ async function processXTrendSignals(): Promise<void> {
     const newsText = [signal.theme, signal.keywords].filter(Boolean).join(' | ').slice(0, 400);
     console.info(`[poly-signal] X trend: "${newsText.slice(0, 80)}..." (eng:${signal.engagement})`);
 
-    const scored = await processNewsSignal(newsText, 'x_trends', signal.id).catch(e => {
+    const scored = await processNewsSignal(newsText, 'x_trends').catch(e => {
       console.error('[poly-signal] Scoring error:', e.message);
       return null;
     });
