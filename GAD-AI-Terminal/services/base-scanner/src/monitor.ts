@@ -67,8 +67,19 @@ async function getCurrentPriceEth(contractAddress: string): Promise<number> {
 async function sellPosition(pos: Position, reason: string, sellPct: number, slippagePct = 0): Promise<void> {
   const tokenBalance = await getTokenBalance(pos.contract_address).catch(() => 0n);
   if (tokenBalance === 0n) {
-    console.warn(`[base-monitor] ${pos.symbol} no token balance — marking inactive`);
-    await query(`UPDATE base_positions SET is_active=false WHERE id=$1`, [pos.id]);
+    // Tokens gone (rug or on-chain sell succeeded but DB update failed due to old column bug)
+    const prevRow = await query<{ total_sold_eth: string; sold_at: Date | null }>(
+      `SELECT total_sold_eth, sold_at FROM base_positions WHERE id=$1`, [pos.id]
+    );
+    const prev = prevRow.rows[0];
+    if (prev?.sold_at) return; // already properly closed
+    const ethReceived = Number(prev?.total_sold_eth ?? 0);
+    console.warn(`[base-monitor] ${pos.symbol} no token balance — closing (total_sold_eth=${ethReceived.toFixed(5)})`);
+    await query(
+      `UPDATE base_positions SET is_active=false, sold_at=NOW(), sell_reason='NO_TOKENS' WHERE id=$1`,
+      [pos.id]
+    );
+    await updateDailyStats(pos, ethReceived);
     return;
   }
 
@@ -103,13 +114,18 @@ async function sellPosition(pos: Position, reason: string, sellPct: number, slip
   console.info(`[base-monitor] ${pos.symbol} SELL (${reason}) ${sellPct}% → ${ethReceived.toFixed(5)} ETH tx:${result.tx_hash?.slice(0, 12)}`);
 
   if (isFull) {
+    // Include any ETH from prior partial sells in the final stats total
+    const prevRow = await query<{ total_sold_eth: string }>(
+      `SELECT COALESCE(total_sold_eth, 0) as total_sold_eth FROM base_positions WHERE id=$1`, [pos.id]
+    );
+    const totalEthReceived = Number(prevRow.rows[0]?.total_sold_eth ?? 0) + ethReceived;
     await query(
       `UPDATE base_positions SET
-         sold_at=NOW(), sell_tx=$2, sold_eth=$3, is_active=false, sell_reason=$4
+         sold_at=NOW(), sell_tx=$2, total_sold_eth=$3, is_active=false, sell_reason=$4
        WHERE id=$1`,
-      [pos.id, result.tx_hash, ethReceived, reason]
+      [pos.id, result.tx_hash, totalEthReceived, reason]
     );
-    await updateDailyStats(pos, ethReceived);
+    await updateDailyStats(pos, totalEthReceived);
   } else {
     const remainingPct = 100 - sellPct;
     const newAmount = (tokenBalance * BigInt(remainingPct)) / 100n;
