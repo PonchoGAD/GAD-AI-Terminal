@@ -85,7 +85,8 @@ async function processGdeltSignals(): Promise<void> {
   );
 
   for (const row of rows) {
-    const newsText = `${row.main_title}: ${row.summary}`.slice(0, 400);
+    // trend_clusters.summary may contain raw HTML from Google News RSS — use only main_title
+    const newsText = row.main_title.slice(0, 400);
     const scored = await processGdeltSignal(newsText).catch(() => null);
     if (scored) await tryOpenPosition(scored);
   }
