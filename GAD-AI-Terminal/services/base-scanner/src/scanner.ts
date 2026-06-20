@@ -248,9 +248,17 @@ export async function runScanCycle(): Promise<BaseToken[]> {
     }
     if (recentScanned.has(token.contract_address)) continue;
 
-    // Run safety check (async, non-blocking for speed — update token after)
+    // Run safety check — REQUIRED, not optional (prevents honeypot buys)
+    // If Basescan is unreliable, set BASE_SKIP_SAFETY_CHECK=true in .env to bypass (not recommended)
     const safety = await checkTokenSafety(token.contract_address).catch(() => null);
-    if (safety) {
+    if (!safety) {
+      if (process.env.BASE_SKIP_SAFETY_CHECK === 'true') {
+        console.debug(`[base-scan] ⚠️ ${token.symbol} safety check unavailable — proceeding (BASE_SKIP_SAFETY_CHECK=true)`);
+      } else {
+        console.debug(`[base-scan] ✗ ${token.symbol} safety check failed (Basescan unavailable) — skip`);
+        continue;
+      }
+    } else {
       token.is_verified = safety.is_verified;
       token.lp_locked   = safety.lp_locked;
       token.safe_score  = safety.safe_score;
