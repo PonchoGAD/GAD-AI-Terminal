@@ -5,6 +5,7 @@ import { fetchActiveMarkets, syncMarketsToDb, getMarketsFromDb } from './markets
 import { processNewsSignal, processGdeltSignal } from './scorer';
 import { openPosition } from './trader';
 import { startMonitor } from './monitor';
+import { fetchRssHeadlines } from './rss-sync';
 
 const PORT         = Number(process.env.PORT                   || '4009');
 const DRY_RUN      = process.env.POLYMARKET_DRY_RUN            !== 'false';
@@ -92,7 +93,28 @@ async function processGdeltSignals(): Promise<void> {
   }
 }
 
-// ─── Strategy 3: Volume spike detection ──────────────────────────────────────
+// ─── Strategy 3: RSS news signals (CoinDesk / CoinTelegraph / Reuters / BBC) ──
+// Runs every 10 minutes. Free feeds — no API key needed.
+
+async function processRssSignals(): Promise<void> {
+  const headlines = await fetchRssHeadlines();
+  if (!headlines.length) return;
+
+  console.info(`[poly-rss] Processing ${headlines.length} headlines from RSS feeds`);
+
+  for (const item of headlines) {
+    const scored = await processNewsSignal(item.title, `rss:${item.source}`).catch(e => {
+      console.error('[poly-rss] Scoring error:', e.message);
+      return null;
+    });
+    if (scored) {
+      await tryOpenPosition(scored);
+      return; // one signal per cycle is enough
+    }
+  }
+}
+
+// ─── Strategy 4: Volume spike detection ──────────────────────────────────────
 // Markets where trading volume spiked recently (updated from Gamma API)
 // may have new information not yet fully reflected in price
 
@@ -266,12 +288,15 @@ async function start(): Promise<void> {
   // Market sync every N minutes
   setInterval(() => syncMarkets().catch(console.error), SYNC_MIN * 60 * 1000);
 
-  // Signal checks every 2 minutes
+  // Signal checks every 2 minutes (X trends + GDELT)
   setInterval(async () => {
     await processXTrendSignals().catch(e => console.error('[poly] X signal error:', e.message));
     await processGdeltSignals().catch(e => console.error('[poly] GDELT signal error:', e.message));
     await checkDryRunProgress().catch(console.error);
   }, CHECK_MIN * 60 * 1000);
+
+  // RSS news check every 10 minutes (CoinDesk/CoinTelegraph/Reuters/BBC — free, no API key)
+  setInterval(() => processRssSignals().catch(e => console.error('[poly] RSS signal error:', e.message)), 10 * 60 * 1000);
 
   // Volume spike check every 30 minutes
   setInterval(() => processVolumeSpikes().catch(console.error), 30 * 60 * 1000);
@@ -279,9 +304,11 @@ async function start(): Promise<void> {
   // Start position monitor
   startMonitor();
 
-  // First signal check after 60s (markets need to sync first)
+  // First signal checks after 60s (markets need to sync first)
   setTimeout(async () => {
     await processXTrendSignals().catch(console.error);
+    await processGdeltSignals().catch(console.error);
+    await processRssSignals().catch(console.error);
   }, 60 * 1000);
 
   console.info('[poly] Scheduler started');

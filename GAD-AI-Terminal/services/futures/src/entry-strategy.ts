@@ -71,6 +71,64 @@ function volumeRatio(candles: OHLCV[]): number {
   return avg20 > 0 ? cur / avg20 : 1;
 }
 
+// ── ADX / DMI (Wilder smoothing, period=14) ───────────────────────────────────
+// Returns adx (trend strength 0-100), +DI, -DI for directional filter.
+// adx > 22: trend is meaningful; adx > 35: strong trend.
+// LONG valid when adx > 22 AND plusDI > minusDI.
+// SHORT valid when adx > 22 AND minusDI > plusDI.
+function calcADX(candles: OHLCV[], period = 14): { adx: number; plusDI: number; minusDI: number } {
+  if (candles.length < period * 2) return { adx: 0, plusDI: 0, minusDI: 0 };
+
+  const trArr:    number[] = [];
+  const plusDMArr:  number[] = [];
+  const minusDMArr: number[] = [];
+
+  for (let i = 1; i < candles.length; i++) {
+    const prev = candles[i - 1];
+    const cur  = candles[i];
+    const tr   = Math.max(cur.high - cur.low, Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close));
+    const upMove   = cur.high  - prev.high;
+    const downMove = prev.low  - cur.low;
+    const plusDM  = upMove > downMove && upMove > 0 ? upMove : 0;
+    const minusDM = downMove > upMove && downMove > 0 ? downMove : 0;
+    trArr.push(tr);
+    plusDMArr.push(plusDM);
+    minusDMArr.push(minusDM);
+  }
+
+  // Wilder smoothing: initial = sum of first `period` values; then += (next - prev/period)
+  let smoothTR    = trArr.slice(0, period).reduce((s, v) => s + v, 0);
+  let smoothPlus  = plusDMArr.slice(0, period).reduce((s, v) => s + v, 0);
+  let smoothMinus = minusDMArr.slice(0, period).reduce((s, v) => s + v, 0);
+
+  const dxArr: number[] = [];
+
+  for (let i = period; i < trArr.length; i++) {
+    smoothTR    = smoothTR    - smoothTR / period    + trArr[i];
+    smoothPlus  = smoothPlus  - smoothPlus / period  + plusDMArr[i];
+    smoothMinus = smoothMinus - smoothMinus / period + minusDMArr[i];
+
+    const pdi = smoothTR > 0 ? (smoothPlus  / smoothTR) * 100 : 0;
+    const mdi = smoothTR > 0 ? (smoothMinus / smoothTR) * 100 : 0;
+    const dx  = (pdi + mdi) > 0 ? (Math.abs(pdi - mdi) / (pdi + mdi)) * 100 : 0;
+    dxArr.push(dx);
+  }
+
+  // ADX = Wilder SMA of DX over `period`
+  if (dxArr.length < period) return { adx: 0, plusDI: 0, minusDI: 0 };
+
+  let adx = dxArr.slice(0, period).reduce((s, v) => s + v, 0) / period;
+  for (let i = period; i < dxArr.length; i++) {
+    adx = (adx * (period - 1) + dxArr[i]) / period;
+  }
+
+  // Final +DI / -DI from last smoothed values
+  const finalPlusDI  = smoothTR > 0 ? (smoothPlus  / smoothTR) * 100 : 0;
+  const finalMinusDI = smoothTR > 0 ? (smoothMinus / smoothTR) * 100 : 0;
+
+  return { adx, plusDI: finalPlusDI, minusDI: finalMinusDI };
+}
+
 // ── Signal logic ──────────────────────────────────────────────────────────────
 function buildSignal(
   closes: number[],
@@ -117,6 +175,9 @@ function buildSignal(
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
+
+const MIN_ADX = Number(process.env.FUTURES_MIN_ADX || '22');
+
 export async function getSignal(): Promise<TechnicalSignal> {
   const candles = await fetchCandles(60);
   const closes  = candles.map(c => c.close);
@@ -126,12 +187,29 @@ export async function getSignal(): Promise<TechnicalSignal> {
   const rsi14    = rsi(closes);
   const volR     = volumeRatio(candles);
   const srLevels = calcSR(candles);
+  const { adx, plusDI, minusDI } = calcADX(candles);
 
   const price = closes[closes.length - 1];
   const e21   = ema21arr[ema21arr.length - 1];
   const e50   = ema50arr[ema50arr.length - 1];
 
-  const { signal, strength } = buildSignal(closes, ema21arr, ema50arr, rsi14, volR);
+  let { signal, strength } = buildSignal(closes, ema21arr, ema50arr, rsi14, volR);
+
+  // ADX directional filter: require meaningful trend (adx > MIN_ADX=22)
+  // AND correct directional alignment (+DI > -DI for LONG; -DI > +DI for SHORT)
+  if (signal !== 'FLAT' && adx < MIN_ADX) {
+    console.log(`[futures] ADX filter: adx=${adx.toFixed(1)} < ${MIN_ADX} — weak/ranging market → FLAT`);
+    signal = 'FLAT';
+    strength = 0;
+  } else if (signal === 'LONG' && plusDI <= minusDI) {
+    console.log(`[futures] ADX filter: LONG blocked — +DI(${plusDI.toFixed(1)}) ≤ -DI(${minusDI.toFixed(1)}) — bearish pressure`);
+    signal = 'FLAT';
+    strength = 0;
+  } else if (signal === 'SHORT' && minusDI <= plusDI) {
+    console.log(`[futures] ADX filter: SHORT blocked — -DI(${minusDI.toFixed(1)}) ≤ +DI(${plusDI.toFixed(1)}) — bullish pressure`);
+    signal = 'FLAT';
+    strength = 0;
+  }
 
   return {
     price,
@@ -142,6 +220,9 @@ export async function getSignal(): Promise<TechnicalSignal> {
     signal,
     strength,
     srLevels,
+    adx,
+    plusDI,
+    minusDI,
     ts: new Date(),
   };
 }
@@ -152,6 +233,9 @@ export function formatSignalReport(s: TechnicalSignal): string {
   const sigEmoji  = s.signal === 'LONG' ? '🟢 LONG' : s.signal === 'SHORT' ? '🔴 SHORT' : '⬜ FLAT';
   const volBadge  = s.volRatio >= 1.5 ? '🔥HIGH' : s.volRatio >= 1.1 ? 'norm+' : 'low';
 
+  const adxLabel = (s.adx ?? 0) > 35 ? '🔥strong' : (s.adx ?? 0) > 22 ? 'trend' : '😴ranging';
+  const diLabel  = (s.plusDI ?? 0) > (s.minusDI ?? 0) ? `+DI>${(s.plusDI??0).toFixed(1)} ↑` : `-DI>${(s.minusDI??0).toFixed(1)} ↓`;
+
   return [
     `📈 ENTRY SIGNAL (SOL-PERP 15m)`,
     ``,
@@ -159,6 +243,7 @@ export function formatSignalReport(s: TechnicalSignal): string {
     `EMA21:  $${s.ema21.toFixed(3)}  EMA50: $${s.ema50.toFixed(3)} ${arrow}`,
     `RSI14:  ${s.rsi14.toFixed(1)} ${rsiEmoji}`,
     `Volume: ${s.volRatio.toFixed(2)}x avg ${volBadge}`,
+    `ADX:    ${(s.adx??0).toFixed(1)} ${adxLabel}  ${diLabel}`,
     `S/R:    S=$${s.srLevels.support.toFixed(2)}  R=$${s.srLevels.resistance.toFixed(2)}`,
     ``,
     `Signal: ${sigEmoji}  (strength ${s.strength}/100)`,

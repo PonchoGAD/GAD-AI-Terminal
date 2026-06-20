@@ -62,48 +62,65 @@ interface TrendSignal {
   engagement: number;
 }
 
-// ─── Concept generation via Claude ───────────────────────────────────────────
+// ─── Concept generation via Claude (primary) → OpenAI (fallback) → template ──
 
 async function generateCoinConcept(trendText: string, tweetUrl: string): Promise<CoinConcept> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
+  const CONCEPT_PROMPT = (text: string, url: string) =>
+    `Based on this viral X (Twitter) post/trend, create a meme coin concept for pump.fun.\n` +
+    `Keep it fun, punchy, crypto-community style. Must be unique and memorable.\n\n` +
+    `Trend: "${text.slice(0, 300)}"\n` +
+    `Source: ${url || 'trending news'}\n\n` +
+    `Reply with ONLY valid JSON (no markdown fences):\n` +
+    `{"ticker":"TICK","name":"Full Token Name","description":"Fun description under 180 chars with crypto humor","imagePrompt":"simple meme coin logo, cartoon style, {theme imagery}, cute, vibrant colors, white background, flat illustration"}`;
 
+  function parseConcept(raw: string): CoinConcept {
+    const jsonStr = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+    const parsed = JSON.parse(jsonStr) as CoinConcept;
+    parsed.ticker = parsed.ticker.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+    if (parsed.ticker.length < 2) parsed.ticker = 'TREND';
+    return parsed;
+  }
+
+  // 1. Try Claude Haiku
   if (apiKey) {
     try {
       const Anthropic = (await import('@anthropic-ai/sdk')).default;
       const client = new Anthropic({ apiKey });
-
       const msg = await client.messages.create({
-        model:      'claude-haiku-4-5-20251001',
-        max_tokens: 256,
-        messages: [{
-          role:    'user',
-          content:
-            `Based on this viral X (Twitter) post/trend, create a meme coin concept for pump.fun.\n` +
-            `Keep it fun, punchy, crypto-community style. Must be unique and memorable.\n\n` +
-            `Trend: "${trendText.slice(0, 300)}"\n` +
-            `Source: ${tweetUrl || 'trending news'}\n\n` +
-            `Reply with ONLY valid JSON (no markdown fences):\n` +
-            `{"ticker":"TICK","name":"Full Token Name","description":"Fun description under 180 chars with crypto humor","imagePrompt":"simple meme coin logo, cartoon style, {theme imagery}, cute, vibrant colors, white background, flat illustration"}`,
-        }],
+        model: 'claude-haiku-4-5-20251001', max_tokens: 256,
+        messages: [{ role: 'user', content: CONCEPT_PROMPT(trendText, tweetUrl) }],
       });
-
-      const raw = ((msg.content[0] as any).text ?? '').trim();
-      const jsonStr = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
-      const parsed = JSON.parse(jsonStr) as CoinConcept;
-
-      // Sanitize ticker: uppercase, 3-6 alphanumeric
-      parsed.ticker = parsed.ticker.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
-      if (parsed.ticker.length < 2) parsed.ticker = 'TREND';
-
+      const parsed = parseConcept(((msg.content[0] as any).text ?? '').trim());
       console.info(`[trend-launch] Claude concept: $${parsed.ticker} — "${parsed.name}"`);
       return parsed;
     } catch (err: any) {
-      console.warn(`[trend-launch] Claude failed: ${err.message} — using template fallback`);
+      const isCredits = err.status === 400 || (err.message ?? '').toLowerCase().includes('credit');
+      console.warn(`[trend-launch] Claude failed: ${err.message}${isCredits ? ' — trying OpenAI fallback' : ''}`);
+
+      // 2. OpenAI gpt-4o-mini fallback (only on credit errors)
+      if (isCredits && process.env.OPENAI_API_KEY) {
+        try {
+          const res = await axios.post(
+            'https://api.openai.com/v1/chat/completions',
+            { model: 'gpt-4o-mini', max_tokens: 256,
+              messages: [{ role: 'user', content: CONCEPT_PROMPT(trendText, tweetUrl) }] },
+            { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+              timeout: 20000 }
+          );
+          const parsed = parseConcept((res.data.choices[0]?.message?.content ?? '').trim());
+          console.info(`[trend-launch] OpenAI fallback concept: $${parsed.ticker} — "${parsed.name}"`);
+          return parsed;
+        } catch (oaiErr: any) {
+          console.warn(`[trend-launch] OpenAI fallback failed: ${oaiErr.message} — using template`);
+        }
+      }
     }
   } else {
     console.info('[trend-launch] ANTHROPIC_API_KEY not set — using template concept');
   }
 
+  // 3. Local template (last resort)
   return buildTemplateConcept(trendText);
 }
 
@@ -325,6 +342,11 @@ async function launchOneToken(
     }
     // ────────────────────────────────────────────────────────────────────────────
 
+    // SDK STATUS (20.06.2026): pumpdotfun-sdk@1.4.2 is BROKEN — pump.fun added
+    // global_volume_accumulator + user_volume_accumulator + bonding_curve_v2 accounts
+    // (indexes 12-16) to buy instruction since Feb 2026. SDK not updated on npm (latest=1.4.2).
+    // FIX: switch to `pumpdotfun-sdk-repumped` (github.com/D3AD-E/pumpdotfun-sdk-repumped)
+    // when disk space allows: npm uninstall pumpdotfun-sdk && npm install pumpdotfun-sdk-repumped
     const conn = new Connection(SOLANA_RPC, 'confirmed');
     const { PumpFunSDK }    = await import('pumpdotfun-sdk');
     const { AnchorProvider } = await import('@coral-xyz/anchor');

@@ -36,6 +36,9 @@ export interface TechnicalSignal {
   signal: Signal;
   strength: number;       // 0-100
   srLevels: { support: number; resistance: number };
+  adx: number;            // Average Directional Index (0-100); trend strength
+  plusDI: number;         // +DI directional indicator
+  minusDI: number;        // -DI directional indicator
   ts: Date;
 }
 
