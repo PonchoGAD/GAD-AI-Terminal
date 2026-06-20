@@ -6,6 +6,9 @@ const BASE_URL   = 'https://api.helius.xyz/v0';
 
 const WHALE_THRESHOLD_USD = Number(process.env.WHALE_THRESHOLD_USD || '5000');
 
+// Backoff state — Helius REST API is Cloudflare-blocked from VPS (403). Back off 2h on 403.
+let _heliusBlockedUntil = 0;
+
 export interface WhaleTx {
   walletAddress: string;
   tokenMint: string;
@@ -21,6 +24,11 @@ export interface WhaleTx {
 export async function fetchLargeTransactions(): Promise<WhaleTx[]> {
   if (!HELIUS_KEY) {
     console.warn('[whale-tracker] HELIUS_API_KEY not set, skipping Helius fetch.');
+    return [];
+  }
+
+  // Cloudflare blocks api.helius.xyz from VPS — back off 2h after 403 to avoid log spam
+  if (_heliusBlockedUntil > Date.now()) {
     return [];
   }
 
@@ -73,7 +81,13 @@ export async function fetchLargeTransactions(): Promise<WhaleTx[]> {
     }
     return txs;
   } catch (err: any) {
-    console.warn('[whale-tracker] Helius fetch failed:', err.message);
+    const status = err.response?.status;
+    if (status === 403 || status === 401) {
+      _heliusBlockedUntil = Date.now() + 2 * 60 * 60 * 1000; // back off 2h
+      console.warn(`[whale-tracker] Helius API blocked (${status}) — backing off 2h (VPS IP blocked by Cloudflare)`);
+    } else {
+      console.warn('[whale-tracker] Helius fetch failed:', err.message);
+    }
     return [];
   }
 }

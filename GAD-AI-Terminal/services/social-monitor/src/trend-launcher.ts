@@ -390,7 +390,10 @@ async function launchOneToken(
 
     const imageBlob = (() => { const ab = new ArrayBuffer(logoBuffer.length); new Uint8Array(ab).set(logoBuffer); return new Blob([ab], { type: 'image/png' }); })();
 
-    // metadataUri = Pinata URI (bypasses pump.fun/api/ipfs which returns 403 from VPS)
+    // Dev buy amount in lamports — included directly in createAndBuy (same TX as creation).
+    // PumpPortal separate buy fails on fresh curves (Custom:1=SlippageExceeded).
+    // metadataUri = Pinata URI (bypasses pump.fun/api/ipfs which returns 403 from VPS).
+    const devBuyLamports = BigInt(Math.round(buySol * 1e9));
     const createResult = await sdk.createAndBuy(
       kp, mintKp,
       {
@@ -399,28 +402,19 @@ async function launchOneToken(
         telegram: 'https://t.me/gadfamilytg', website: 'https://gadai.shop',
         metadataUri: metaUri,
       } as any,
-      BigInt(0), 500n, { unitLimit: 250000, unitPrice: 250000 }
+      devBuyLamports, 500n, { unitLimit: 250000, unitPrice: 250000 }
     );
 
-    if (!createResult.success) throw new Error('pumpdotfun-sdk create returned success=false');
-    console.info(`[trend-launch] ${walletAlias} ✅ Created: ${mintAddr}`);
+    if (!createResult.success) throw new Error('pumpdotfun-sdk createAndBuy returned success=false');
+    console.info(`[trend-launch] ${walletAlias} ✅ Created+bought: ${mintAddr} (${buySol} SOL dev buy)`);
 
-    // ONLY this wallet buys — no other wallet touches this token
-    // Wait for bonding curve to propagate across the network (checks every 1.5s, max 20s)
-    await waitForMintVisible(conn, mintAddr);
-    try {
-      const sig = await pumpBuy(conn, kp, mintAddr, buySol);
-      // Verify tokens actually landed — pumpBuy confirms TX but TX could fail on-chain
-      const tokenAmt = await verifyTokensReceived(conn, kp, mintAddr);
-      if (tokenAmt > 0) {
-        console.info(`[trend-launch] ${walletAlias} buy ✅ ${buySol} SOL → ${tokenAmt.toLocaleString()} tokens: ${sig}`);
-      } else {
-        console.warn(`[trend-launch] ${walletAlias} buy TX ok (${sig}) but 0 tokens in wallet — bonding curve may have reverted. SOL NOT deducted (Solana atomic).`);
-        await tgNotifyPrivate(`⚠️ *${walletAlias} buy TX ok but 0 tokens received*\n$${concept.ticker} \`${mintAddr}\`\nToken created but dev buy failed — check pump.fun manually.`);
-      }
-    } catch (e: any) {
-      console.warn(`[trend-launch] ${walletAlias} buy failed after 3 attempts: ${e.message}`);
-      await tgNotifyPrivate(`⚠️ *${walletAlias} dev buy failed* — token created but not bought\n$${concept.ticker} \`${mintAddr}\`\nError: \`${(e.message as string).slice(0, 150)}\``);
+    // Verify tokens landed — createAndBuy is atomic so success=true means tokens should be there
+    const tokenAmt = await verifyTokensReceived(conn, kp, mintAddr);
+    if (tokenAmt > 0) {
+      console.info(`[trend-launch] ${walletAlias} 🪙 ${tokenAmt.toLocaleString()} tokens received`);
+    } else {
+      console.warn(`[trend-launch] ${walletAlias} 0 tokens after create — bonding curve issue`);
+      await tgNotifyPrivate(`⚠️ *${walletAlias} 0 tokens after create*\n$${concept.ticker} \`${mintAddr}\``);
     }
 
     await recordLaunch(trend.id, concept.ticker, concept.name, concept.description,
