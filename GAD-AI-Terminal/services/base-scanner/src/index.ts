@@ -1,6 +1,6 @@
 import express from 'express';
 import { query } from '@lib/db';
-import { getEthBalance, buyToken } from '@lib/base';
+import { getEthBalance, buyToken, getTokenBalance } from '@lib/base';
 import { runScanCycle, loadBaseRecentBuys, BaseToken } from './scanner';
 import { startMonitor, getPositionSummary } from './monitor';
 import { registerMoralisStream, handleMoralisWebhook } from './moralis-stream';
@@ -184,6 +184,25 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
 
   console.info(`[base-scanner] ✅ ${token.symbol} bought ${result.amount_out} tokens tx:${result.tx_hash?.slice(0,12)}`);
 
+  // Honeypot check: verify actual token balance 3s after buy
+  // If balance is 0, the token is a honeypot (ETH taken, no tokens received)
+  await new Promise(r => setTimeout(r, 3000));
+  const actualBalance = await getTokenBalance(token.contract_address).catch(() => 0n);
+  if (actualBalance === 0n) {
+    console.error(`[base-scanner] 🍯 HONEYPOT detected — ${token.symbol}: 0 tokens after buy, ${BUY_ETH} ETH lost`);
+    buyFailBlacklist.set(token.contract_address, Date.now() + 24 * 60 * 60 * 1000); // 24h blacklist
+    await query(
+      `INSERT INTO base_positions
+         (contract_address, symbol, wallet, amount_eth, token_amount, entry_price_eth,
+          bought_at, sold_at, dex, fee_tier, tp_index, is_active, trail_high, buy_tx,
+          total_sold_eth, sell_reason)
+       VALUES ($1,$2,$3,$4,'0',$6,NOW(),NOW(),$7,$8,0,false,0,$9,0,'HONEYPOT')`,
+      [token.contract_address, token.symbol, WALLET, BUY_ETH, token.price_eth,
+       result.dex, result.fee_tier ?? 3000, result.tx_hash]
+    );
+    return;
+  }
+
   await query(
     `INSERT INTO base_positions
        (contract_address, symbol, wallet, amount_eth, token_amount, entry_price_eth,
@@ -194,7 +213,7 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
       token.symbol,
       WALLET,
       BUY_ETH,
-      result.amount_out,
+      actualBalance.toString(), // use actual on-chain balance, not quote
       token.price_eth,
       result.dex,
       result.fee_tier ?? 3000,
