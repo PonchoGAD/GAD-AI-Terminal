@@ -96,14 +96,24 @@ console.warn('[sell] ...')
 
 ---
 
-## Тарифные планы (АКТУАЛЬНО — июнь 2026)
+## Тарифные планы (АКТУАЛЬНО — 20.06.2026)
 
-| slug | Цена | Срок | Описание |
-|---|---|---|---|
-| `trial_1d` | **0.05 SOL** | 24 часа | Полный доступ, одноразовый на кошелёк |
-| `trial_3d` | **0.1 SOL** | 72 часа | Полный доступ + Alpha Engine |
-| `monthly` | **1.0 SOL** | 30 дней | Всё включено (без авто-покупки) |
-| `autobuy_pro` | **5.0 SOL** | 30 дней | Всё включено + авто-покупка (ПЛАНИРУЕТСЯ) |
+**Оплата: USDT на BSC (MetaMask/Trust Wallet) ИЛИ Telegram Stars**
+**EVM кошелёк казначейства:** `0x4C0B07Ad19D47994639D18ac2Af2FF82A0F95F37` (BSC_WALLET_PUBLIC_KEY)
+**Stars rate:** $2.29 за 100 звёзд → $5=219⭐ | $10=437⭐ | $100=4367⭐
+
+| slug | Цена USD | Stars | Срок | Описание |
+|---|---|---|---|---|
+| `trial_1d` | **$5** | 219 ⭐ | 24 часа | Полный доступ, одноразовый на аккаунт |
+| `trial_3d` | **$10** | 437 ⭐ | 72 часа | Полный доступ + Alpha Engine |
+| `monthly` | **$100** | 4367 ⭐ | 30 дней | Всё включено |
+
+**Способы оплаты:**
+1. **USDT на BSC** — gadai.shop/pay → MetaMask → USDT transfer → API верификация через BSC RPC
+2. **Telegram Stars** — /subscribe в боте → кнопка ⭐ → invoice → `pre_checkout_query` → `successful_payment`
+
+**Идентификация:** `tg_<user_id>` как virtual wallet_address для Stars/USDT подписок (не нужен Solana wallet)
+**Статус /tg/status/:id** — проверяет ОБА: linked wallet AND `tg_<id>` — находит любую подписку
 
 ---
 
@@ -123,7 +133,14 @@ console.warn('[sell] ...')
 - [x] Полная схема БД (11 SQL-миграций)
 - [x] Все 18 shared-либ + trend-engine (GDELT + Google News + AI идеи)
 - [x] API сервер: токены, watchlist, alerts, portfolio, subscription, tg-user linking
-- [x] Subscription routes: 3 плана (0.05/0.1/1.0 SOL), on-chain верификация tx, FREE_WALLETS bypass
+- [x] Subscription routes: 3 плана, FREE_WALLETS bypass
+- [x] **Payment system USDT+Stars (20.06.2026):** migration 022, BSC USDT верификация, Telegram Stars invoice
+  - `POST /subscription/verify-usdt` — BSC RPC verification (eth_getTransactionReceipt + Transfer event decode)
+  - `POST /subscription/activate-stars` — Stars payment activation (tg_user_id + telegram_charge_id)
+  - `/tg/status/:id` — теперь проверяет tg_<id> wallet fallback (no Solana wallet needed)
+  - Stars: $2.29/100⭐ → trial_1d=219⭐, trial_3d=437⭐, monthly=4367⭐
+  - Pay page: MetaMask USDT on BSC (encodeUsdtTransfer ABI, wallet_switchEthereumChain)
+  - Bot Stars flow: `stars_plan:` callback → `sendInvoice(XTR)` → `pre_checkout_query` → `successful_payment`
 - [x] Telegram-бот: все команды + Alpha Engine + Trend Engine (/trends, /ideas, /approve_idea)
 - [x] Trade Journal: `/journal` + `/riskpassport` + CSV экспорт
 - [x] TokenScore: `/tokenscore <mint>` — скор 0-100
@@ -248,6 +265,18 @@ console.warn('[sell] ...')
   - W2 (CFmHWpmQ) и W3 (DJ8Tq8vi) = ТОЛЬКО для triple-launch новых токенов
   - Trейдинг на pump.fun кошельках слил все SOL в 0 — запрет абсолютный
   - **Правило:** W2/W3 участвуют только как создатели монет в `launchTriple()`, никаких buy/sell токенов
+- [x] **Polymarket Prediction Market Bot (20.06.2026):** migration 021, services/polymarket-bot, port 4009
+  - Gamma API: 94 активных рынка, обновление каждые 15 мин
+  - AI scoring: Claude Haiku (2 вызова/сигнал: matchNewsToMarket + EV scoring, MIN_EV=0.12)
+  - 3 стратегии: X Trends (слабо матчит), GDELT clusters main_title, Volume Spikes
+  - DRY-RUN → LIVE после WR≥65% на 30+ сделках. Полная документация: `!аналитика бота полимаркет.md`
+  - Telegram: /polystatus /polypositions /polytrades /polymarkets (Admin only)
+- [x] **Payment system USDT/Stars (20.06.2026):** migration 022
+  - USDT на BSC: treasury `0x4C0B07Ad19D47994639D18ac2Af2FF82A0F95F37`, BSC USDT 18 decimals
+  - Stars: trial_1d=219⭐ | trial_3d=437⭐ | monthly=4367⭐ (rate $2.29/100)
+  - Pay page: MetaMask + USDT ABI encoding + BSC RPC confirmation polling
+  - Subscription status: fallback на `tg_<id>` wallet (без Solana кошелька)
+  - Stars flow: stars_plan: callback → sendInvoice(XTR) → pre_checkout_query → successful_payment
 - [x] **Triple-launch (3-wallet simultaneous token creation, 19.06.2026):**
   - `services/telegram/src/launcher.ts`: `launchTriple(cfg)` — все 3 кошелька создают ОДНУ И ТУ ЖЕ монету одновременно
   - Pinata image+metadata загружаются ОДИН РАЗ → `Promise.all()` для 3 независимых createAndBuy
@@ -319,6 +348,7 @@ console.warn('[sell] ...')
 | futures | 4003 | ✅ 24/7 | BTC futures анализ (paper mode) |
 | base-scanner | 4005 | ✅ 24/7 | Base Network EVM (dry-run) |
 | ton-scanner | 4007 | ✅ 24/7 | TON Network / STON.fi (dry-run, needs TON_WALLET_MNEMONIC) |
+| polymarket-bot | 4009 | ✅ 24/7 | Polymarket prediction market (DRY-RUN, target WR≥65% on 30 trades) |
 
 **Только локально (НЕ на VPS):**
 - `scripts/launch-*.ts` — запуск токенов на pump.fun (нужен ключ + pumpdotfun-sdk локально)
@@ -342,7 +372,7 @@ console.warn('[sell] ...')
   - `docker builder prune -af` теперь даёт 0B (build cache пуст). Диск занят ОБРАЗАМИ запущенных контейнеров
   - До расширения диска: деплой через hot-patch (scp + docker exec build), НЕ docker compose build
 - [ ] **Metadata enrichment** — tokens.symbol/name остаются NULL
-- [ ] **ANTHROPIC_API_KEY** в VPS .env — нужен для trend-engine AI генерации идей
+- [x] ~~**ANTHROPIC_API_KEY** в VPS .env~~ — SET ✅ (проверено 20.06.2026)
 - [ ] **Migration 011** применить на VPS: `docker compose exec -T postgres psql -U gad -d gad_ai < migrations/011_trend_engine.sql`
 - [ ] **Health checks** для scanner, telegram, autobuy, whale-tracker
 - [ ] **Futures LIVE MODE:** отключён по умолчанию (FUTURES_LIVE_MODE=false → paper trading). Для real Drift Protocol включить через .env + депозит USDC на Drift аккаунт
@@ -360,8 +390,9 @@ console.warn('[sell] ...')
 
 #### P2 — Инфраструктура (КРИТИЧНО)
 - [ ] **⚠️ ДИСК VPS 100% (17.06.2026):** добавить Hetzner Volume 20GB ($5/мес) ИЛИ перейти на CPX41 (160GB). Текущий фикс (tune2fs) даёт 291MB — не хватит надолго
-- [ ] **ANTHROPIC_API_KEY** в VPS .env — нужен для trend-engine AI генерации идей (GDELT→cluster→AI idea)
-- [ ] **Миграции на VPS:** проверить что все (011-020) применены: `docker compose exec postgres psql -U gad -d gad_ai -c "\dt"`
+- [x] ~~ANTHROPIC_API_KEY~~ — SET на VPS ✅
+- [ ] **Миграции на VPS:** проверить что все (011-022) применены: `docker compose exec postgres psql -U gad -d gad_ai -c "\dt"` (022 применена 20.06.2026 ✅)
+- [ ] **Polymarket LIVE:** включить после WR≥65% на 30+ dry-run сделках (см. `!аналитика бота полимаркет.md`)
 
 #### P3 — X/Twitter Trends
 - [ ] **Twitter Basic план ($100/мес)** — для реальных engagement metrics (сейчас Nitter = synthetic данные без лайков/ретвитов)
@@ -467,6 +498,28 @@ console.warn('[sell] ...')
 **Решение:** `getMarketRegime()` теперь возвращает EXTREME_FEAR только при F&G < 13 (было < 25).
 **Почему:** F&G=18 → EXTREME_FEAR → все покупки заморожены. Но стратегия владельца: "покупать на страхе" (contrarian). Снижение порога до 13 означает: бот покупает в FEAR-режиме (F&G 13-45) но с жёсткими фильтрами (мин pc1h 15%, сниженные TP). EXTREME_FEAR = только реальная капитуляция/чёрный лебедь (< 13), не обычный коррекционный страх.
 **Не менять** порог назад без явного решения владельца.
+
+### 2026-06 — Payment system: SOL → USDT/Stars (20.06.2026)
+**Решение:** Полный переход с SOL на USDT (BSC) + Telegram Stars. SOL payment routes оставлены для обратной совместимости.
+**Почему:** Система выросла на Solana→Base→BSC→TON. Платить только SOL неудобно для новых юзеров. USDT более привычен. Stars удобен для Telegram-native платежей.
+**Детали:**
+- USDT treasury: `0x4C0B07Ad19D47994639D18ac2Af2FF82A0F95F37` (BSC_WALLET_PUBLIC_KEY на VPS)
+- BSC USDT: `0x55d398326f99059fF775485246999027B3197955` (18 decimals — НЕ 6 как Ethereum!)
+- Verification: `eth_getTransactionReceipt` + Transfer event decode через BSC public RPC (без API ключа)
+- Stars: TG Bot API `sendInvoice(currency:'XTR')` → `answerPreCheckoutQuery` → `successful_payment`
+- Идентификатор: `tg_<user_id>` как virtual wallet (не нужен Solana кошелёк для новых методов)
+**Не менять** BSC USDT decimals на 6 — это будет неправильно для BSC (18 decimals).
+**Stars admin TG ID:** 1304225865 — звёзды приходят автоматически на бот (владелец бота = этот TG аккаунт)
+
+### 2026-06 — Polymarket Bot (20.06.2026)
+**Решение:** Prediction market trading bot в DRY-RUN. Нельзя переключить на LIVE без WR≥65% на 30+ сделках.
+**Стратегии:** X тренды (плохой матч с политикой), GDELT clusters (лучший матч), Volume spikes.
+**Критические детали:**
+- `clobTokenIds` в Gamma API приходят как JSON-encoded STRING, не массив — нужен JSON.parse()
+- `source_signal_id` в polymarket_signals = TEXT (UUID x_trend_signals.id нужно кастовать `s.id::text`)
+- trend_clusters.summary содержит HTML (RSS) — использовать только `main_title`
+- CLOB Auth для live: HMAC-SHA256, private key из MetaMask Polygon wallet + API key с polymarket.com
+- Файлы: `!аналитика бота полимаркет.md` — полная документация + LIVE setup guide
 
 ### 2026-06 — gadai.shop — Vercel, не VPS (14.06.2026)
 **Факт:** `gadai.shop` хостится на Vercel, подключён к `https://github.com/PonchoGAD/gadai.git`.
