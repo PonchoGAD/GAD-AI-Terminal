@@ -58,7 +58,7 @@
     "next": "14.2.3",
     "node-telegram-bot-api": "^0.61.0",
     "pg": "^8.12.0",
-    "pumpdotfun-sdk": "^1.4.2",
+    "pumpdotfun-sdk": "github:D3AD-E/pumpdotfun-sdk-repumped",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ws": "^8.17.1"
