@@ -20,12 +20,15 @@
 import axios from 'axios';
 import FormData from 'form-data';
 import bs58 from 'bs58';
-import { Keypair, Connection, VersionedTransaction, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { Keypair, Connection, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { query } from '@lib/db';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const ENABLED        = process.env.TREND_AUTO_LAUNCH_ENABLED === 'true';
+// DRY_RUN: runs full pipeline (concept gen, logo, Pinata upload) but skips createAndBuy.
+// Set TREND_DRY_RUN=true to verify the pipeline without spending any SOL.
+const DRY_RUN        = process.env.TREND_DRY_RUN === 'true';
 const COOLDOWN_H     = Number(process.env.TREND_LAUNCH_COOLDOWN_H ?? '4');
 const DEV_BUY_SOL   = Number(process.env.TREND_LAUNCH_DEV_BUY_SOL ?? '0.03');
 const MIN_ENGAGEMENT = Number(process.env.TREND_MIN_ENGAGEMENT ?? '10000');
@@ -160,74 +163,6 @@ function loadKp(envKey: string): Keypair | null {
   catch { return null; }
 }
 
-// ─── PumpPortal buy ───────────────────────────────────────────────────────────
-
-// Wait until pump.fun bonding curve is visible on the network (max 20s).
-// PumpPortal builds TXs from their own RPC — if they can't find the mint, TX will fail.
-async function waitForMintVisible(conn: Connection, mintAddr: string, maxWaitMs = 20000): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < maxWaitMs) {
-    try {
-      const info = await conn.getAccountInfo(new PublicKey(mintAddr));
-      if (info) return; // mint account is on-chain
-    } catch {}
-    await new Promise(r => setTimeout(r, 1500));
-  }
-  // Proceed anyway — don't block the buy, just warn
-  console.warn(`[trend-launch] mint ${mintAddr.slice(0, 12)}... not visible after ${maxWaitMs / 1000}s — trying buy anyway`);
-}
-
-async function pumpBuyOnce(conn: Connection, wallet: Keypair, mintAddr: string, amountSol: number, slippage: number): Promise<string> {
-  const r = await axios.post('https://pumpportal.fun/api/trade-local', {
-    publicKey: wallet.publicKey.toBase58(), action: 'buy', mint: mintAddr,
-    amount: amountSol, denominatedInSol: 'true', slippage, priorityFee: 0.003, pool: 'pump',
-  }, { responseType: 'arraybuffer', timeout: 30000 });
-
-  // PumpPortal returns JSON error if mint not found (not arraybuffer)
-  const bytes = new Uint8Array(r.data as ArrayBuffer);
-  if (bytes[0] === 123) { // '{' = JSON error response
-    const errText = Buffer.from(bytes).toString('utf8');
-    throw new Error(`PumpPortal rejected buy: ${errText.slice(0, 200)}`);
-  }
-
-  const tx = VersionedTransaction.deserialize(bytes);
-  tx.sign([wallet]);
-  const sig = await conn.sendTransaction(tx, { skipPreflight: true, maxRetries: 2 });
-
-  // confirmTransaction only tells us the TX was included — check .err for on-chain failure
-  const result = await conn.confirmTransaction(sig, 'confirmed');
-  if (result.value.err) {
-    throw new Error(`Buy TX failed on-chain (Custom:1=SlippageExceeded): ${JSON.stringify(result.value.err)}`);
-  }
-  return sig;
-}
-
-async function pumpBuy(conn: Connection, wallet: Keypair, mintAddr: string, amountSol: number): Promise<string> {
-  // Escalating slippage: 30% → 50% → 80% → 90%
-  // Custom:1 = TooFewTokensToReceive (slippage) — freshly created bonding curves are at 0 virtual SOL
-  // Higher slippage = accept fewer tokens per SOL → passes threshold
-  const slippages = [30, 50, 80, 90];
-  let lastError: Error = new Error('no attempts');
-
-  for (let i = 0; i < slippages.length; i++) {
-    try {
-      const sig = await pumpBuyOnce(conn, wallet, mintAddr, amountSol, slippages[i]);
-      if (i > 0) console.info(`[trend-launch] buy succeeded on retry ${i + 1} (slippage=${slippages[i]}%)`);
-      return sig;
-    } catch (e: any) {
-      lastError = e;
-      const isPumpPortalNotFound = e.message?.includes('PumpPortal rejected') && e.message?.includes('not found');
-      console.warn(`[trend-launch] buy attempt ${i + 1}/${slippages.length} failed (slippage=${slippages[i]}%): ${e.message.slice(0, 150)}`);
-      if (i < slippages.length - 1) {
-        const delay = isPumpPortalNotFound ? 5000 : 3000; // longer wait if mint not yet indexed
-        await new Promise(r => setTimeout(r, delay));
-      }
-    }
-  }
-
-  throw lastError;
-}
-
 // Verify tokens landed in wallet after buy — prevents silent swap failures
 async function verifyTokensReceived(conn: Connection, wallet: Keypair, mintAddr: string): Promise<number> {
   try {
@@ -251,16 +186,17 @@ async function tgNotify(text: string): Promise<void> {
   }, { timeout: 8000 }).catch((e: any) => console.warn('[trend-launch] TG notify failed:', e.message));
 }
 
-// Private only — errors, warnings, balance alerts (never sent to public channel)
+// Private only — errors/warnings go ONLY to TG_PRIVATE_CHAT_ID, never to public channel.
+// If TG_PRIVATE_CHAT_ID is not set, just logs to console.
 async function tgNotifyPrivate(text: string): Promise<void> {
-  if (!TG_TOKEN) return;
-  const chatId = PRIVATE_CHAT || ADMIN_CHAT; // fallback to admin chat only if private not configured
-  if (!chatId) return;
-  // If private chat not separately configured and ADMIN_CHAT is public — skip silently
-  if (!PRIVATE_CHAT && !ADMIN_CHAT) return;
+  if (!TG_TOKEN || !PRIVATE_CHAT) {
+    // No private chat configured — log to console only, never public channel
+    console.info(`[trend-launch] [private] ${text.replace(/\*/g, '').slice(0, 200)}`);
+    return;
+  }
   await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-    chat_id: chatId, text, parse_mode: 'Markdown', disable_web_page_preview: true,
-  }, { timeout: 8000 }).catch(() => {}); // silent — don't log errors about error notifications
+    chat_id: PRIVATE_CHAT, text, parse_mode: 'Markdown', disable_web_page_preview: true,
+  }, { timeout: 8000 }).catch(() => {});
 }
 
 // ─── Cooldown check ───────────────────────────────────────────────────────────
@@ -328,9 +264,10 @@ async function recordLaunch(
 ): Promise<void> {
   await query(`UPDATE x_trend_signals SET action = $1 WHERE id = $2`, [`LAUNCHED:${mintAddr}`, signalId]).catch(() => {});
 
+  // source='trend_auto_launch' is critical — getLastLaunchTimestamp() queries by this field
   await query(`
-    INSERT INTO coin_ideas (ticker, name, description, score, status, created_at)
-    VALUES ($1, $2, $3, 0, 'launched', now())
+    INSERT INTO coin_ideas (ticker, name, description, score, status, source, created_at)
+    VALUES ($1, $2, $3, 0, 'launched', 'trend_auto_launch', now())
     ON CONFLICT DO NOTHING
   `, [ticker, name, `Auto-launched [${walletAlias}] from X trend: ${tweetUrl}`]).catch(() => {});
 
@@ -377,6 +314,16 @@ async function launchOneToken(
     }, `${concept.ticker}_metadata`);
     const metaUri = `${PINATA_GATEWAY}${metaCid}`;
     console.info(`[trend-launch] ${walletAlias} Meta → ${metaUri}`);
+
+    // ── DRY_RUN: pipeline verified OK — skip actual TX / SOL spend ──────────────
+    if (DRY_RUN) {
+      console.info(`[trend-launch] [DRY-RUN] ${walletAlias} ✅ Pipeline OK — would launch $${concept.ticker} (${buySol} SOL dev buy)`);
+      console.info(`[trend-launch] [DRY-RUN] ${walletAlias} Image: ${imageUrl}`);
+      console.info(`[trend-launch] [DRY-RUN] ${walletAlias} Meta:  ${metaUri}`);
+      await tgNotifyPrivate(`🔍 *[DRY-RUN] ${walletAlias}* — pipeline verified\n$${concept.ticker} "${concept.name}"\nImage: ${imageUrl}\nMeta: ${metaUri}`);
+      return; // no createAndBuy, no SOL spent
+    }
+    // ────────────────────────────────────────────────────────────────────────────
 
     const conn = new Connection(SOLANA_RPC, 'confirmed');
     const { PumpFunSDK }    = await import('pumpdotfun-sdk');
@@ -455,6 +402,7 @@ async function getWalletSolBalance(kp: Keypair): Promise<number> {
 
 export async function runTrendLaunchCycle(): Promise<void> {
   if (!ENABLED) return;
+  if (DRY_RUN) console.info('[trend-launch] *** DRY_RUN=true — full pipeline runs but NO createAndBuy TX will fire ***');
   if (!PINATA_JWT) { console.warn('[trend-launch] PINATA_JWT not configured'); return; }
 
   // Cooldown check
