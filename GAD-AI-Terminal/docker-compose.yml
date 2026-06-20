@@ -324,5 +324,37 @@ services:
       api:
         condition: service_started
 
+  polymarket-bot:
+    build:
+      context: .
+      dockerfile: services/polymarket-bot/Dockerfile
+    container_name: gad-ai-polymarket-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      PORT: "4009"
+      POLYMARKET_DRY_RUN: "${POLYMARKET_DRY_RUN:-true}"
+      POLYMARKET_ENABLED: "${POLYMARKET_ENABLED:-true}"
+      POLYMARKET_MAX_USDC: "${POLYMARKET_MAX_USDC:-10}"
+      POLYMARKET_MAX_OPEN: "${POLYMARKET_MAX_OPEN:-3}"
+      POLYMARKET_MIN_VOLUME: "${POLYMARKET_MIN_VOLUME:-50000}"
+      POLYMARKET_MIN_EV: "${POLYMARKET_MIN_EV:-0.12}"
+      POLYMARKET_MIN_CONFIDENCE: "${POLYMARKET_MIN_CONFIDENCE:-MEDIUM}"
+      POLYMARKET_TP_PCT: "${POLYMARKET_TP_PCT:-35}"
+      POLYMARKET_IMPULSE_PCT: "${POLYMARKET_IMPULSE_PCT:-22}"
+      POLYMARKET_SL_PCT: "${POLYMARKET_SL_PCT:-40}"
+      POLYMARKET_TIME_LIMIT_S: "${POLYMARKET_TIME_LIMIT_S:-7200}"
+      POLYMARKET_SYNC_MIN: "${POLYMARKET_SYNC_MIN:-15}"
+      POLYMARKET_DRY_TARGET: "${POLYMARKET_DRY_TARGET:-30}"
+    ports:
+      - "4009:4009"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+
 volumes:
   postgres-data:

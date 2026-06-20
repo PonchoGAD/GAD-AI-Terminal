@@ -1,4 +1,4 @@
-import dotenv from 'dotenv';
+﻿import dotenv from 'dotenv';
 import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
 import { query } from '@lib/db';
@@ -1917,7 +1917,104 @@ bot.onText(/\/postpromo/, (msg) => {
 // ─── Broadcaster — auto-posts top signals to channel ──────────────────────────
 startBroadcaster(bot);
 
+// ─── Polymarket commands ──────────────────────────────────────────────────────
+const POLY_API = process.env.POLYMARKET_API_URL || 'http://polymarket-bot:4009';
+
+async function polyGet<T = any>(path: string): Promise<T> {
+  const res = await axios.get<T>(`${POLY_API}${path}`, { timeout: 8000 });
+  return res.data;
+}
+
+bot.onText(/\/polystatus/, async (msg) => {
+  if (String(msg.chat.id) !== String(ADMIN_ID)) return;
+  try {
+    const h   = await polyGet('/health');
+    const s   = await polyGet<any[]>('/stats');
+    const tot = s.reduce((a: any, r: any) => ({
+      trades: (a.trades||0) + Number(r.trades||0),
+      wins:   (a.wins||0)   + Number(r.wins||0),
+      pnl:    (a.pnl||0)    + Number(r.pnl_usdc||0),
+    }), {});
+    const wr = tot.trades > 0 ? (tot.wins / tot.trades * 100).toFixed(0) : '0';
+    const { rows: open } = await query<any>('SELECT COUNT(*) AS c FROM polymarket_positions WHERE is_active=true').then(r => r).catch(() => ({ rows: [{ c: 0 }] }));
+    send(msg.chat.id,
+      `🔮 *Polymarket Bot*\n` +
+      `Mode: ${h.mode === 'dry-run' ? '🟡 DRY-RUN' : '🔴 LIVE'}\n` +
+      `Enabled: ${h.enabled ? '✅' : '❌'}\n` +
+      `Open positions: ${open[0]?.c ?? 0}\n\n` +
+      `📊 *All-time stats:*\n` +
+      `Trades: ${tot.trades} | WR: ${wr}% | PnL: ${(tot.pnl>=0?'+':'') + tot.pnl.toFixed(2)} USDC`
+    );
+  } catch(e: any) {
+    send(msg.chat.id, `❌ Polymarket bot offline: ${e.message}`);
+  }
+});
+
+bot.onText(/\/polypositions/, async (msg) => {
+  if (String(msg.chat.id) !== String(ADMIN_ID)) return;
+  try {
+    const positions = await polyGet<any[]>('/positions');
+    const open = positions.filter(p => p.is_active);
+    if (!open.length) {
+      send(msg.chat.id, '🔮 *Polymarket* — no open positions');
+      return;
+    }
+    const lines = open.map((p: any) => {
+      const age = Math.floor((Date.now() - new Date(p.created_at).getTime()) / 60000);
+      return `${p.outcome === 'YES' ? '🟢' : '🔴'} *${p.outcome}* @ $${Number(p.entry_price).toFixed(3)}\n   ${p.market_title?.slice(0,50) ?? p.market_id?.slice(0,12)}\n   ${Number(p.shares).toFixed(2)} shares | $${Number(p.amount_usdc).toFixed(2)} | ${age}min ago${p.is_dry_run?' [DRY]':''}`;
+    });
+    send(msg.chat.id, `🔮 *Open Polymarket positions (${open.length}):*\n\n${lines.join('\n\n')}`);
+  } catch(e: any) {
+    send(msg.chat.id, `❌ ${e.message}`);
+  }
+});
+
+bot.onText(/\/polytrades/, async (msg) => {
+  if (String(msg.chat.id) !== String(ADMIN_ID)) return;
+  try {
+    const positions = await polyGet<any[]>('/positions');
+    const closed = positions.filter(p => !p.is_active && p.closed_at).slice(0, 10);
+    if (!closed.length) {
+      send(msg.chat.id, '🔮 *Polymarket* — no closed trades yet');
+      return;
+    }
+    const lines = closed.map((p: any) => {
+      const pnl = Number(p.pnl_usdc ?? 0);
+      const mult = p.entry_price > 0 ? (Number(p.close_price) / Number(p.entry_price)) : 0;
+      return `${pnl >= 0 ? '✅' : '❌'} *${p.outcome}* ${mult.toFixed(2)}x (${p.close_reason})\n   ${p.market_title?.slice(0,45) ?? p.market_id?.slice(0,12)}\n   PnL: ${pnl>=0?'+':''}$${pnl.toFixed(3)}${p.is_dry_run?' [DRY]':''}`;
+    });
+    const stats = await polyGet<any[]>('/stats');
+    const tot = stats.reduce((a: any,r: any) => ({
+      trades: (a.trades||0)+Number(r.trades||0),
+      wins:   (a.wins||0)+Number(r.wins||0),
+      pnl:    (a.pnl||0)+Number(r.pnl_usdc||0),
+    }), {});
+    const wr = tot.trades > 0 ? (tot.wins/tot.trades*100).toFixed(0) : '0';
+    send(msg.chat.id,
+      `🔮 *Polymarket Trades* (last 10)\n\n${lines.join('\n\n')}\n\n` +
+      `Total: ${tot.trades} | WR: ${wr}% | PnL: ${tot.pnl>=0?'+':''}$${tot.pnl.toFixed(2)}`
+    );
+  } catch(e: any) {
+    send(msg.chat.id, `❌ ${e.message}`);
+  }
+});
+
+bot.onText(/\/polymarkets/, async (msg) => {
+  if (String(msg.chat.id) !== String(ADMIN_ID)) return;
+  try {
+    const markets = await polyGet<any[]>('/markets');
+    const top = markets.slice(0, 8);
+    const lines = top.map((m: any) =>
+      `📊 ${m.title?.slice(0,55)}\n   YES:$${Number(m.price_yes).toFixed(2)} | NO:$${Number(m.price_no).toFixed(2)} | Vol:$${Number(m.volume_usd/1000).toFixed(0)}k`
+    );
+    send(msg.chat.id, `🔮 *Top Polymarket Markets:*\n\n${lines.join('\n\n')}`);
+  } catch(e: any) {
+    send(msg.chat.id, `❌ ${e.message}`);
+  }
+});
+
 // ─── Errors ───────────────────────────────────────────────────────────────────
 bot.on('polling_error', (err) => log('error', 'polling:', err.message));
 if (ADMIN_ID) bot.sendMessage(ADMIN_ID, '🤖 GAD AI Terminal online.').catch(() => {});
 log('info', 'Telegram bot running. t.me/gadai_sol_bot');
+

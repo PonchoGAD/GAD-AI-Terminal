@@ -41,6 +41,23 @@ registerRoutes(app);
 registerSubscriptionRoutes(app);
 registerTgUserRoutes(app);
 
+// ─── Polymarket proxy ─────────────────────────────────────────────────────────
+const POLY_URL = process.env.POLYMARKET_API_URL || 'http://polymarket-bot:4009';
+app.use('/polymarket', async (req, res) => {
+  try {
+    const { data, status } = await (await import('axios')).default({
+      method: req.method as any,
+      url: `${POLY_URL}${req.path}`,
+      params: req.query,
+      data: req.body,
+      timeout: 10000,
+    });
+    res.status(status).json(data);
+  } catch (e: any) {
+    res.status(e.response?.status ?? 502).json({ error: e.message });
+  }
+});
+
 // ─── HTTP server + WebSocket ──────────────────────────────────────────────────
 
 const server = http.createServer(app);
