@@ -13,6 +13,14 @@ import axios from 'axios';
 
 const POLL_INTERVAL_MS = Number(process.env.SOCIAL_POLL_INTERVAL_SECONDS ?? '120') * 1000;
 
+// UTC quiet hours: skip LLM-heavy cycles to save API credits (default 00:00-07:00 UTC)
+const QUIET_START = Number(process.env.QUIET_HOURS_START ?? '0');
+const QUIET_END   = Number(process.env.QUIET_HOURS_END   ?? '7');
+function isQuietHour(): boolean {
+  const h = new Date().getUTCHours();
+  return h >= QUIET_START && h < QUIET_END;
+}
+
 interface MonitoredAccount {
   id:              string;
   platform:        string;
@@ -249,7 +257,9 @@ export async function startSocialMonitor(): Promise<void> {
   setTimeout(() => {
     const runXCycle = async () => {
       if (shouldStop) return;
-      try { await runXTrendCycle(); } catch (err: any) { console.warn(`[social] X cycle error: ${err.message}`); }
+      if (!isQuietHour()) {
+        try { await runXTrendCycle(); } catch (err: any) { console.warn(`[social] X cycle error: ${err.message}`); }
+      }
       if (!shouldStop) setTimeout(runXCycle, 15 * 60 * 1000);
     };
     runXCycle();
@@ -269,7 +279,9 @@ export async function startSocialMonitor(): Promise<void> {
   setTimeout(() => {
     const runAlphaCycle = async () => {
       if (shouldStop) return;
-      try { await runFreeAlphaCycle(); } catch (err: any) { console.debug(`[social] Free alpha error: ${err.message}`); }
+      if (!isQuietHour()) {
+        try { await runFreeAlphaCycle(); } catch (err: any) { console.debug(`[social] Free alpha error: ${err.message}`); }
+      }
       if (!shouldStop) setTimeout(runAlphaCycle, 5 * 60 * 1000);
     };
     runAlphaCycle();
