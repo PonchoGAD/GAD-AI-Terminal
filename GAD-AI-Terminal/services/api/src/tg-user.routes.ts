@@ -59,20 +59,38 @@ export function registerTgUserRoutes(app: Application) {
         [telegram_id]
       );
 
-      if (!userQ.rows.length || !userQ.rows[0].wallet_address) {
+      const wallet = userQ.rows[0]?.wallet_address ?? null;
+
+      // Check for Stars/USDT subscription even if no Solana wallet linked
+      if (!wallet) {
+        const tgSub = await query<{ plan_slug: string; expires_at: Date }>(
+          `SELECT plan_slug, expires_at FROM subscriptions
+           WHERE wallet_address = 'tg_' || $1 AND status='active' AND expires_at > now()
+           ORDER BY expires_at DESC LIMIT 1`,
+          [telegram_id]
+        );
+        if (tgSub.rows.length) {
+          const sub = tgSub.rows[0];
+          const remainingMs = new Date(sub.expires_at).getTime() - Date.now();
+          return res.json({
+            active: true, walletLinked: false, wallet: null,
+            plan: sub.plan_slug, expiresAt: sub.expires_at,
+            remainingHours: Math.round(Math.max(0, remainingMs / 3_600_000) * 10) / 10,
+            isTrial: sub.plan_slug === 'trial_1d'
+          });
+        }
         return res.json({ active: false, walletLinked: false });
       }
 
-      const wallet = userQ.rows[0].wallet_address;
-
+      // Also check for Stars/USDT subscriptions linked directly by tg_user_id (wallet = 'tg_<id>')
       const subQ = await query<{ plan_slug: string; expires_at: Date; status: string }>(
         `SELECT plan_slug, expires_at, status
          FROM subscriptions
-         WHERE wallet_address = $1
+         WHERE (wallet_address = $1 OR wallet_address = 'tg_' || $2)
            AND status = 'active'
            AND expires_at > now()
          ORDER BY expires_at DESC LIMIT 1`,
-        [wallet]
+        [wallet, telegram_id]
       );
 
       if (!subQ.rows.length) {

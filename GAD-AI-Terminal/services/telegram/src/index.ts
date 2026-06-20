@@ -117,8 +117,8 @@ async function requireSub(chatId: number, telegramId: number): Promise<boolean> 
 
   const payUrl = `${SITE_URL}/pay?tg_id=${telegramId}`;
   const msg = status.walletLinked
-    ? `🔒 *Subscription expired.*\nRenew to continue using GAD AI Terminal.\n\n🧪 1-Day Trial — 0.05 SOL\n⚡ 3-Day Access — 0.1 SOL\n💎 Monthly — 1 SOL / 30 days`
-    : `🔒 *Access Required*\n\nSubscription needed to use this feature.\n\n🧪 1-Day Trial — 0.05 SOL\n⚡ 3-Day Access — 0.1 SOL\n💎 Monthly — 1 SOL / 30 days\n\nConnect Phantom or Solflare on the payment page.`;
+    ? `🔒 *Subscription expired.*\nRenew to continue using GAD AI Terminal.\n\n🧪 1-Day Trial — $5 | 219 ⭐\n⚡ 3-Day Access — $10 | 437 ⭐\n💎 Monthly PRO — $100 | 4,367 ⭐`
+    : `🔒 *Access Required*\n\nSubscription needed to use this feature.\n\n🧪 1-Day Trial — $5 | 219 ⭐\n⚡ 3-Day Access — $10 | 437 ⭐\n💎 Monthly PRO — $100 | 4,367 ⭐\n\nPay with USDT on BSC or Telegram Stars.`;
 
   await send(chatId, msg, {
     reply_markup: { inline_keyboard: [[{ text: '💳 Get Access', url: payUrl }]] }
@@ -263,27 +263,48 @@ bot.onText(/\/help/, (msg) => {
   );
 });
 
+// Stars plan prices (exact calculation: $2.29/100 stars)
+const STARS_PRICES: Record<string, number> = { trial_1d: 219, trial_3d: 437, monthly: 4367 };
+const USD_PRICES:   Record<string, number> = { trial_1d: 5,   trial_3d: 10,  monthly: 100  };
+const PLAN_NAMES:   Record<string, string> = {
+  trial_1d: '1-Day Trial',
+  trial_3d: '3-Day Access',
+  monthly:  'Monthly PRO',
+};
+
 bot.onText(/\/subscribe/, (msg) => guard(msg.chat.id, async () => {
   const tgId   = msg.from?.id ?? msg.chat.id;
   const payUrl = `${SITE_URL}/pay?tg_id=${tgId}`;
   send(msg.chat.id,
     `💳 *GAD AI Terminal — Plans*\n\n` +
-    `🧪 *1-Day Trial* — 0.05 SOL\n` +
-    `  24h · One trial per wallet\n` +
+    `🧪 *1-Day Trial* — $5 USDT | 219 ⭐ Stars\n` +
+    `  24h · One trial per account\n` +
     `  ✅ All analytics, signals, whales\n` +
     `  ✅ Trade journal & risk passport\n\n` +
-    `⚡ *3-Day Access* — 0.1 SOL\n` +
+    `⚡ *3-Day Access* — $10 USDT | 437 ⭐ Stars\n` +
     `  72h · Best for testing the alpha\n` +
     `  ✅ Everything in Trial\n` +
     `  ✅ Trend engine & coin ideas\n\n` +
-    `💎 *Monthly PRO* — 1 SOL / 30 days\n` +
-    `  ✅ Everything above\n` +
+    `💎 *Monthly PRO* — $100 USDT | 4,367 ⭐ Stars\n` +
+    `  30 days · Everything included\n` +
     `  ✅ Bot control (AutoBuy /bot)\n` +
     `  ✅ Portfolio manager\n` +
     `  ✅ Token launcher on Pump.fun\n` +
-    `  ✅ Futures trading module\n\n` +
-    `Payment: Phantom or Solflare → direct to treasury.\nNo middleman. Verified on-chain.`,
-    { reply_markup: { inline_keyboard: [[{ text: '💳 Pay & Get Access', url: payUrl }]] } }
+    `  ✅ Futures + Base + BSC + TON\n\n` +
+    `💳 Pay via *USDT on BSC* (MetaMask/Trust Wallet)\n` +
+    `⭐ Or pay with *Telegram Stars* right here in the bot`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '💳 Pay with USDT (website)', url: payUrl }],
+          [
+            { text: '🧪 Trial 1D ⭐ 219', callback_data: 'stars_plan:trial_1d' },
+            { text: '⚡ Trial 3D ⭐ 437', callback_data: 'stars_plan:trial_3d' },
+          ],
+          [{ text: '💎 Monthly ⭐ 4,367', callback_data: 'stars_plan:monthly' }],
+        ]
+      }
+    }
   );
 }));
 
@@ -532,8 +553,22 @@ bot.on('callback_query', async (query) => {
   if (action === 'subscribe') {
     const payUrl = `${SITE_URL}/pay?tg_id=${tgId}`;
     await send(chatId,
-      `💳 *Subscription Plans*\n\n🧪 1-Day Trial — 0.05 SOL\n⚡ 3-Day Access — 0.1 SOL\n💎 Monthly — 1 SOL / 30 days`,
-      { reply_markup: { inline_keyboard: [[{ text: '💳 Open Payment Page', url: payUrl }]] } }
+      `💳 *GAD AI Terminal — Plans*\n\n` +
+      `🧪 1-Day Trial — $5 USDT | 219 ⭐\n` +
+      `⚡ 3-Day Access — $10 USDT | 437 ⭐\n` +
+      `💎 Monthly PRO — $100 USDT | 4,367 ⭐`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '💳 Pay with USDT (website)', url: payUrl }],
+            [
+              { text: '🧪 Trial 1D ⭐219', callback_data: 'stars_plan:trial_1d' },
+              { text: '⚡ Trial 3D ⭐437', callback_data: 'stars_plan:trial_3d' },
+            ],
+            [{ text: '💎 Monthly ⭐4,367', callback_data: 'stars_plan:monthly' }],
+          ]
+        }
+      }
     );
     return;
   }
@@ -2010,6 +2045,108 @@ bot.onText(/\/polymarkets/, async (msg) => {
     send(msg.chat.id, `🔮 *Top Polymarket Markets:*\n\n${lines.join('\n\n')}`);
   } catch(e: any) {
     send(msg.chat.id, `❌ ${e.message}`);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TELEGRAM STARS PAYMENT
+//  Stars rate: $2.29/100 stars → $5=219, $10=437, $100=4367
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Handle Stars plan selection callbacks (stars_plan:trial_1d etc.)
+bot.on('callback_query', async (query) => {
+  if (!query.data?.startsWith('stars_plan:')) return;
+  const chatId  = query.message?.chat.id;
+  const tgId    = query.from.id;
+  if (!chatId) return;
+
+  const planSlug = query.data.replace('stars_plan:', '');
+  const stars    = STARS_PRICES[planSlug];
+  const usd      = USD_PRICES[planSlug];
+  const planName = PLAN_NAMES[planSlug] ?? planSlug;
+
+  if (!stars) {
+    await bot.answerCallbackQuery(query.id, { text: 'Unknown plan' }).catch(() => {});
+    return;
+  }
+
+  await bot.answerCallbackQuery(query.id).catch(() => {});
+
+  try {
+    await (bot as any).sendInvoice(
+      chatId,
+      `GAD AI Terminal — ${planName}`,
+      `Full access to Solana memecoin analytics, AI scoring, whale tracking, auto-buy, futures trading and more. 30-network coverage: Solana · Base · BSC · TON.`,
+      `pay_${planSlug}`,
+      '',          // empty provider_token = Telegram Stars (XTR)
+      'XTR',
+      [{ label: planName, amount: stars }],
+      {
+        protect_content: false,
+        reply_markup: undefined,
+      }
+    );
+  } catch (e: any) {
+    log('error', `[stars] sendInvoice error for ${planSlug}:`, e.message);
+    await send(chatId, `❌ Could not create invoice: ${e.message}\n\nTry paying via website: ${SITE_URL}/pay?tg_id=${tgId}`);
+  }
+});
+
+// Answer pre_checkout_query — MUST reply within 10 seconds
+bot.on('pre_checkout_query', async (query: any) => {
+  try {
+    await bot.answerPreCheckoutQuery(query.id, true);
+    log('info', `[stars] pre_checkout OK: ${query.invoice_payload} | ${query.total_amount} XTR | user:${query.from.id}`);
+  } catch (e: any) {
+    log('error', '[stars] answerPreCheckoutQuery error:', e.message);
+  }
+});
+
+// Handle successful Stars payment
+bot.on('message', async (msg: any) => {
+  const payment = msg.successful_payment;
+  if (!payment) return;
+
+  const chatId  = msg.chat.id;
+  const userId  = msg.from?.id;
+  if (!userId) return;
+
+  const planSlug = (payment.invoice_payload as string).replace('pay_', '');
+  const planName = PLAN_NAMES[planSlug] ?? planSlug;
+
+  log('info', `[stars] ✅ Payment received: user:${userId} plan:${planSlug} stars:${payment.total_amount} charge:${payment.telegram_payment_charge_id}`);
+
+  try {
+    const res = await apiPost('/subscription/activate-stars', {
+      tg_user_id:          userId,
+      plan_slug:           planSlug,
+      telegram_charge_id:  payment.telegram_payment_charge_id,
+      total_amount:        payment.total_amount,
+      currency:            payment.currency,
+    });
+
+    if (res.success) {
+      const expires = res.subscription?.expires_at
+        ? new Date(res.subscription.expires_at).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC' }) + ' UTC'
+        : '?';
+
+      await send(chatId,
+        `⭐ *Payment Successful!*\n\n` +
+        `✅ Subscription activated: *${planName}*\n` +
+        `📅 Expires: ${expires}\n\n` +
+        `Use /status to check your subscription.\nUse /help to see all available commands.\n\nWAGMI 🚀`
+      );
+    } else {
+      throw new Error('API returned success=false');
+    }
+  } catch (e: any) {
+    log('error', '[stars] Activation error:', e.message);
+    // Don't leave user hanging — money was taken
+    await send(chatId,
+      `⭐ Stars received! But activation had an error.\n` +
+      `Payment ID: \`${payment.telegram_payment_charge_id}\`\n` +
+      `Contact @gadfamilytg and provide this ID.`
+    );
   }
 });
 

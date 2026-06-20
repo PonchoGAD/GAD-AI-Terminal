@@ -1,9 +1,16 @@
 import { Application, Request, Response } from 'express';
 import { query } from '@lib/db';
 import { Connection, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import axios from 'axios';
 
 const SOLANA_RPC      = process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com';
 const TREASURY_WALLET = process.env.TREASURY_WALLET_ADDRESS;
+
+// EVM/BSC USDT payment settings
+const BSC_RPC         = process.env.BSC_RPC || 'https://bsc-dataseed1.binance.org';
+const USDT_BSC        = (process.env.USDT_BSC_CONTRACT || '0x55d398326f99059fF775485246999027B3197955').toLowerCase();
+const TREASURY_EVM    = (process.env.BSC_WALLET_PUBLIC_KEY || '').toLowerCase();
+const TRANSFER_TOPIC  = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
 // Owner wallets that bypass subscription checks (comma-separated in FREE_WALLETS env)
 const FREE_WALLETS = new Set(
@@ -17,6 +24,73 @@ const PLAN_PRICES: Record<string, number> = {
 };
 
 const connection = new Connection(SOLANA_RPC, { commitment: 'confirmed' });
+
+// ─── BSC RPC helper ───────────────────────────────────────────────────────────
+async function bscRpc(method: string, params: any[]): Promise<any> {
+  const { data } = await axios.post(BSC_RPC,
+    { jsonrpc: '2.0', method, params, id: 1 },
+    { timeout: 15000 }
+  );
+  return data.result ?? null;
+}
+
+// ─── Verify USDT (BEP-20) transfer on BSC ────────────────────────────────────
+// BSC USDT (0x55d398...) has 18 decimals (NOT 6 like Ethereum USDT)
+async function verifyUsdtTx(
+  txHash: string,
+  expectedAmountUsd: number
+): Promise<{ ok: boolean; detail?: string; actualAmount?: number }> {
+  const DELAYS = [2000, 4000, 8000, 12000, 16000];
+
+  for (let i = 0; i <= DELAYS.length; i++) {
+    if (i > 0) await new Promise(r => setTimeout(r, DELAYS[i - 1]));
+
+    try {
+      const receipt = await bscRpc('eth_getTransactionReceipt', [txHash]);
+
+      if (!receipt) {
+        if (i < DELAYS.length) continue;
+        return { ok: false, detail: 'Transaction not found. Wait 30s and retry.' };
+      }
+
+      if (receipt.status !== '0x1') {
+        return { ok: false, detail: 'Transaction failed on BSC.' };
+      }
+
+      // Find USDT Transfer log: address=USDT contract, topic[2]=treasury wallet
+      const treasuryPadded = TREASURY_EVM.replace('0x', '').padStart(64, '0');
+      const log = (receipt.logs ?? []).find((l: any) =>
+        l.address?.toLowerCase() === USDT_BSC &&
+        l.topics?.[0] === TRANSFER_TOPIC &&
+        l.topics?.[2]?.toLowerCase() === '0x' + treasuryPadded
+      );
+
+      if (!log) {
+        return { ok: false, detail: 'No USDT transfer to treasury found in this transaction.' };
+      }
+
+      // Amount is in log.data as uint256 with 18 decimals
+      const amountWei = BigInt(log.data);
+      const actualAmount = Number(amountWei) / 1e18;
+
+      if (actualAmount < expectedAmountUsd * 0.99) {
+        return {
+          ok: false,
+          actualAmount,
+          detail: `Received $${actualAmount.toFixed(2)} USDT, expected $${expectedAmountUsd.toFixed(2)}.`
+        };
+      }
+
+      return { ok: true, actualAmount };
+
+    } catch (e: any) {
+      if (i < DELAYS.length) continue;
+      return { ok: false, detail: `BSC RPC error: ${e.message}` };
+    }
+  }
+
+  return { ok: false, detail: 'Max retries exceeded.' };
+}
 
 async function safeRes<T>(res: Response, fn: () => Promise<T>) {
   try { await fn(); }
@@ -251,6 +325,115 @@ export function registerSubscriptionRoutes(app: Application) {
       );
 
       res.json({ success: true, subscription: rows[0] ?? { wallet_address, plan_slug, expires_at: expiresAt } });
+    });
+  });
+
+  /** POST /subscription/verify-usdt — verify BSC USDT transfer and activate subscription */
+  app.post('/subscription/verify-usdt', async (req: Request, res: Response) => {
+    await safeRes(res, async () => {
+      const { tx_hash, tg_user_id, plan_slug } = req.body;
+      if (!tx_hash || !tg_user_id || !plan_slug) {
+        return res.status(400).json({ error: 'tx_hash, tg_user_id and plan_slug are required' });
+      }
+      if (!TREASURY_EVM) {
+        return res.status(500).json({ error: 'BSC_WALLET_PUBLIC_KEY not configured on server.' });
+      }
+
+      const planQ = await query('SELECT * FROM subscription_plans WHERE slug = $1 AND active = true', [plan_slug]);
+      if (!planQ.rows.length) return res.status(404).json({ error: 'Plan not found' });
+      const plan = planQ.rows[0];
+      const priceUsd = Number(plan.price_usd ?? 0);
+      if (!priceUsd) return res.status(500).json({ error: 'Plan has no USD price configured.' });
+
+      // Prevent tx reuse
+      const txExists = await query('SELECT id FROM subscriptions WHERE tx_signature = $1', [tx_hash]);
+      if (txExists.rows.length) return res.status(409).json({ error: 'Transaction already used.' });
+
+      // Virtual wallet for TG-based subscriptions
+      const virtualWallet = `tg_${tg_user_id}`;
+
+      // Prevent trial reuse
+      if (plan_slug.startsWith('trial_')) {
+        const used = await query(
+          'SELECT id FROM subscriptions WHERE wallet_address = $1 AND plan_slug = $2',
+          [virtualWallet, plan_slug]
+        );
+        if (used.rows.length) return res.status(409).json({ error: `Trial "${plan_slug}" already used for this account.` });
+      }
+
+      // Verify on BSC
+      const verification = await verifyUsdtTx(tx_hash, priceUsd);
+      if (!verification.ok) {
+        return res.status(402).json({
+          error: verification.detail ?? 'USDT payment verification failed.',
+          expected: `$${priceUsd} USDT to ${TREASURY_EVM}`,
+          actualAmount: verification.actualAmount,
+          hint: 'Wait 30 seconds after sending USDT, then retry. Ensure you sent on BNB Smart Chain (BSC).'
+        });
+      }
+
+      const expiresAt = new Date(Date.now() + Number(plan.duration_hours) * 3_600_000);
+
+      const { rows } = await query(
+        `INSERT INTO subscriptions
+           (wallet_address, plan_slug, tx_signature, amount_sol, payment_type, status, started_at, expires_at, verified_at)
+         VALUES ($1,$2,$3,0,'usdt_bsc','active',now(),$4,now())
+         RETURNING *`,
+        [virtualWallet, plan_slug, tx_hash, expiresAt]
+      );
+
+      res.json({
+        success: true,
+        subscription: rows[0],
+        message: `Subscription activated: ${plan.name}. Expires ${expiresAt.toISOString()}`
+      });
+    });
+  });
+
+  /** POST /subscription/activate-stars — activate subscription after successful Telegram Stars payment */
+  app.post('/subscription/activate-stars', async (req: Request, res: Response) => {
+    await safeRes(res, async () => {
+      const { tg_user_id, plan_slug, telegram_charge_id, total_amount } = req.body;
+      if (!tg_user_id || !plan_slug || !telegram_charge_id) {
+        return res.status(400).json({ error: 'tg_user_id, plan_slug and telegram_charge_id are required' });
+      }
+
+      const planQ = await query('SELECT * FROM subscription_plans WHERE slug = $1 AND active = true', [plan_slug]);
+      if (!planQ.rows.length) return res.status(404).json({ error: 'Plan not found' });
+      const plan = planQ.rows[0];
+
+      // Prevent duplicate charge
+      const txExists = await query('SELECT id FROM subscriptions WHERE tx_signature = $1', [telegram_charge_id]);
+      if (txExists.rows.length) return res.status(409).json({ error: 'Stars payment already processed.' });
+
+      // Verify Stars amount matches plan
+      const expectedStars = Number(plan.price_stars ?? 0);
+      if (expectedStars > 0 && Number(total_amount) < expectedStars) {
+        return res.status(402).json({
+          error: `Expected ${expectedStars} Stars, received ${total_amount}.`,
+          expected: expectedStars,
+          received: total_amount
+        });
+      }
+
+      const virtualWallet = `tg_${tg_user_id}`;
+      const expiresAt = new Date(Date.now() + Number(plan.duration_hours) * 3_600_000);
+
+      const { rows } = await query(
+        `INSERT INTO subscriptions
+           (wallet_address, plan_slug, tx_signature, amount_sol, payment_type, status, started_at, expires_at, verified_at)
+         VALUES ($1,$2,$3,0,'stars','active',now(),$4,now())
+         RETURNING *`,
+        [virtualWallet, plan_slug, telegram_charge_id, expiresAt]
+      );
+
+      console.info(`[sub] ⭐ Stars payment: tg_${tg_user_id} → ${plan_slug} | ${total_amount} stars | expires ${expiresAt.toISOString()}`);
+
+      res.json({
+        success: true,
+        subscription: rows[0],
+        message: `Subscription activated: ${plan.name}. Expires ${expiresAt.toISOString()}`
+      });
     });
   });
 }
