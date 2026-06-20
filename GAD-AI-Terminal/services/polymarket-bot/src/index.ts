@@ -43,13 +43,13 @@ async function syncMarkets(): Promise<void> {
 // ─── Strategy 1: X/Twitter trend signals (x_trend_signals table) ─────────────
 
 async function processXTrendSignals(): Promise<void> {
-  const { rows } = await query<{ id: number; theme: string; keywords: string; engagement: number }>(
-    `SELECT s.id, s.theme, s.keywords, s.engagement
+  const { rows } = await query<{ id: string; theme: string; keywords: string; engagement: number }>(
+    `SELECT s.id::text AS id, s.theme, s.keywords, s.engagement
      FROM x_trend_signals s
      WHERE s.created_at > NOW() - INTERVAL '90 minutes'
        AND s.engagement >= 5000
        AND NOT EXISTS (
-         SELECT 1 FROM polymarket_signals ps WHERE ps.source_signal_id = s.id
+         SELECT 1 FROM polymarket_signals ps WHERE ps.source_signal_id = s.id::text
        )
      ORDER BY s.engagement DESC LIMIT 5`
   );
@@ -72,20 +72,20 @@ async function processXTrendSignals(): Promise<void> {
 // ─── Strategy 2: GDELT / trend_clusters (second signal source) ───────────────
 
 async function processGdeltSignals(): Promise<void> {
-  const { rows } = await query<{ id: number; cluster_label: string; summary: string }>(
-    `SELECT id, cluster_label, summary
+  const { rows } = await query<{ id: string; main_title: string; summary: string }>(
+    `SELECT id::text AS id, main_title, summary
      FROM trend_clusters
      WHERE created_at > NOW() - INTERVAL '60 minutes'
        AND NOT EXISTS (
          SELECT 1 FROM polymarket_signals ps
-         WHERE ps.news_text LIKE '%' || LEFT(summary, 30) || '%'
+         WHERE ps.source_signal_id = id::text
            AND ps.created_at > NOW() - INTERVAL '60 minutes'
        )
      ORDER BY created_at DESC LIMIT 3`
   );
 
   for (const row of rows) {
-    const newsText = `${row.cluster_label}: ${row.summary}`.slice(0, 400);
+    const newsText = `${row.main_title}: ${row.summary}`.slice(0, 400);
     const scored = await processGdeltSignal(newsText).catch(() => null);
     if (scored) await tryOpenPosition(scored);
   }

@@ -128,7 +128,8 @@ export async function processNewsSignal(
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
      RETURNING id`,
     [match.marketId, match.outcome, entryPrice, score.aiProbability, score.evScore,
-     score.confidence, score.reasoning, source, newsText.slice(0, 500), sourceSignalId]
+     score.confidence, score.reasoning, source, newsText.slice(0, 500),
+     sourceSignalId !== null ? String(sourceSignalId) : null]
   );
 
   return {

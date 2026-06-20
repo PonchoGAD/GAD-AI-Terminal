@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS polymarket_signals (
     reasoning       TEXT,
     news_source     TEXT,
     news_text       TEXT,                      -- theme/keywords from x_trend_signals
-    source_signal_id INTEGER,                  -- x_trend_signals.id (prevent duplicate processing)
+    source_signal_id TEXT,                     -- x_trend_signals.id (UUID cast to text)
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
