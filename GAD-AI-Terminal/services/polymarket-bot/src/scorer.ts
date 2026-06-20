@@ -1,10 +1,40 @@
 import Anthropic from '@anthropic-ai/sdk';
+import axios from 'axios';
 import { query } from '@lib/db';
 import { getMarketsFromDb, Market } from './markets';
 
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const MIN_EV         = Number(process.env.POLYMARKET_MIN_EV           || '0.12');
 const MIN_CONFIDENCE = process.env.POLYMARKET_MIN_CONFIDENCE           || 'MEDIUM'; // HIGH | MEDIUM
+
+// LLM abstraction: Claude Haiku → OpenAI gpt-4o-mini fallback on credit errors
+async function callLLM(userContent: string, maxTokens: number): Promise<string> {
+  // 1. Try Claude Haiku
+  try {
+    const msg = await claude.messages.create({
+      model: 'claude-haiku-4-5-20251001', max_tokens: maxTokens,
+      messages: [{ role: 'user', content: userContent }],
+    });
+    return msg.content[0].type === 'text' ? msg.content[0].text : '';
+  } catch (err: any) {
+    const isCredits = err.status === 400 || (err.message ?? '').toLowerCase().includes('credit');
+    if (!isCredits) throw err; // only fallback on credit errors
+    console.warn('[poly-scorer] Claude credits exhausted — trying OpenAI fallback');
+  }
+
+  // 2. OpenAI gpt-4o-mini fallback
+  const openaiKey = process.env.OPENAI_API_KEY;
+  if (!openaiKey) throw new Error('Anthropic credits exhausted and OPENAI_API_KEY not set');
+
+  const res = await axios.post('https://api.openai.com/v1/chat/completions', {
+    model: 'gpt-4o-mini', max_tokens: maxTokens,
+    messages: [{ role: 'user', content: userContent }],
+  }, {
+    headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
+    timeout: 20000,
+  });
+  return res.data.choices[0]?.message?.content ?? '';
+}
 
 export interface ScoredSignal {
   marketId:      string;
@@ -31,22 +61,15 @@ async function matchNewsToMarket(
     yes: m.priceYes,
   }));
 
-  const resp = await claude.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 200,
-    messages: [{
-      role: 'user',
-      content:
-        `You are a Polymarket analyst. Match this news to the SINGLE most relevant active prediction market.\n\n` +
-        `NEWS: "${newsText.slice(0, 400)}"\n\n` +
-        `MARKETS: ${JSON.stringify(marketList)}\n\n` +
-        `Return ONLY valid JSON (no extra text):\n` +
-        `{"match":true/false,"market_id":"...","affected_outcome":"YES"/"NO","relevance":0-100}\n` +
-        `If no clear match, return {"match":false}`,
-    }],
-  });
+  const prompt =
+    `You are a Polymarket analyst. Match this news to the SINGLE most relevant active prediction market.\n\n` +
+    `NEWS: "${newsText.slice(0, 400)}"\n\n` +
+    `MARKETS: ${JSON.stringify(marketList)}\n\n` +
+    `Return ONLY valid JSON (no extra text):\n` +
+    `{"match":true/false,"market_id":"...","affected_outcome":"YES"/"NO","relevance":0-100}\n` +
+    `If no clear match, return {"match":false}`;
 
-  const text = resp.content[0].type === 'text' ? resp.content[0].text : '';
+  const text = await callLLM(prompt, 200);
   const json = JSON.parse(text.match(/\{[\s\S]*?\}/)?.[0] ?? 'null');
   if (!json?.match || json.relevance < 50) return null;
   return { marketId: json.market_id, outcome: json.affected_outcome, relevance: json.relevance };
@@ -60,26 +83,19 @@ async function scorePosition(
 ): Promise<Omit<ScoredSignal, 'marketId' | 'marketTitle' | 'tokenIdYes' | 'tokenIdNo' | 'outcome' | 'entryPrice'> | null> {
   const currentPrice = outcome === 'YES' ? market.priceYes : market.priceNo;
 
-  const resp = await claude.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 350,
-    messages: [{
-      role: 'user',
-      content:
-        `You are a prediction market EV calculator. Analyze this Polymarket position.\n\n` +
-        `MARKET: "${market.title}"\n` +
-        `CATEGORY: ${market.category}\n` +
-        `NEWS/SIGNAL: "${newsContext.slice(0, 400)}"\n` +
-        `CURRENT PRICE of ${outcome}: $${currentPrice.toFixed(3)} (market implies ${(currentPrice * 100).toFixed(0)}% probability)\n\n` +
-        `EV = (your_estimated_P_YES × $1.00) − current_price_of_${outcome}\n` +
-        `Only trade if EV ≥ ${MIN_EV} AND you are at least MEDIUM confidence.\n` +
-        `Anti-fake-news: if the news refutes/denies/is unverified, do NOT recommend trading.\n\n` +
-        `Return ONLY valid JSON:\n` +
-        `{"ai_prob_yes":0.0-1.0,"recommended":"YES"/"NO"/"HOLD","target_entry":0.01-0.99,"ev":float,"confidence":"HIGH"/"MEDIUM"/"LOW","reasoning":"one sentence"}`,
-    }],
-  });
+  const prompt =
+    `You are a prediction market EV calculator. Analyze this Polymarket position.\n\n` +
+    `MARKET: "${market.title}"\n` +
+    `CATEGORY: ${market.category}\n` +
+    `NEWS/SIGNAL: "${newsContext.slice(0, 400)}"\n` +
+    `CURRENT PRICE of ${outcome}: $${currentPrice.toFixed(3)} (market implies ${(currentPrice * 100).toFixed(0)}% probability)\n\n` +
+    `EV = (your_estimated_P_YES × $1.00) − current_price_of_${outcome}\n` +
+    `Only trade if EV ≥ ${MIN_EV} AND you are at least MEDIUM confidence.\n` +
+    `Anti-fake-news: if the news refutes/denies/is unverified, do NOT recommend trading.\n\n` +
+    `Return ONLY valid JSON:\n` +
+    `{"ai_prob_yes":0.0-1.0,"recommended":"YES"/"NO"/"HOLD","target_entry":0.01-0.99,"ev":float,"confidence":"HIGH"/"MEDIUM"/"LOW","reasoning":"one sentence"}`;
 
-  const text = resp.content[0].type === 'text' ? resp.content[0].text : '';
+  const text = await callLLM(prompt, 350);
   const j = JSON.parse(text.match(/\{[\s\S]*?\}/)?.[0] ?? 'null');
   if (!j || j.recommended === 'HOLD') return null;
   if (j.ev < MIN_EV) return null;
