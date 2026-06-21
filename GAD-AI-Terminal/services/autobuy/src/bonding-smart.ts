@@ -33,10 +33,11 @@ import axios from 'axios';
 import { Connection, Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { query } from '@lib/db';
-import { analyzeDevReputation }  from './dev-profiler';
-import { detectSybilAttack, detectEarlyBundle }      from './sybil-detector';
-import { registerBuy, getConfirmations, hasSmartMoneySignal } from './smart-money-tracker';
-import { sendTxWithFallback }    from './jito-helper';
+import { analyzeDevReputation }   from './dev-profiler';
+import { detectSybilAttack, detectEarlyBundle } from './sybil-detector';
+import { registerBuy, getConfirmations }        from './smart-money-tracker';
+import { sendTxWithFallback }                   from './jito-helper';
+import { checkPumpFunSentiment }                from './social-sentiment';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -204,6 +205,11 @@ async function shouldBuy(state: TokenState): Promise<{ buy: boolean; reason: str
   // ── Social check ──────────────────────────────────────────────────────────
   if (!state.hasTwitter && !state.hasTelegram)
     return skip('no_socials: no Twitter/Telegram');
+
+  // ── Community activity (БЛОК 2): pump.fun reply count ────────────────────
+  const sentiment = await checkPumpFunSentiment(state.mint, 5, 15000);
+  if (!sentiment.active)
+    return skip(`no_community: ${sentiment.reason}`);
 
   // ── Bonding curve progress 25-55% ─────────────────────────────────────────
   const curveProgress = Math.min(100, (state.vSol / GRADUATION_SOL) * 100);
@@ -506,11 +512,11 @@ async function handleTrade(ev: any): Promise<void> {
   const cutoff = now - WINDOW_MS;
   state.events = state.events.filter(e => e.ts >= cutoff);
 
-  // Pre-graduation guard
-  if (vSol > 488 && activePositions.has(mint)) {
+  // Pre-graduation guard: exit at 92% (540/588) to avoid graduation-sniper dump
+  if (vSol > 540 && activePositions.has(mint)) {
     const pos = activePositions.get(mint)!;
-    console.warn(`[bonding-smart] 🎓 Pre-grad exit: ${pos.symbol} vSol=${vSol.toFixed(0)}`);
-    await doSell(mint, pos.symbol, 100, 'pre_grad: vSol > 488', DUMP_SLIPPAGE_BPS);
+    console.warn(`[bonding-smart] 🎓 Pre-grad exit: ${pos.symbol} vSol=${vSol.toFixed(0)} (92% threshold)`);
+    await doSell(mint, pos.symbol, 100, 'pre_grad: vSol > 540 (92%)', DUMP_SLIPPAGE_BPS);
     activePositions.delete(mint);
     return;
   }

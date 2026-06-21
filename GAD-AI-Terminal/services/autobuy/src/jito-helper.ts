@@ -28,7 +28,38 @@ const JITO_TIP_ACCOUNTS = [
   'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY',
 ];
 
-const TIP_SOL = Number(process.env.JITO_TIP_SOL ?? '0.0002');  // 0.0002 SOL tip
+const TIP_SOL_DEFAULT = Number(process.env.JITO_TIP_SOL ?? '0.0002');
+
+// ─── Dynamic Jito tip calculation ────────────────────────────────────────────
+// Polls Jito's official tips endpoint to get the 25th percentile of recent landed tips.
+// This avoids overpaying during quiet periods and underpaying during spam.
+
+let _cachedTip: number | null = null;
+let _tipCacheTs = 0;
+const TIP_CACHE_MS = 30_000;  // refresh every 30s
+
+export async function getOptimalJitoTip(): Promise<number> {
+  if (_cachedTip !== null && Date.now() - _tipCacheTs < TIP_CACHE_MS) return _cachedTip;
+
+  try {
+    const res = await axios.get('https://mainnet.block-engine.jito.wtf/api/v1/tips', { timeout: 4_000 });
+    const tips: any[] = Array.isArray(res.data) ? res.data : [];
+    if (!tips.length) return TIP_SOL_DEFAULT;
+
+    const latest = tips[0];
+    // landed_tips_25th_percentile is in lamports
+    const p25Lamports = Number(latest.landed_tips_25th_percentile ?? TIP_SOL_DEFAULT * 1e9);
+    // Add 5% buffer, clamp to [0.0001, 0.001] SOL
+    const tipSol = Math.min(Math.max((p25Lamports / 1e9) * 1.05, 0.0001), 0.001);
+
+    _cachedTip = tipSol;
+    _tipCacheTs = Date.now();
+    console.debug(`[jito] Dynamic tip: ${tipSol.toFixed(6)} SOL (p25: ${(p25Lamports / 1e9).toFixed(6)})`);
+    return tipSol;
+  } catch {
+    return TIP_SOL_DEFAULT;
+  }
+}
 
 export interface JitoResult {
   ok: boolean;
@@ -54,7 +85,8 @@ export async function sendViaJito(
     // 1. Deserialize the main transaction
     const mainTx = VersionedTransaction.deserialize(txBytes);
 
-    // 2. Build tip transaction
+    // 2. Build tip transaction (dynamic tip)
+    const tipSol    = await getOptimalJitoTip();
     const tipAccount = new PublicKey(
       JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]
     );
@@ -62,7 +94,7 @@ export async function sendViaJito(
     const tipIx = SystemProgram.transfer({
       fromPubkey: payer.publicKey,
       toPubkey:   tipAccount,
-      lamports:   Math.floor(TIP_SOL * 1e9),
+      lamports:   Math.floor(tipSol * 1e9),
     });
     const tipMsg = new TransactionMessage({
       payerKey: payer.publicKey,
