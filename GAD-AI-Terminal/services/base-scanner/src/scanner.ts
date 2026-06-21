@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { query } from '@lib/db';
 import { checkTokenSafety, checkBaseSmartMoney } from '@lib/base';
+import { isBaseTokenImpersonator } from './impersonator-guard';
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 // Adapted from Raydium scanner thresholds (58% WR in FEAR market):
@@ -198,18 +199,12 @@ const TRADEABLE_DEX_IDS = new Set([
   'aerodrome-v2', 'aerodrome',
 ]);
 
-// Symbols that impersonate assets from other chains — honeypot red flag on Base.
-// These tokens have no legitimate reason to be named "SOL", "BNB", etc. on Base network.
-const CHAIN_IMPERSONATORS = new Set([
-  'SOL', 'BNB', 'AVAX', 'MATIC', 'POL', 'TRX', 'XRP', 'ADA', 'DOT',
-  'ATOM', 'SUI', 'APT', 'NEAR', 'FTM', 'ONE', 'ALGO', 'XLM', 'VET',
-  'EOS', 'IOTA', 'THETA', 'ICP', 'FLOW', 'HBAR', 'EGLD',
-]);
-
 // ─── Filter ──────────────────────────────────────────────────────────────────
 function passesFilter(t: BaseToken): string | null {
-  // Block chain impersonators — tokens named after other blockchains are honeypots on Base
-  if (CHAIN_IMPERSONATORS.has(t.symbol.toUpperCase())) {
+  // Anti-Impersonator Guard: blocks tokens with cross-chain names (SOL, BNB, wSOL, cbSOL…)
+  // unless the contract address is a verified official bridge address.
+  // More robust than a hardcoded symbol Set — catches variants like wSOL, SOL-Wrapped, cbSOL, etc.
+  if (isBaseTokenImpersonator(t.symbol, t.contract_address)) {
     return `symbol:${t.symbol} (chain impersonator — not a Base-native asset)`;
   }
   if (t.liquidity_usd < MIN_LIQ)            return `liq:$${t.liquidity_usd.toFixed(0)} < $${MIN_LIQ}`;
