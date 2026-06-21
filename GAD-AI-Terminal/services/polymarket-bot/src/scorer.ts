@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import axios from 'axios';
+import OpenAI from 'openai';
 import { query } from '@lib/db';
 import { getMarketsFromDb, Market } from './markets';
 
@@ -7,10 +7,110 @@ const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const MIN_EV         = Number(process.env.POLYMARKET_MIN_EV           || '0.12');
 const MIN_CONFIDENCE = process.env.POLYMARKET_MIN_CONFIDENCE           || 'MEDIUM'; // HIGH | MEDIUM
 
-// LLM abstraction: Claude Haiku → DeepSeek → OpenAI gpt-4o-mini
-// Falls back on credit exhaustion (status 400) or rate limit (status 429)
-async function callLLM(userContent: string, maxTokens: number): Promise<string> {
-  // 1. Try Claude Haiku
+// Lazy-init OpenAI-compatible clients — Groq/DeepSeek/OpenAI share the same SDK interface
+let _groqClient: OpenAI | null = null;
+let _dsClient: OpenAI | null = null;
+let _oaiClient: OpenAI | null = null;
+
+function groqClient(): OpenAI {
+  if (!_groqClient) _groqClient = new OpenAI({
+    apiKey: process.env.GROQ_API_KEY ?? 'no-key',
+    baseURL: 'https://api.groq.com/openai/v1',
+    timeout: 15000,
+  });
+  return _groqClient;
+}
+function dsClient(): OpenAI {
+  if (!_dsClient) _dsClient = new OpenAI({
+    apiKey: process.env.DEEPSEEK_API_KEY ?? 'no-key',
+    baseURL: 'https://api.deepseek.com/v1',
+    timeout: 25000,
+  });
+  return _dsClient;
+}
+function oaiClient(): OpenAI {
+  if (!_oaiClient) _oaiClient = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY ?? 'no-key',
+    timeout: 20000,
+  });
+  return _oaiClient;
+}
+
+// Groq free tier: 6,000 TPM. Sequential promise chain serializer ensures 5.5s
+// between each call (10.9 calls/min × ~470 tokens = ~5,100 TPM, under 6k limit).
+// .then() is atomic in JS single-thread — no race condition possible.
+let _groqNextAt = 0;
+let _groqChain: Promise<void> = Promise.resolve();
+function acquireGroqToken(): Promise<void> {
+  const token = _groqChain.then(() => {
+    const now = Date.now();
+    const delay = Math.max(0, _groqNextAt - now);
+    _groqNextAt = Math.max(now, _groqNextAt) + 5500;
+    return delay > 0 ? new Promise<void>(r => setTimeout(r, delay)) : undefined;
+  });
+  _groqChain = token;
+  return token;
+}
+
+// ── FREE LLM: Groq → DeepSeek → OpenAI (OpenAI SDK client for all three) ───
+// Used for matchNewsToMarket + scorePosition (many calls per cycle).
+// response_format: json_object eliminates all JSON parse errors.
+async function callLLMFree(userContent: string, maxTokens: number): Promise<string> {
+  // 1. Groq (FREE — TPM rate limited)
+  if (process.env.GROQ_API_KEY) {
+    try {
+      await acquireGroqToken();
+      const res = await groqClient().chat.completions.create({
+        model: 'llama-3.1-8b-instant', max_tokens: maxTokens,
+        response_format: { type: 'json_object' },
+        messages: [{ role: 'user', content: userContent }],
+      });
+      return res.choices[0]?.message?.content ?? '';
+    } catch (err: any) {
+      if (err.status === 429) {
+        await new Promise(r => setTimeout(r, 5000));
+        try {
+          const res2 = await groqClient().chat.completions.create({
+            model: 'llama-3.1-8b-instant', max_tokens: maxTokens,
+            response_format: { type: 'json_object' },
+            messages: [{ role: 'user', content: userContent }],
+          });
+          return res2.choices[0]?.message?.content ?? '';
+        } catch { /* fall through */ }
+      }
+      console.debug(`[poly-scorer] Groq (${err.status ?? err.message?.slice(0,30)}) — trying DeepSeek`);
+    }
+  }
+
+  // 2. DeepSeek (requires balance on platform.deepseek.com)
+  if (process.env.DEEPSEEK_API_KEY) {
+    try {
+      const res = await dsClient().chat.completions.create({
+        model: 'deepseek-chat', max_tokens: maxTokens,
+        response_format: { type: 'json_object' },
+        messages: [{ role: 'user', content: userContent }],
+      });
+      return res.choices[0]?.message?.content ?? '';
+    } catch (err: any) {
+      console.debug(`[poly-scorer] DeepSeek (${err.status ?? err.message?.slice(0,30)}) — trying OpenAI`);
+    }
+  }
+
+  // 3. OpenAI gpt-4o-mini (last resort)
+  if (!process.env.OPENAI_API_KEY) throw new Error('No LLM available — add GROQ_API_KEY or top up DEEPSEEK_API_KEY');
+  const res = await oaiClient().chat.completions.create({
+    model: 'gpt-4o-mini', max_tokens: maxTokens,
+    response_format: { type: 'json_object' },
+    messages: [{ role: 'user', content: userContent }],
+  });
+  return res.choices[0]?.message?.content ?? '';
+}
+
+// ── PREMIUM LLM: Claude → DeepSeek → Groq ───────────────────────────────────
+// Used ONLY for finalTradeValidation() — called once per actual trade entry.
+// Claude provides highest accuracy for the moment that costs real money.
+async function callLLMPremium(userContent: string, maxTokens: number): Promise<string> {
+  // 1a. Claude Haiku 4.5
   try {
     const msg = await claude.messages.create({
       model: 'claude-haiku-4-5-20251001', max_tokens: maxTokens,
@@ -18,42 +118,29 @@ async function callLLM(userContent: string, maxTokens: number): Promise<string> 
     });
     return msg.content[0].type === 'text' ? msg.content[0].text : '';
   } catch (err: any) {
-    const isTransient = err.status === 400 || err.status === 429 || err.status === 529
+    const isTransient = err.status === 400 || err.status === 403 || err.status === 404
+      || err.status === 429 || err.status === 529
       || (err.message ?? '').toLowerCase().includes('credit')
       || (err.message ?? '').toLowerCase().includes('overload');
     if (!isTransient) throw err;
-    console.warn(`[poly-scorer] Claude unavailable (${err.status}) — trying DeepSeek`);
+    console.warn(`[poly-scorer] Claude Haiku 4.5 unavailable (${err.status}) — trying claude-3-5-haiku`);
   }
-
-  // 2. DeepSeek (OpenAI-compatible, cheap fallback)
-  const deepseekKey = process.env.DEEPSEEK_API_KEY;
-  if (deepseekKey) {
-    try {
-      const res = await axios.post('https://api.deepseek.com/v1/chat/completions', {
-        model: 'deepseek-chat', max_tokens: maxTokens,
-        messages: [{ role: 'user', content: userContent }],
-      }, {
-        headers: { Authorization: `Bearer ${deepseekKey}`, 'Content-Type': 'application/json' },
-        timeout: 25000,
-      });
-      return res.data.choices[0]?.message?.content ?? '';
-    } catch (deepErr: any) {
-      console.warn(`[poly-scorer] DeepSeek failed (${deepErr.status ?? deepErr.message}) — trying OpenAI`);
-    }
+  // 1b. Claude 3.5 Haiku
+  try {
+    const msg = await claude.messages.create({
+      model: 'claude-3-5-haiku-20241022', max_tokens: maxTokens,
+      messages: [{ role: 'user', content: userContent }],
+    });
+    return msg.content[0].type === 'text' ? msg.content[0].text : '';
+  } catch (err: any) {
+    const isTransient = err.status === 400 || err.status === 403 || err.status === 404
+      || err.status === 429 || err.status === 529
+      || (err.message ?? '').toLowerCase().includes('credit');
+    if (!isTransient) throw err;
+    console.warn(`[poly-scorer] Claude 3.5 Haiku unavailable (${err.status}) — falling back to free LLM for validation`);
   }
-
-  // 3. OpenAI gpt-4o-mini final fallback
-  const openaiKey = process.env.OPENAI_API_KEY;
-  if (!openaiKey) throw new Error('All LLM providers exhausted (no OPENAI_API_KEY set)');
-
-  const res = await axios.post('https://api.openai.com/v1/chat/completions', {
-    model: 'gpt-4o-mini', max_tokens: maxTokens,
-    messages: [{ role: 'user', content: userContent }],
-  }, {
-    headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' },
-    timeout: 20000,
-  });
-  return res.data.choices[0]?.message?.content ?? '';
+  // Fallback: DeepSeek/Groq if Claude completely unavailable
+  return callLLMFree(userContent, maxTokens);
 }
 
 export interface ScoredSignal {
@@ -74,25 +161,22 @@ async function matchNewsToMarket(
   newsText: string,
   markets: Market[]
 ): Promise<{ marketId: string; outcome: 'YES' | 'NO'; relevance: number } | null> {
-  const marketList = markets.slice(0, 60).map(m => ({
-    id: m.id,
-    q:  m.title,
-    cat: m.category,
-    yes: m.priceYes,
-  }));
+  // Top 10 markets, numeric index as ID to minimize tokens (~470 tokens total vs 1100 with full hashes)
+  const top10 = markets.slice(0, 10);
+  const marketList = top10.map((m, i) => ({ i, q: m.title.slice(0, 60), y: +m.priceYes.toFixed(3) }));
 
   const prompt =
-    `You are a Polymarket analyst. Match this news to the SINGLE most relevant active prediction market.\n\n` +
-    `NEWS: "${newsText.slice(0, 400)}"\n\n` +
-    `MARKETS: ${JSON.stringify(marketList)}\n\n` +
-    `Return ONLY valid JSON (no extra text):\n` +
-    `{"match":true/false,"market_id":"...","affected_outcome":"YES"/"NO","relevance":0-100}\n` +
-    `If no clear match, return {"match":false}`;
+    `Match news to most relevant Polymarket market. Return ONLY JSON.\n` +
+    `NEWS: "${newsText.slice(0, 200)}"\n` +
+    `MARKETS: ${JSON.stringify(marketList)}\n` +
+    `{"match":true/false,"idx":0-9,"outcome":"YES"/"NO","relevance":0-100} or {"match":false}`;
 
-  const text = await callLLM(prompt, 200);
+  const text = await callLLMFree(prompt, 120);
   const json = JSON.parse(text.match(/\{[\s\S]*?\}/)?.[0] ?? 'null');
   if (!json?.match || json.relevance < 50) return null;
-  return { marketId: json.market_id, outcome: json.affected_outcome, relevance: json.relevance };
+  const mkt = top10[Number(json.idx)];
+  if (!mkt) return null;
+  return { marketId: mkt.id, outcome: json.outcome as 'YES' | 'NO', relevance: json.relevance };
 }
 
 // Prompt 2: EV scoring — should we trade?
@@ -104,18 +188,14 @@ async function scorePosition(
   const currentPrice = outcome === 'YES' ? market.priceYes : market.priceNo;
 
   const prompt =
-    `You are a prediction market EV calculator. Analyze this Polymarket position.\n\n` +
-    `MARKET: "${market.title}"\n` +
-    `CATEGORY: ${market.category}\n` +
-    `NEWS/SIGNAL: "${newsContext.slice(0, 400)}"\n` +
-    `CURRENT PRICE of ${outcome}: $${currentPrice.toFixed(3)} (market implies ${(currentPrice * 100).toFixed(0)}% probability)\n\n` +
-    `EV = (your_estimated_P_YES × $1.00) − current_price_of_${outcome}\n` +
-    `Only trade if EV ≥ ${MIN_EV} AND you are at least MEDIUM confidence.\n` +
-    `Anti-fake-news: if the news refutes/denies/is unverified, do NOT recommend trading.\n\n` +
-    `Return ONLY valid JSON:\n` +
-    `{"ai_prob_yes":0.0-1.0,"recommended":"YES"/"NO"/"HOLD","target_entry":0.01-0.99,"ev":float,"confidence":"HIGH"/"MEDIUM"/"LOW","reasoning":"one sentence"}`;
+    `Prediction market EV calculator.\n` +
+    `MARKET: "${market.title.slice(0, 80)}"\n` +
+    `SIGNAL: "${newsContext.slice(0, 200)}"\n` +
+    `BUY ${outcome} at $${currentPrice.toFixed(3)} (market: ${(currentPrice * 100).toFixed(0)}%)\n` +
+    `EV=(p_yes-price_${outcome}). Trade if EV≥${MIN_EV} and confidence MEDIUM+.\n` +
+    `JSON only: {"ai_prob_yes":0-1,"recommended":"YES"/"NO"/"HOLD","ev":float,"confidence":"HIGH"/"MEDIUM"/"LOW","reasoning":"<10 words"}`;
 
-  const text = await callLLM(prompt, 350);
+  const text = await callLLMFree(prompt, 350);
   const j = JSON.parse(text.match(/\{[\s\S]*?\}/)?.[0] ?? 'null');
   if (!j || j.recommended === 'HOLD') return null;
   if (j.ev < MIN_EV) return null;
@@ -157,6 +237,31 @@ export async function processNewsSignal(
   if (!score) return null;
 
   const entryPrice = match.outcome === 'YES' ? market.priceYes : market.priceNo;
+
+  // ── FINAL GATE: Claude validates only when we're about to commit a trade ──
+  // All broad analysis (matchNews + scorePosition) already ran on free LLMs.
+  // Claude is called ONCE per actual trade signal to catch reasoning errors.
+  const finalPrompt =
+    `Prediction market trade validator. A free-tier AI already scored this signal.\n` +
+    `Perform a final sanity check before executing a real-money position.\n\n` +
+    `MARKET: "${market.title}"\n` +
+    `SIGNAL: "${newsText.slice(0, 300)}"\n` +
+    `TRADE: BUY ${match.outcome} at $${entryPrice.toFixed(3)} | AI prob_yes=${score.aiProbability.toFixed(2)} | EV=${score.evScore.toFixed(3)}\n` +
+    `REASONING: ${score.reasoning}\n\n` +
+    `Is this trade logically sound? Any red flags (fake news, reversed causality, stale data)?\n` +
+    `Reply ONLY JSON: {"approve":true/false,"reason":"one sentence"}`;
+  try {
+    const finalText = await callLLMPremium(finalPrompt, 150);
+    const fj = JSON.parse(finalText.match(/\{[\s\S]*?\}/)?.[0] ?? 'null');
+    if (fj && fj.approve === false) {
+      console.info(`[poly-scorer] 🚫 Claude final gate REJECTED: ${fj.reason ?? 'no reason'}`);
+      return null;
+    }
+    if (fj?.approve) console.info(`[poly-scorer] ✅ Claude final gate APPROVED: ${fj.reason ?? ''}`);
+  } catch (e: any) {
+    console.debug(`[poly-scorer] Final gate skipped (${e.message?.slice(0,40)})`);
+    // Non-blocking: if Claude completely unavailable, proceed with free-LLM score
+  }
 
   const { rows } = await query<{ id: number }>(
     `INSERT INTO polymarket_signals

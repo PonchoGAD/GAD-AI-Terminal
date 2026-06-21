@@ -356,5 +356,27 @@ services:
       api:
         condition: service_started
 
+  autobuy-w2:
+    image: gad-ai-terminal-autobuy:latest
+    container_name: gad-ai-autobuy-w2
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      WALLET_PRIVATE_KEY: "${PUMPFUN_WALLET_PRIVATE_KEY}"
+      AUTO_BUY_SOL: "0.01"
+      MAX_AUTO_POSITIONS: "2"
+      DAILY_MAX_SOL: "0.1"
+      RAYDIUM_DRY_RUN: "false"
+      BONDING_SCANNER_ENABLED: "false"
+      BONDING_HOT_ENABLED: "false"
+      SOL_VELOCITY_ENABLED: "false"
+      GRAD_HUNTER_ENABLED: "false"
+      BONDING_SMART_ENABLED: "false"
+    depends_on:
+      api:
+        condition: service_started
+
 volumes:
   postgres-data:
