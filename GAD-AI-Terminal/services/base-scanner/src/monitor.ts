@@ -10,12 +10,26 @@ import axios from 'axios';
 // - Trail at 12% matches Raydium (was 8%)
 // - TP1 at 1.25x (FEAR-conservative like Raydium 1.18-1.30x) → sell 80%
 // - Time limit 2h (Base memes slower to develop than Solana bonding curve)
-const STOP_LOSS_PCT    = Number(process.env.BASE_STOP_LOSS_PCT     || '8');    // 8% (Raydium parity)
-const TRAIL_PCT        = Number(process.env.BASE_TRAIL_PCT         || '12');   // 12% (Raydium parity)
-const EARLY_TRAIL_PCT  = Number(process.env.BASE_EARLY_TRAIL_PCT   || '3');    // activates trail before TP1
-const TIME_LIMIT_SEC   = Number(process.env.BASE_TIME_LIMIT_SEC    || '7200'); // 2h
+const STOP_LOSS_PCT    = Number(process.env.BASE_STOP_LOSS_PCT     || '8');
+const TRAIL_PCT        = Number(process.env.BASE_TRAIL_PCT         || '10');   // 10% (was 12%)
+const EARLY_TRAIL_PCT  = Number(process.env.BASE_EARLY_TRAIL_PCT   || '3');
+const TIME_LIMIT_SEC   = Number(process.env.BASE_TIME_LIMIT_SEC    || '5400'); // 1.5h (was 2h)
 const POLL_INTERVAL_MS = Number(process.env.BASE_POLL_INTERVAL_MS  || '10000');
 const BUY_ETH          = Number(process.env.BASE_BUY_ETH           || '0.001');
+
+let _ethUsdCache: { price: number; ts: number } = { price: 2700, ts: 0 };
+async function getEthPriceUsd(): Promise<number> {
+  if (Date.now() - _ethUsdCache.ts < 5 * 60 * 1000) return _ethUsdCache.price; // 5min cache
+  try {
+    const r = await axios.get(
+      'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd',
+      { timeout: 4000 }
+    );
+    const price = Number(r.data?.ethereum?.usd ?? 2700);
+    _ethUsdCache = { price, ts: Date.now() };
+    return price;
+  } catch { return _ethUsdCache.price; } // return last known on error
+}
 
 // TP levels — Raydium-style: capture most profit early, trail the rest
 // Conservative targets fit current FEAR market (F&G=20)
@@ -111,7 +125,15 @@ async function sellPosition(pos: Position, reason: string, sellPct: number, slip
   const ethReceived = Math.max(0, ethBalAfter - ethBalBefore);
   const isFull = sellPct >= 100 || (tokenBalance - amountToSell) < 100n;
 
-  console.info(`[base-monitor] ${pos.symbol} SELL (${reason}) ${sellPct}% → ${ethReceived.toFixed(5)} ETH tx:${result.tx_hash?.slice(0, 12)}`);
+  const ethUsd  = await getEthPriceUsd();
+  const pnlEth  = ethReceived - (pos.amount_eth * sellPct / 100);
+  const pnlSign = pnlEth >= 0 ? '+' : '';
+  console.info(
+    `[base-monitor] ${pos.symbol} SELL (${reason}) ${sellPct}% → ` +
+    `${ethReceived.toFixed(5)} ETH ($${(ethReceived * ethUsd).toFixed(2)}) | ` +
+    `PnL: ${pnlSign}${pnlEth.toFixed(5)} ETH (${pnlSign}$${(pnlEth * ethUsd).toFixed(2)}) | ` +
+    `tx:${result.tx_hash?.slice(0, 12)}`
+  );
 
   if (isFull) {
     // Include any ETH from prior partial sells in the final stats total

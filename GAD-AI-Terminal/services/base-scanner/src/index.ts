@@ -5,11 +5,13 @@ import { runScanCycle, loadBaseRecentBuys, BaseToken } from './scanner';
 import { startMonitor, getPositionSummary } from './monitor';
 import { registerMoralisStream, handleMoralisWebhook } from './moralis-stream';
 
-const PORT      = Number(process.env.PORT         || '4005');
-const BUY_ETH   = Number(process.env.BASE_BUY_ETH || '0.005');
-const MAX_POS   = Number(process.env.BASE_MAX_POSITIONS || '5');
-const AUTO_BUY  = process.env.BASE_AUTO_BUY !== 'false';
-const WALLET    = process.env.BASE_WALLET_PUBLIC_KEY ?? 'unknown';
+const PORT           = Number(process.env.PORT              || '4005');
+const BUY_ETH        = Number(process.env.BASE_BUY_ETH     || '0.001');  // 0.001 ETH = ~$3.50
+const MAX_POS        = Number(process.env.BASE_MAX_POSITIONS|| '3');
+const AUTO_BUY       = process.env.BASE_AUTO_BUY !== 'false';
+const WALLET         = process.env.BASE_WALLET_PUBLIC_KEY ?? 'unknown';
+// Fixed gas reserve instead of percentage multiplier — covers 2 TX (buy + sell) even during Base fee spikes
+const GAS_RESERVE_ETH = 0.0004; // ~$1.10 at ETH $2700 — safe floor for Base transactions
 
 const app = express();
 app.use(express.json());
@@ -155,8 +157,12 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
   }
 
   const ethBal = await getEthBalance().catch(() => 0);
-  if (ethBal < BUY_ETH * 1.1) {
-    console.warn(`[base-scanner] Insufficient ETH balance: ${ethBal.toFixed(5)} ETH (need ${BUY_ETH})`);
+  if (ethBal < BUY_ETH + GAS_RESERVE_ETH) {
+    console.warn(
+      `[base-scanner] Insufficient balance for trade + gas: ` +
+      `need ${(BUY_ETH + GAS_RESERVE_ETH).toFixed(5)} ETH (${BUY_ETH.toFixed(4)} buy + ${GAS_RESERVE_ETH} gas), ` +
+      `have ${ethBal.toFixed(5)} ETH`
+    );
     return;
   }
 
@@ -196,7 +202,7 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
          (contract_address, symbol, wallet, amount_eth, token_amount, entry_price_eth,
           bought_at, sold_at, dex, fee_tier, tp_index, is_active, trail_high, buy_tx,
           total_sold_eth, sell_reason)
-       VALUES ($1,$2,$3,$4,'0',$6,NOW(),NOW(),$7,$8,0,false,0,$9,0,'HONEYPOT')`,
+       VALUES ($1,$2,$3,$4,'0',$5,NOW(),NOW(),$6,$7,0,false,0,$8,0,'HONEYPOT')`,
       [token.contract_address, token.symbol, WALLET, BUY_ETH, token.price_eth,
        result.dex, result.fee_tier ?? 3000, result.tx_hash]
     );
