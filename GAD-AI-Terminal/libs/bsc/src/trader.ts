@@ -2,10 +2,27 @@ import { ethers } from 'ethers';
 import { getWallet, getProvider } from './provider';
 import { ADDRESSES, PANCAKE_ROUTER_ABI, ERC20_ABI } from './contracts';
 
-const GAS_PRICE_GWEI  = Number(process.env.BSC_GAS_PRICE_GWEI  || '3');
-const GAS_PRICE_FAST  = Number(process.env.BSC_GAS_PRICE_FAST   || '5');
 const GAS_LIMIT_BUY   = BigInt(process.env.BSC_GAS_LIMIT_BUY   || '350000');
 const GAS_LIMIT_SELL  = BigInt(process.env.BSC_GAS_LIMIT_SELL  || '300000');
+// Extra Gwei added on top of network median to skip the sandwich bot queue.
+// Sandwich bots read the mempool and front-run at exactly networkGas+0.1 Gwei.
+// Adding 1.5 Gwei places our TX ahead of the typical sandwich window.
+const SANDWICH_BUMP_GWEI = Number(process.env.BSC_SANDWICH_BUMP_GWEI || '1.5');
+const GAS_FALLBACK_GWEI  = Number(process.env.BSC_GAS_FALLBACK_GWEI  || '4.5');
+
+// Fetch live network gas price and add SANDWICH_BUMP_GWEI to defeat front-runners.
+// Falls back to GAS_FALLBACK_GWEI if RPC is unavailable.
+export async function getBscSecureGasPrice(): Promise<bigint> {
+  try {
+    const feeData    = await getProvider().getFeeData();
+    const networkGas = feeData.gasPrice ?? ethers.parseUnits(String(GAS_FALLBACK_GWEI - SANDWICH_BUMP_GWEI), 'gwei');
+    const secureGas  = networkGas + ethers.parseUnits(String(SANDWICH_BUMP_GWEI), 'gwei');
+    console.debug(`[bsc-gas] network:${ethers.formatUnits(networkGas, 'gwei')}gwei + bump:${SANDWICH_BUMP_GWEI}gwei = ${ethers.formatUnits(secureGas, 'gwei')}gwei`);
+    return secureGas;
+  } catch {
+    return ethers.parseUnits(String(GAS_FALLBACK_GWEI), 'gwei');
+  }
+}
 
 export interface BscTradeResult {
   ok:         boolean;
@@ -41,7 +58,7 @@ export async function buyBscToken(
   const bnbAmountWei = ethers.parseEther(bnbAmountBnb.toString());
   const router       = new ethers.Contract(ADDRESSES.PANCAKESWAP_ROUTER_V2, PANCAKE_ROUTER_ABI, wallet);
   const deadline     = BigInt(Math.floor(Date.now() / 1000) + 1200); // 20 min
-  const gasPrice     = ethers.parseUnits(String(fastGas ? GAS_PRICE_FAST : GAS_PRICE_GWEI), 'gwei');
+  const gasPrice     = await getBscSecureGasPrice();
 
   let amountOutMin: bigint;
   try {
@@ -97,7 +114,7 @@ export async function sellBscToken(
   const provider = getProvider();
   const router   = new ethers.Contract(ADDRESSES.PANCAKESWAP_ROUTER_V2, PANCAKE_ROUTER_ABI, wallet);
   const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200);
-  const gasPrice = ethers.parseUnits(String(fastGas ? GAS_PRICE_FAST : GAS_PRICE_GWEI), 'gwei');
+  const gasPrice = await getBscSecureGasPrice();
 
   // Ensure router is approved to spend tokens
   await ensureAllowance(tokenAddress, ADDRESSES.PANCAKESWAP_ROUTER_V2, tokenAmountWei);

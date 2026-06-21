@@ -6,7 +6,9 @@ const TON_SM_MIN_WEIGHT = Number(process.env.TON_SM_MIN_WEIGHT ?? '2.0');
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 const AUTO_BUY       = process.env.TON_AUTO_BUY       === 'true';
-const BUY_TON        = Number(process.env.TON_BUY_AMOUNT        || '2');
+// 3.5 TON minimum: STON.fi swap = 0.12-0.18 TON gas; at 0.5 TON that's 30-35% fees.
+// 3.5 TON keeps gas overhead <10% of position size.
+const BUY_TON        = Number(process.env.TON_BUY_AMOUNT        || '3.5');
 const MAX_POSITIONS  = Number(process.env.TON_MAX_POSITIONS      || '3');
 const DAILY_MAX_TON  = Number(process.env.TON_DAILY_MAX_TON      || '20');
 const SCAN_INTERVAL  = Number(process.env.TON_SCAN_INTERVAL_SEC  || '60') * 1000;
@@ -100,8 +102,13 @@ export async function runTonScanCycle(): Promise<void> {
         continue;
       }
 
-      // Safety check
+      // Safety check — isSafe blocks blacklisted + unverified tokens (verification='none')
       const safety = await checkJettonSafety(addr);
+      if (!safety.isSafe) {
+        console.info(`${label} 🚨 SKIP ${t.symbol} unsafe: ${safety.flags.join(',')} score:${safety.safe_score}`);
+        skipped.rug++;
+        continue;
+      }
       if (safety.safe_score < MIN_SAFE_SCORE) {
         console.info(`${label} 🚨 SKIP ${t.symbol} safe_score:${safety.safe_score} flags:${safety.flags.join(',')}`);
         skipped.safety++;
@@ -119,8 +126,10 @@ export async function runTonScanCycle(): Promise<void> {
       if (dailySpend + BUY_TON > DAILY_MAX_TON) { skipped.daily++; continue; }
 
       const tonBal = await getTonBalance();
-      if (tonBal < BUY_TON + 0.5) {
-        console.warn(`${label} ⚠️ Low TON balance: ${tonBal.toFixed(3)} TON`);
+      // GAS_RESERVE = 1.0 TON wallet floor: covers 2 sell TXs (2 × 0.15 TON) + buffer
+      const TON_GAS_RESERVE = Number(process.env.TON_GAS_RESERVE || '1.0');
+      if (tonBal < BUY_TON + TON_GAS_RESERVE) {
+        console.warn(`${label} ⚠️ Low TON balance: ${tonBal.toFixed(3)} TON (need ${(BUY_TON + TON_GAS_RESERVE).toFixed(1)})`);
         continue;
       }
 

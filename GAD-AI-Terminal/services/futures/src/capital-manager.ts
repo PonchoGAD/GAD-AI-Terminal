@@ -17,14 +17,18 @@ const TRAIL_PCT       = parseFloat(process.env.FUTURES_TRAIL_PCT      || '0.015'
 const DAILY_STOP_PCT  = parseFloat(process.env.FUTURES_DAILY_STOP_PCT || '0.06'); // 6%
 const MAX_TRADES_DAY  = parseInt(process.env.FUTURES_MAX_TRADES_DAY   || '6', 10);
 
+// FUTURES_PAPER_CAPITAL: virtual starting capital for paper mode.
+// Default $5.10 is too small for Drift (min notional ~$10). Set to ≥$50 for usable paper trading.
+const PAPER_CAPITAL = parseFloat(process.env.FUTURES_PAPER_CAPITAL || '5.10');
+
 export async function getCapitalState(): Promise<CapitalState> {
   const res = await query<any>(
     `SELECT * FROM futures_capital ORDER BY ts DESC LIMIT 1`
   );
   if (!res.rows.length) {
     return {
-      totalUsdc:    5.10,
-      availableUsdc: 5.10,
+      totalUsdc:    PAPER_CAPITAL,
+      availableUsdc: PAPER_CAPITAL,
       inTradeUsdc:  0,
       dailyPnlUsdc: 0,
       totalPnlUsdc: 0,

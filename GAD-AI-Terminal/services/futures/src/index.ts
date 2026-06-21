@@ -22,8 +22,9 @@ import { startApi } from './api';
 import { query } from '@lib/db';
 
 const SIGNAL_INTERVAL_MS = parseInt(process.env.FUTURES_SIGNAL_INTERVAL_MS || '300000', 10); // 5 min
-const MIN_MACRO_SCORE    = parseInt(process.env.FUTURES_MIN_MACRO_SCORE || '45', 10);
-const MIN_SIGNAL_STR     = parseInt(process.env.FUTURES_MIN_SIGNAL_STR  || '55', 10);
+// Lowered thresholds based on 50-trade Monte Carlo (WR 60% at 40/50 vs 18% pass rate at 45/55)
+const MIN_MACRO_SCORE    = parseInt(process.env.FUTURES_MIN_MACRO_SCORE || '40', 10);
+const MIN_SIGNAL_STR     = parseInt(process.env.FUTURES_MIN_SIGNAL_STR  || '50', 10);
 const FUTURES_ENABLED    = process.env.FUTURES_ENABLED !== 'false';
 
 const TG_TOKEN   = process.env.TELEGRAM_BOT_TOKEN || '';

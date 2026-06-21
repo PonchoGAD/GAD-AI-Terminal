@@ -2,18 +2,19 @@ import { query } from '@lib/db';
 import { sellJetton, getJettonBalance, getPoolPrice } from '@lib/ton';
 
 // ─── Config ────────────────────────────────────────────────────────────────────
-const STOP_LOSS_PCT    = Number(process.env.TON_STOP_LOSS_PCT   || '8');
+// SL raised 8→10%, time 30min→10min: TON meme cycles are fast, don't overstay.
+// 5-stage TP → 2-stage: 5 TX × 0.15 TON gas = 0.75 TON wasted; 2 TX = 0.30 TON.
+const STOP_LOSS_PCT    = Number(process.env.TON_STOP_LOSS_PCT   || '10');
 const TRAIL_PCT        = Number(process.env.TON_TRAIL_PCT        || '10');
-const TIME_LIMIT_SEC   = Number(process.env.TON_TIME_LIMIT_SEC  || '1800');
+const TIME_LIMIT_SEC   = Number(process.env.TON_TIME_LIMIT_SEC  || '600');
 const POLL_INTERVAL    = Number(process.env.TON_POLL_INTERVAL_SEC || '15') * 1000;
 
-// 5-stage TP: lock profit fast (TON meme cycles are short)
+// 2-stage TP: aggressive lock on spike, then close.
+// Stage 1: +35% → sell 70% (fast lock captures spike)
+// Stage 2: +80% → sell 100% (close remainder on extension)
 const TP_STAGES = [
-  { multiplier: 1.20, sellPct: 30 },
-  { multiplier: 1.50, sellPct: 30 },
-  { multiplier: 2.00, sellPct: 20 },
-  { multiplier: 3.00, sellPct: 15 },
-  { multiplier: 5.00, sellPct: 5  },
+  { multiplier: 1.35, sellPct: 70  },
+  { multiplier: 1.80, sellPct: 100 },
 ];
 
 interface TonPosition {

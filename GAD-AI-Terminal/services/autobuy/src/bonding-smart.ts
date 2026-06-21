@@ -135,6 +135,8 @@ interface TokenState {
   devScore: number | null;
   // Module 3: smart money confirmations
   smConfirmations: number;
+  // vSol at the moment first SM wallet was observed — used by decay guard
+  smFirstVSol: number | null;
 }
 
 const tokenStates = new Map<string, TokenState>();
@@ -287,6 +289,13 @@ async function shouldBuy(state: TokenState): Promise<{ buy: boolean; reason: str
   // ── Module 3: Smart Money (REQUIRE_SMART_MONEY=true bypasses without SM) ──
   if (REQUIRE_SMART_MONEY && !hasSmSignal)
     return skip(`no_smart_money: only ${smConfirms}/${2} SM confirmations`);
+
+  // ── Decay guard: block if price already moved >MAX_DECAY_PCT from SM entry ─
+  if (state.smFirstVSol) {
+    const decay = checkPriceDecay(state.smFirstVSol, state.vSol);
+    if (!decay.allowed)
+      return skip(`decay_guard: vSol +${decay.decayPct.toFixed(1)}% above SM entry (limit ${MAX_DECAY_PCT}%)`);
+  }
 
   // ── Dev holding check ─────────────────────────────────────────────────────
   const devPct = await getDevHoldingPct(state.mint, state.devWallet);
@@ -492,6 +501,7 @@ async function handleCreate(ev: any): Promise<void> {
     devSolInvested: devSolBuy,
     devScore: null,
     smConfirmations: 0,
+    smFirstVSol: null,
   };
 
   tokenStates.set(mint, state);
@@ -546,7 +556,10 @@ async function handleTrade(ev: any): Promise<void> {
   // Module 3: register smart money buy
   if (isBuy) {
     const smCount = await registerBuy(mint, buyer);
-    if (smCount > 0) state.smConfirmations = smCount;
+    if (smCount > 0) {
+      state.smConfirmations = smCount;
+      if (!state.smFirstVSol) state.smFirstVSol = vSol;
+    }
   }
 
   if (!ENABLED) return;

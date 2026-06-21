@@ -134,3 +134,31 @@ export async function sellJetton(
     return { ok: false, dex: 'stonfi_v1', error: e.message ?? String(e) };
   }
 }
+
+// Verify that at least `minTokens` jettons were received 15s after a buy.
+// TON transactions are async message chains — the buy TX hash alone doesn't confirm receipt.
+// Returns { ok: true } if balance ≥ minTokens, { ok: false } if bounced/failed.
+export async function verifyJettonBalance(
+  jettonAddress: string,
+  minTokens: bigint = 1n,
+  pollMs = 15_000,
+  retries = 3
+): Promise<{ ok: boolean; balance: bigint; error?: string }> {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    await new Promise(r => setTimeout(r, pollMs));
+    try {
+      const balance = await getJettonBalance(jettonAddress);
+      if (balance >= minTokens) {
+        console.info(`[ton-trader] ✅ verifyJettonBalance: balance=${balance} ≥ min=${minTokens}`);
+        return { ok: true, balance };
+      }
+      console.debug(`[ton-trader] verifyJettonBalance attempt ${attempt + 1}: balance=${balance} < min=${minTokens}`);
+    } catch (e: any) {
+      console.warn(`[ton-trader] verifyJettonBalance attempt ${attempt + 1} error: ${e.message}`);
+    }
+  }
+  const finalBalance = await getJettonBalance(jettonAddress).catch(() => 0n);
+  if (finalBalance > 0n) return { ok: true, balance: finalBalance };
+  console.error(`[ton-trader] ❌ verifyJettonBalance: 0 tokens after ${retries} attempts — likely bounced TX`);
+  return { ok: false, balance: 0n, error: 'jetton_not_received' };
+}

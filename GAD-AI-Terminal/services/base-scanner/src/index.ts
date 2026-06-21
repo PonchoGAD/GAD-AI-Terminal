@@ -4,6 +4,7 @@ import { getEthBalance, buyToken, getTokenBalance } from '@lib/base';
 import { runScanCycle, loadBaseRecentBuys, BaseToken } from './scanner';
 import { startMonitor, getPositionSummary } from './monitor';
 import { registerMoralisStream, handleMoralisWebhook } from './moralis-stream';
+import { calculateDynamicSlippage } from './slippage';
 
 const PORT           = Number(process.env.PORT              || '4005');
 const BUY_ETH        = Number(process.env.BASE_BUY_ETH     || '0.001');  // 0.001 ETH = ~$3.50
@@ -178,9 +179,10 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
   }
 
   const smTag = (token.sm_weight ?? 0) >= 2.0 ? ` 🔥SM(w${token.sm_weight})` : '';
-  console.info(`[base-scanner] 🛒 Buying ${token.symbol} ${BUY_ETH} ETH | liq:$${token.liquidity_usd.toFixed(0)} score:${token.safe_score} dex:${token.dex_id}${smTag}`);
+  const dynSlippage = calculateDynamicSlippage(token.volume_5m ?? 0, token.liquidity_usd);
+  console.info(`[base-scanner] 🛒 Buying ${token.symbol} ${BUY_ETH} ETH | liq:$${token.liquidity_usd.toFixed(0)} score:${token.safe_score} dex:${token.dex_id} slip:${dynSlippage}%${smTag}`);
 
-  const result = await buyToken(token.contract_address, BUY_ETH);
+  const result = await buyToken(token.contract_address, BUY_ETH, dynSlippage);
 
   if (!result.ok) {
     // Blacklist this token for 2h — simulation or execution failed

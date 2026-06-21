@@ -212,7 +212,7 @@ function simulateTrade(sc: TokenScenario): TradeResult {
 
 // ─── Run simulation ───────────────────────────────────────────────────────────
 
-const NUM_TRADES = 30;
+const NUM_TRADES = 50;
 const trades: TradeResult[] = [];
 
 // Generate candidate pool (need more candidates since many get filtered)
