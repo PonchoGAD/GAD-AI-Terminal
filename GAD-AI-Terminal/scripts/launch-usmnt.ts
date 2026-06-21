@@ -14,7 +14,7 @@ import { AnchorProvider } from '@coral-xyz/anchor';
 import NodeWallet from '@coral-xyz/anchor/dist/cjs/nodewallet';
 dotenv.config();
 
-const SOLANA_RPC     = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.solana.com';
+const SOLANA_ RPC     = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.solana.com';
 const MAIN_WALLET_PK = process.env.WALLET_PRIVATE_KEY!;
 const PUMP_WALLET_PK = process.env.PUMPFUN_WALLET_PRIVATE_KEY!;
 const PINATA_JWT     = process.env.PINATA_JWT!;

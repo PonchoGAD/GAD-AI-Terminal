@@ -3,12 +3,15 @@ export declare const ADDRESSES: {
     USDC: string;
     UNISWAP_V3_ROUTER: string;
     UNISWAP_V3_QUOTER: string;
+    UNISWAP_V2_ROUTER: string;
+    UNISWAP_V2_FACTORY: string;
     AERODROME_ROUTER: string;
     AERODROME_FACTORY: string;
 };
 export declare const UNISWAP_V3_ROUTER_ABI: string[];
 export declare const UNISWAP_V3_QUOTER_ABI: string[];
 export declare const AERODROME_ROUTER_ABI: string[];
+export declare const UNISWAP_V2_ROUTER_ABI: string[];
 export declare const ERC20_ABI: string[];
 export declare const FEE_TIERS: {
     LOW: number;

@@ -34,27 +34,23 @@ export interface PriceResult {
 }
 export declare const SELL_STAGES: readonly [{
     readonly stage: 1;
-    readonly multiplier: 4;
-    readonly sellPct: 75;
+    readonly multiplier: 1.05;
+    readonly sellPct: 50;
 }, {
     readonly stage: 2;
-    readonly multiplier: 7;
-    readonly sellPct: 75;
+    readonly multiplier: 1.15;
+    readonly sellPct: 50;
 }, {
     readonly stage: 3;
-    readonly multiplier: 11;
-    readonly sellPct: 75;
+    readonly multiplier: 3;
+    readonly sellPct: 50;
 }, {
     readonly stage: 4;
-    readonly multiplier: 16;
-    readonly sellPct: 75;
+    readonly multiplier: 7;
+    readonly sellPct: 50;
 }, {
     readonly stage: 5;
-    readonly multiplier: 21;
-    readonly sellPct: 75;
-}, {
-    readonly stage: 6;
-    readonly multiplier: 31;
+    readonly multiplier: 15;
     readonly sellPct: 100;
 }];
 export declare function loadKeypairFromString(raw: string): Keypair;

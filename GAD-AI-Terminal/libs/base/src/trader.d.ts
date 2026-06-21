@@ -8,6 +8,6 @@ export interface TradeResult {
     error?: string;
 }
 export declare function buyToken(tokenAddress: string, ethAmountEth: number, slippagePct?: number): Promise<TradeResult>;
-export declare function sellToken(tokenAddress: string, tokenAmountWei: bigint, dex: 'uniswap_v3' | 'aerodrome', feeTier?: number, slippagePct?: number): Promise<TradeResult>;
+export declare function sellToken(tokenAddress: string, tokenAmountWei: bigint, dex: 'uniswap_v3' | 'uniswap_v2' | 'aerodrome', feeTier?: number, slippagePct?: number): Promise<TradeResult>;
 export declare function getTokenBalance(tokenAddress: string): Promise<bigint>;
 export declare function getEthBalance(): Promise<number>;

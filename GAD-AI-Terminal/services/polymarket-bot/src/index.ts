@@ -6,6 +6,7 @@ import { processNewsSignal, processGdeltSignal } from './scorer';
 import { openPosition } from './trader';
 import { startMonitor } from './monitor';
 import { fetchRssHeadlines } from './rss-sync';
+import { getWikipediaPageviews, searchGdeltNews, extractEntitiesFromMarket, getUSMacroSignal } from './data-sources';
 
 const PORT         = Number(process.env.PORT                   || '4009');
 const DRY_RUN      = process.env.POLYMARKET_DRY_RUN            !== 'false';
@@ -114,7 +115,58 @@ async function processRssSignals(): Promise<void> {
   }
 }
 
-// ─── Strategy 4: Volume spike detection ──────────────────────────────────────
+// ─── Strategy 4: Wikipedia pageview spikes ───────────────────────────────────
+// Detects sudden public interest surges in market-related entities.
+// A +50% spike in Wikipedia views signals rising real-world attention.
+
+async function processWikipediaSignals(): Promise<void> {
+  const markets = await getMarketsFromDb();
+  if (!markets.length) return;
+
+  for (const market of markets.slice(0, 10)) {
+    const entities = extractEntitiesFromMarket(market.title);
+    for (const entity of entities) {
+      const { spike, trend } = await getWikipediaPageviews(entity, 7);
+      if (!spike) continue;
+      const newsText =
+        `Wikipedia interest surge: "${entity}" +${(trend * 100).toFixed(0)}% views in last 3 days. ` +
+        `Related market: "${market.title}"`;
+      const scored = await processNewsSignal(newsText, 'wikipedia_spike').catch(() => null);
+      if (scored) { await tryOpenPosition(scored); return; }
+    }
+  }
+}
+
+// ─── Strategy 5: GDELT v2 direct search for active market keywords ───────────
+// Searches GDELT for fresh articles matching top market titles directly.
+// Complements trend_clusters with targeted per-market keyword queries.
+
+async function processGdeltSearchSignals(): Promise<void> {
+  const markets = await getMarketsFromDb();
+  if (!markets.length) return;
+
+  for (const market of markets.slice(0, 5)) {
+    // Use first 40 chars of title as search keyword
+    const keyword = market.title.replace(/['"?!]/g, '').slice(0, 40);
+    const headlines = await searchGdeltNews(keyword, 3);
+    for (const headline of headlines) {
+      const scored = await processNewsSignal(headline, 'gdelt_search').catch(() => null);
+      if (scored) { await tryOpenPosition(scored); return; }
+    }
+  }
+}
+
+// ─── Strategy 6: US Macro snapshot ───────────────────────────────────────────
+// Treasury interest rate data — relevant for "Will Fed rate exceed X%?" markets.
+
+async function processUSMacroSignal(): Promise<void> {
+  const macroText = await getUSMacroSignal().catch(() => null);
+  if (!macroText) return;
+  const scored = await processNewsSignal(macroText, 'us_fiscal_data').catch(() => null);
+  if (scored) await tryOpenPosition(scored);
+}
+
+// ─── Strategy 7: Volume spike detection ──────────────────────────────────────
 // Markets where trading volume spiked recently (updated from Gamma API)
 // may have new information not yet fully reflected in price
 
@@ -288,18 +340,25 @@ async function start(): Promise<void> {
   // Market sync every N minutes
   setInterval(() => syncMarkets().catch(console.error), SYNC_MIN * 60 * 1000);
 
-  // Signal checks every 2 minutes (X trends + GDELT)
+  // Signal checks every 8 minutes (X trends + GDELT clusters + GDELT search)
   setInterval(async () => {
     await processXTrendSignals().catch(e => console.error('[poly] X signal error:', e.message));
     await processGdeltSignals().catch(e => console.error('[poly] GDELT signal error:', e.message));
+    await processGdeltSearchSignals().catch(e => console.error('[poly] GDELT search error:', e.message));
     await checkDryRunProgress().catch(console.error);
   }, CHECK_MIN * 60 * 1000);
 
-  // RSS news check every 10 minutes (CoinDesk/CoinTelegraph/Reuters/BBC — free, no API key)
+  // RSS news check every 10 minutes
   setInterval(() => processRssSignals().catch(e => console.error('[poly] RSS signal error:', e.message)), 10 * 60 * 1000);
 
   // Volume spike check every 30 minutes
   setInterval(() => processVolumeSpikes().catch(console.error), 30 * 60 * 1000);
+
+  // Wikipedia pageview spikes every 20 minutes (external API, no rate limit concerns)
+  setInterval(() => processWikipediaSignals().catch(e => console.error('[poly] Wiki signal error:', e.message)), 20 * 60 * 1000);
+
+  // US Macro snapshot every 60 minutes (Treasury data updates daily, no need to poll fast)
+  setInterval(() => processUSMacroSignal().catch(console.error), 60 * 60 * 1000);
 
   // Start position monitor
   startMonitor();
@@ -308,7 +367,9 @@ async function start(): Promise<void> {
   setTimeout(async () => {
     await processXTrendSignals().catch(console.error);
     await processGdeltSignals().catch(console.error);
+    await processGdeltSearchSignals().catch(console.error);
     await processRssSignals().catch(console.error);
+    await processUSMacroSignal().catch(console.error);
   }, 60 * 1000);
 
   console.info('[poly] Scheduler started');

@@ -1,5 +1,5 @@
 export interface QuoteResult {
-    dex: 'uniswap_v3' | 'aerodrome';
+    dex: 'uniswap_v3' | 'uniswap_v2' | 'aerodrome';
     amountOut: bigint;
     amountOutMin: bigint;
     fee: number;

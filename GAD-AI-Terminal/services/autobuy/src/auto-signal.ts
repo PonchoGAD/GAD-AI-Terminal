@@ -837,6 +837,51 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     console.debug(`[raydium-scan] GeckoTerminal newest error: ${e.message?.slice(0, 40)}`);
   }
 
+  // Source 7: DexScreener new Solana pairs sorted by pairCreatedAt DESC.
+  // Targets tokens listed in last 0.5–12h, before they appear in volume-sorted endpoints.
+  // Complements Sources 0–6 which are mostly volume/momentum-sorted (biased toward established tokens).
+  try {
+    const nowMs = Date.now();
+    const maxAgeMs = 12 * 3600 * 1000; // 12h cap
+    const minAgeMs = 30 * 60 * 1000;   // 30min — skip instant rugs
+
+    // DexScreener search: query "raydium" on Solana sorted by recent activity
+    const queries7 = ['raydium memecoin', 'raydium meme new', 'new sol raydium'];
+    for (const q of queries7) {
+      try {
+        const r = await axios.get(
+          `${DEXSCREENER_BASE}/search?q=${encodeURIComponent(q)}`,
+          { timeout: 6_000 }
+        );
+        const pairs: any[] = r.data?.pairs ?? [];
+        // Sort by pairCreatedAt descending (most recent first)
+        const sorted = pairs
+          .filter((p: any) => {
+            if (p.chainId !== 'solana') return false;
+            if (!JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')) return false;
+            const created = p.pairCreatedAt ? Number(p.pairCreatedAt) : 0;
+            if (!created) return false;
+            const ageMs = nowMs - created;
+            return ageMs >= minAgeMs && ageMs <= maxAgeMs;
+          })
+          .sort((a: any, b: any) => Number(b.pairCreatedAt) - Number(a.pairCreatedAt));
+
+        let added = 0;
+        for (const p of sorted) {
+          const mint = p.baseToken?.address;
+          if (!mint || seen.has(mint)) continue;
+          seen.add(mint);
+          results.push(p);
+          added++;
+        }
+        if (added > 0) console.debug(`[raydium-scan] DS new-pairs "${q}": ${added} fresh Raydium (<12h)`);
+        await new Promise(r => setTimeout(r, 200));
+      } catch { /* ignore per-query errors */ }
+    }
+  } catch (e: any) {
+    console.debug(`[raydium-scan] DS new-pairs Source7 error: ${e.message?.slice(0, 40)}`);
+  }
+
   const dxCount = results.length - raydiumDexCount;
   console.debug(`[raydium-scan] total: ${results.length} unique candidates (${raydiumDexCount} raydium-dex + ${dxCount} dx)`);
   return results;
