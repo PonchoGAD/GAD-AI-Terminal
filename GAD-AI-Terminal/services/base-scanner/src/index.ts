@@ -177,7 +177,8 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
     return;
   }
 
-  console.info(`[base-scanner] 🛒 Buying ${token.symbol} ${BUY_ETH} ETH | liq:$${token.liquidity_usd.toFixed(0)} score:${token.safe_score} dex:${token.dex_id}`);
+  const smTag = (token.sm_weight ?? 0) >= 2.0 ? ` 🔥SM(w${token.sm_weight})` : '';
+  console.info(`[base-scanner] 🛒 Buying ${token.symbol} ${BUY_ETH} ETH | liq:$${token.liquidity_usd.toFixed(0)} score:${token.safe_score} dex:${token.dex_id}${smTag}`);
 
   const result = await buyToken(token.contract_address, BUY_ETH);
 

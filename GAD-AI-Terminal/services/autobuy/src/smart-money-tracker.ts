@@ -1,125 +1,198 @@
 /**
- * Smart Money Tracker — real-time monitoring of profitable wallets.
+ * Smart Money Tracker v2 — weighted signal detection for Solana pump.fun.
  *
- * Maintains an in-memory registry of "smart money" wallet purchases.
- * When ≥2 smart money wallets buy the same token within 120s → BUY signal.
+ * Architecture:
+ *  - Wallet weights stored in DB (smart_money_wallets.reliability_weight)
+ *  - Standard wallet = 1.0, proven sniper (top-10) = 2.0, elite (top-3 + multi-token) = 3.0
+ *  - Signal triggers when total weight ≥ TRIGGER_THRESHOLD (default 2.5)
  *
- * Smart money list sourced from:
- *  1. SMART_MONEY_WALLETS env var (comma-separated, for quick config)
- *  2. smart_money_wallets DB table (for managed lists)
+ * Threshold logic:
+ *   Elite (3.0) alone  → triggers (3.0 ≥ 2.5)
+ *   Two standard (2.0) → triggers (2×1.0 ≥ 2.5? No → need 3 standard or 1 proven+1 standard)
+ *   Proven + Standard  → triggers (2.0+1.0 = 3.0 ≥ 2.5)
+ *   Three standard     → triggers (3×1.0 = 3.0 ≥ 2.5)
  *
- * Win rate uplift observed in open-source sniper research:
- *  0 SM wallets → baseline WR
- *  1 SM wallet  → +10-15% WR uplift
- *  2+ SM wallets → +25-30% WR uplift
+ * Reduces false positives vs v1 (count-only) — weak co-entry of 2 standard wallets
+ * is no longer enough; needs >= 2.5 weighted confidence.
  */
 
 import { query } from '@lib/db';
 
-// Window for smart money co-buy detection
-const CONFIRMATION_WINDOW_MS = Number(process.env.SMART_MONEY_WINDOW_MS ?? '120000');  // 120s
-const MIN_SM_CONFIRMATIONS   = Number(process.env.SMART_MONEY_MIN_CONFIRM ?? '2');
+const CONFIRMATION_WINDOW_MS = Number(process.env.SMART_MONEY_WINDOW_MS     ?? '120000');
+const TRIGGER_THRESHOLD      = Number(process.env.SMART_MONEY_THRESHOLD     ?? '2.5');
+const REFRESH_MS             = 15 * 60 * 1000;  // 15 min
 
-// In-memory: mint → Map<smWallet, timestamp>
-const buyRegistry = new Map<string, Map<string, number>>();
+// ─── Wallet registry (weight-aware) ─────────────────────────────────────────
 
-// Smart money wallet list — loaded once at startup, refreshed every 15 min
-let smartMoneySet = new Set<string>();
-let lastRefresh = 0;
-const REFRESH_MS = 15 * 60 * 1000;
+interface SmWallet {
+  address: string;
+  weight:  number;
+}
+
+// in-memory weight map: address → weight
+let smartMoneyMap = new Map<string, number>();
+let lastRefresh   = 0;
 
 async function refreshSmartMoneyList(): Promise<void> {
   if (Date.now() - lastRefresh < REFRESH_MS) return;
   lastRefresh = Date.now();
 
-  const fresh = new Set<string>();
+  const fresh = new Map<string, number>();
 
-  // 1. From env (always available)
-  const fromEnv = process.env.SMART_MONEY_WALLETS ?? '';
-  for (const addr of fromEnv.split(',').map(a => a.trim()).filter(Boolean)) {
-    fresh.add(addr);
+  // 1. From env (flat list, default weight 1.0)
+  for (const addr of (process.env.SMART_MONEY_WALLETS ?? '').split(',').map(a => a.trim()).filter(Boolean)) {
+    fresh.set(addr, 1.0);
   }
 
-  // 2. From DB table (if it exists)
+  // 2. From DB (includes reliability_weight)
   try {
-    const { rows } = await query<{ wallet_address: string }>(
-      `SELECT wallet_address FROM smart_money_wallets WHERE active = true LIMIT 200`
+    const { rows } = await query<{ wallet_address: string; reliability_weight: string }>(
+      `SELECT wallet_address, reliability_weight
+         FROM smart_money_wallets
+        WHERE active = true AND (network = 'solana' OR network IS NULL)
+        LIMIT 500`
     );
-    for (const row of rows) fresh.add(row.wallet_address);
+    for (const row of rows) {
+      const w = Number(row.reliability_weight ?? 1.0);
+      fresh.set(row.wallet_address, w);
+    }
   } catch {
-    // Table may not exist yet — env-only mode is fine
+    // Table may not have network column yet (pre-migration) — fallback to simple query
+    try {
+      const { rows } = await query<{ wallet_address: string }>(
+        `SELECT wallet_address FROM smart_money_wallets WHERE active = true LIMIT 500`
+      );
+      for (const row of rows) {
+        if (!fresh.has(row.wallet_address)) fresh.set(row.wallet_address, 1.0);
+      }
+    } catch { /* env-only mode */ }
   }
 
-  if (fresh.size !== smartMoneySet.size) {
-    console.info(`[smart-money] Loaded ${fresh.size} smart money wallets`);
+  if (fresh.size !== smartMoneyMap.size) {
+    console.info(`[smart-money] Loaded ${fresh.size} wallets (weighted)`);
   }
-  smartMoneySet = fresh;
+  smartMoneyMap = fresh;
 }
 
+// ─── Active signal registry ───────────────────────────────────────────────────
+
+interface ActiveSignal {
+  wallet:    string;
+  weight:    number;
+  timestamp: number;
+}
+
+// mint → [signals within window]
+const activeSignals = new Map<string, ActiveSignal[]>();
+
+function getValidSignals(mint: string): ActiveSignal[] {
+  const now = Date.now();
+  const signals = (activeSignals.get(mint) ?? []).filter(s => now - s.timestamp <= CONFIRMATION_WINDOW_MS);
+  activeSignals.set(mint, signals);
+  return signals;
+}
+
+function getTotalWeight(signals: ActiveSignal[]): number {
+  return signals.reduce((sum, s) => sum + s.weight, 0);
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
 /**
- * Called on every buy event from PumpPortal WebSocket.
- * Returns the number of SM confirmations for this mint (including this one).
+ * Register a buy event. Returns current SM confirmation count (v1 compat).
+ * Also updates weighted signal registry.
  */
 export async function registerBuy(mint: string, buyer: string): Promise<number> {
   await refreshSmartMoneyList();
 
-  if (!smartMoneySet.has(buyer)) return 0;
+  const weight = smartMoneyMap.get(buyer);
+  if (weight === undefined) return 0;  // not a SM wallet
 
   const now = Date.now();
+  const signals = getValidSignals(mint);
 
-  // Init registry for this mint
-  if (!buyRegistry.has(mint)) {
-    buyRegistry.set(mint, new Map());
-  }
-  const mintMap = buyRegistry.get(mint)!;
-
-  // Add this SM wallet's buy
-  mintMap.set(buyer, now);
-
-  // Prune expired entries (outside confirmation window)
-  for (const [wallet, ts] of mintMap) {
-    if (now - ts > CONFIRMATION_WINDOW_MS) mintMap.delete(wallet);
+  // Avoid duplicate from same wallet within window
+  if (!signals.some(s => s.wallet === buyer)) {
+    signals.push({ wallet: buyer, weight, timestamp: now });
+    activeSignals.set(mint, signals);
   }
 
-  const confirmations = mintMap.size;
+  const totalWeight = getTotalWeight(signals);
+  const count       = signals.length;
 
-  if (confirmations >= MIN_SM_CONFIRMATIONS) {
-    const wallets = Array.from(mintMap.keys()).map(w => w.slice(0, 8)).join(', ');
-    console.info(`[smart-money] 🔥 ${confirmations} confirmations on ${mint.slice(0, 8)} — wallets: ${wallets}`);
-  } else if (confirmations === 1) {
-    console.debug(`[smart-money] 👀 SM wallet ${buyer.slice(0, 8)} entered ${mint.slice(0, 8)}`);
+  if (totalWeight >= TRIGGER_THRESHOLD) {
+    const wallets = signals.map(s => `${s.wallet.slice(0, 6)}(w${s.weight})`).join(', ');
+    console.info(`[smart-money] 🔥 Weight ${totalWeight.toFixed(1)}/${TRIGGER_THRESHOLD} on ${mint.slice(0, 8)} — ${wallets}`);
+  } else if (count === 1) {
+    console.debug(`[smart-money] 👀 SM w${weight} ${buyer.slice(0, 8)} → ${mint.slice(0, 8)}`);
   }
 
-  return confirmations;
-}
-
-/** Get current SM confirmation count for a mint (0 if none or expired). */
-export function getConfirmations(mint: string): number {
-  const mintMap = buyRegistry.get(mint);
-  if (!mintMap) return 0;
-  const now = Date.now();
-  let count = 0;
-  for (const [, ts] of mintMap) {
-    if (now - ts <= CONFIRMATION_WINDOW_MS) count++;
-  }
   return count;
 }
 
-/** True if this mint has ≥ MIN_SM_CONFIRMATIONS smart money buys within window. */
-export function hasSmartMoneySignal(mint: string): boolean {
-  return getConfirmations(mint) >= MIN_SM_CONFIRMATIONS;
+/**
+ * БЛОК 2.2: Weighted signal check.
+ * Returns true if total weight of SM buys within window ≥ TRIGGER_THRESHOLD.
+ * Use this instead of getConfirmations() for production trading decisions.
+ */
+export async function processSmartMoneyBuy(mint: string, buyerWallet: string): Promise<boolean> {
+  await refreshSmartMoneyList();
+
+  const weight = smartMoneyMap.get(buyerWallet);
+  if (weight === undefined) return false;
+
+  const now = Date.now();
+  const signals = getValidSignals(mint);
+
+  if (!signals.some(s => s.wallet === buyerWallet)) {
+    signals.push({ wallet: buyerWallet, weight, timestamp: now });
+    activeSignals.set(mint, signals);
+  }
+
+  const totalWeight = getTotalWeight(signals);
+
+  if (totalWeight >= TRIGGER_THRESHOLD) {
+    console.info(`[smart-money-v3] 🎯 Threshold passed for ${mint.slice(0, 8)}. Total weight: ${totalWeight.toFixed(1)}`);
+
+    // Update signal count in DB (non-blocking)
+    query(
+      `UPDATE smart_money_wallets SET total_signals = total_signals + 1, last_signal_at = now()
+        WHERE wallet_address = $1`,
+      [buyerWallet]
+    ).catch(() => {});
+
+    return true;
+  }
+
+  return false;
 }
 
-/** Clean up old mint entries (call periodically to prevent memory leak). */
+/** Get current SM confirmation count (backward compat with v1). */
+export function getConfirmations(mint: string): number {
+  return getValidSignals(mint).length;
+}
+
+/** Get total weight of SM signals for a mint. */
+export function getSignalWeight(mint: string): number {
+  return getTotalWeight(getValidSignals(mint));
+}
+
+/** True if weight ≥ TRIGGER_THRESHOLD (recommended over getConfirmations). */
+export function hasSmartMoneySignal(mint: string): boolean {
+  return getSignalWeight(mint) >= TRIGGER_THRESHOLD;
+}
+
+/** Legacy: true if ≥ 2 SM confirmations (v1 compat). */
+export function hasSmartMoneyCount(mint: string, minCount = 2): boolean {
+  return getConfirmations(mint) >= minCount;
+}
+
+/** Prune expired entries. */
 export function pruneRegistry(): void {
-  const now = Date.now();
-  for (const [mint, mintMap] of buyRegistry) {
-    for (const [wallet, ts] of mintMap) {
-      if (now - ts > CONFIRMATION_WINDOW_MS) mintMap.delete(wallet);
-    }
-    if (mintMap.size === 0) buyRegistry.delete(mint);
+  for (const mint of activeSignals.keys()) {
+    getValidSignals(mint);  // side-effect: prunes and updates
+    if ((activeSignals.get(mint) ?? []).length === 0) activeSignals.delete(mint);
   }
 }
 
-// Periodic prune every 5 minutes
 setInterval(pruneRegistry, 5 * 60 * 1000);

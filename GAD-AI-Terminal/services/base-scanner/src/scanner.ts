@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { query } from '@lib/db';
-import { checkTokenSafety } from '@lib/base';
+import { checkTokenSafety, checkBaseSmartMoney } from '@lib/base';
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 // Adapted from Raydium scanner thresholds (58% WR in FEAR market):
@@ -22,6 +22,8 @@ const MIN_SAFE_SCORE = Number(process.env.BASE_MIN_SAFE_SCORE     || '35');
 const MIN_BUYS_H1    = Number(process.env.BASE_MIN_BUYS_H1        || '5');    // min unique buys in last hour
 const SCAN_INTERVAL = Number(process.env.BASE_SCAN_INTERVAL_SEC  || '30') * 1000;
 
+const BASE_REQUIRE_SM = process.env.BASE_REQUIRE_SM_SIGNAL === 'true';  // if true: skip tokens without SM signal
+
 export interface BaseToken {
   contract_address: string;
   symbol:           string;
@@ -42,6 +44,8 @@ export interface BaseToken {
   is_verified:      boolean;
   lp_locked:        boolean;
   safe_score:       number;
+  sm_weight:        number;  // smart money signal weight (0 = no signal)
+  sm_wallets:       string[]; // SM wallets that bought this token
 }
 
 // ─── DexScreener ─────────────────────────────────────────────────────────────
@@ -119,6 +123,8 @@ function mapDexPair(p: any): BaseToken | null {
     is_verified:      false,
     lp_locked:        false,
     safe_score:       50,
+    sm_weight:        0,
+    sm_wallets:       [],
   };
 }
 
@@ -150,6 +156,8 @@ function mapGeckoPool(pool: any, dexOverride?: string): BaseToken | null {
     is_verified:      false,
     lp_locked:        false,
     safe_score:       50,
+    sm_weight:        0,
+    sm_wallets:       [],
   };
 }
 
@@ -282,11 +290,24 @@ export async function runScanCycle(): Promise<BaseToken[]> {
       continue;
     }
 
+    // Smart Money signal check (non-blocking — fail open)
+    try {
+      const smResult = await checkBaseSmartMoney(token.contract_address, token.pair_address);
+      token.sm_weight  = smResult.weight;
+      token.sm_wallets = smResult.wallets;
+    } catch { /* fail open */ }
+
+    if (BASE_REQUIRE_SM && token.sm_weight < 2.0) {
+      console.debug(`[base-scan] ✗ ${token.symbol} SM weight ${token.sm_weight} < 2.0 (BASE_REQUIRE_SM_SIGNAL=true)`);
+      continue;
+    }
+
     // Upsert to DB
     await upsertBaseToken(token);
     recentScanned.add(token.contract_address);
     passed.push(token);
-    console.info(`[base-scan] ✅ ${token.symbol} liq:$${token.liquidity_usd.toFixed(0)} pc1h:${token.price_change_1h.toFixed(1)}% score:${token.safe_score}`);
+    const smTag = token.sm_weight >= 2.0 ? ` 🔥SM(w${token.sm_weight})` : '';
+    console.info(`[base-scan] ✅ ${token.symbol} liq:$${token.liquidity_usd.toFixed(0)} pc1h:${token.price_change_1h.toFixed(1)}% score:${token.safe_score}${smTag}`);
   }
 
   return passed;

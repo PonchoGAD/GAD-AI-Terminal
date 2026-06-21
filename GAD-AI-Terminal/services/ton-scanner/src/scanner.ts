@@ -1,5 +1,8 @@
 import { query } from '@lib/db';
-import { discoverTonTokens, checkJettonSafety, buyJetton, getTonBalance, getWalletAddress, TonToken } from '@lib/ton';
+import { discoverTonTokens, checkJettonSafety, buyJetton, getTonBalance, getWalletAddress, TonToken, checkTonSmartMoney } from '@lib/ton';
+
+const TON_REQUIRE_SM = process.env.TON_REQUIRE_SM_SIGNAL === 'true';
+const TON_SM_MIN_WEIGHT = Number(process.env.TON_SM_MIN_WEIGHT ?? '2.0');
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 const AUTO_BUY       = process.env.TON_AUTO_BUY       === 'true';
@@ -78,8 +81,22 @@ export async function runTonScanCycle(): Promise<void> {
 
       seen.add(addr);
 
+      // Smart Money signal check (non-blocking)
+      let smWeight = 0;
+      try {
+        const smResult = await checkTonSmartMoney(addr);
+        smWeight = smResult.weight;
+      } catch { /* fail open */ }
+
+      if (TON_REQUIRE_SM && smWeight < TON_SM_MIN_WEIGHT) {
+        console.debug(`${label} ✗ ${t.symbol} SM weight ${smWeight} < ${TON_SM_MIN_WEIGHT} (TON_REQUIRE_SM_SIGNAL=true)`);
+        continue;
+      }
+
+      const smTag = smWeight >= TON_SM_MIN_WEIGHT ? ` 🔥SM(w${smWeight})` : '';
+
       if (!AUTO_BUY) {
-        console.info(`${label} 📡 ${t.symbol} liq:$${t.liquidity_usd.toFixed(0)} pc1h:${t.price_change_1h.toFixed(1)}% (dry-run — TON_AUTO_BUY=false)`);
+        console.info(`${label} 📡 ${t.symbol} liq:$${t.liquidity_usd.toFixed(0)} pc1h:${t.price_change_1h.toFixed(1)}%${smTag} (dry-run — TON_AUTO_BUY=false)`);
         continue;
       }
 
@@ -108,7 +125,7 @@ export async function runTonScanCycle(): Promise<void> {
       }
 
       const walletAddr = await getWalletAddress();
-      console.info(`${label} 🟢 BUYING ${t.symbol} liq:$${t.liquidity_usd.toFixed(0)} pc1h:${t.price_change_1h.toFixed(1)}% safe:${safety.safe_score}`);
+      console.info(`${label} 🟢 BUYING ${t.symbol} liq:$${t.liquidity_usd.toFixed(0)} pc1h:${t.price_change_1h.toFixed(1)}% safe:${safety.safe_score}${smTag}`);
 
       const result = await buyJetton(addr, BUY_TON);
       if (!result.ok) {
