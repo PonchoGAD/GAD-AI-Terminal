@@ -2231,3 +2231,44 @@ bot.on('polling_error', (err) => log('error', 'polling:', err.message));
 if (ADMIN_ID) bot.sendMessage(ADMIN_ID, '🤖 GAD AI Terminal online.').catch(() => {});
 log('info', 'Telegram bot running. t.me/gadai_sol_bot');
 
+// ─── Periodic heartbeat (every 12h) ──────────────────────────────────────────
+// Sends a short status digest to ADMIN so the owner can see the bot is alive
+// even when there's no trading activity.
+if (ADMIN_ID) {
+  const sendHeartbeat = async () => {
+    try {
+      const [positions, dailyPnl] = await Promise.all([
+        query(`SELECT COUNT(*) AS active_cnt,
+                      COUNT(*) FILTER (WHERE active = false AND total_sold_sol > 0) AS closed_cnt
+               FROM autobuy_jobs
+               WHERE active = true OR created_at > NOW() - INTERVAL '24h'`),
+        query(`SELECT COALESCE(SUM(total_sold_sol - total_spent_sol), 0) AS pnl_sol,
+                      COUNT(*) FILTER (WHERE total_sold_sol > total_spent_sol) AS wins,
+                      COUNT(*) FILTER (WHERE total_sold_sol <= total_spent_sol AND total_sold_sol > 0) AS losses
+               FROM autobuy_jobs
+               WHERE created_at > NOW() - INTERVAL '24h' AND active = false AND total_sold_sol > 0`),
+      ]);
+
+      const activeCnt  = Number(positions.rows[0]?.active_cnt ?? 0);
+      const wins       = Number(dailyPnl.rows[0]?.wins ?? 0);
+      const losses     = Number(dailyPnl.rows[0]?.losses ?? 0);
+      const pnl        = Number(dailyPnl.rows[0]?.pnl_sol ?? 0).toFixed(4);
+      const fg         = '?'; // F&G from env cache — not in DB
+
+      const lines = [
+        `💓 *GAD Terminal alive*`,
+        `🕐 ${new Date().toUTCString()}`,
+        ``,
+        `📊 Active positions: ${activeCnt}`,
+        `📅 24h closed: ${wins}W / ${losses}L | PnL: ${Number(pnl) >= 0 ? '+' : ''}${pnl} SOL`,
+      ];
+      bot.sendMessage(ADMIN_ID!, lines.join('\n'), { parse_mode: 'Markdown' }).catch(() => {});
+    } catch { /* never crash on heartbeat errors */ }
+  };
+  // Fire first heartbeat after 12h, then every 12h
+  setTimeout(() => {
+    sendHeartbeat();
+    setInterval(sendHeartbeat, 12 * 60 * 60 * 1000);
+  }, 12 * 60 * 60 * 1000);
+}
+
