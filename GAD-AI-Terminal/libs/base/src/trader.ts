@@ -3,9 +3,33 @@ import { getWallet, getProvider } from './provider';
 import { ADDRESSES, UNISWAP_V3_ROUTER_ABI, UNISWAP_V2_ROUTER_ABI, AERODROME_ROUTER_ABI, ERC20_ABI } from './contracts';
 import { getBestBuyQuote, getBestSellQuote, QuoteResult } from './quotes';
 
-const MAX_SLIPPAGE_PCT = Number(process.env.BASE_MAX_SLIPPAGE_PCT || '3');
-const GAS_LIMIT_BUY    = BigInt(process.env.BASE_GAS_LIMIT_BUY  || '350000');
-const GAS_LIMIT_SELL   = BigInt(process.env.BASE_GAS_LIMIT_SELL || '300000');
+const MAX_SLIPPAGE_PCT   = Number(process.env.BASE_MAX_SLIPPAGE_PCT    || '3');
+const GAS_LIMIT_BUY      = BigInt(process.env.BASE_GAS_LIMIT_BUY       || '350000');
+const GAS_LIMIT_SELL     = BigInt(process.env.BASE_GAS_LIMIT_SELL      || '300000');
+// Multiplier on top of network maxPriorityFeePerGas to ensure faster inclusion
+const GAS_PRIORITY_MULT  = Number(process.env.BASE_GAS_PRIORITY_MULT   || '1.3');
+
+// Fetch current EIP-1559 fee data and apply a priority multiplier.
+// Base L2 base fee is nearly 0 but priority fee matters for quick inclusion.
+async function getEip1559Overrides(gasLimit: bigint): Promise<Record<string, bigint>> {
+  try {
+    const provider = getProvider();
+    const feeData  = await provider.getFeeData();
+
+    const basePriority = feeData.maxPriorityFeePerGas ?? ethers.parseUnits('0.001', 'gwei');
+    const maxPriority  = BigInt(Math.ceil(Number(basePriority) * GAS_PRIORITY_MULT));
+    // maxFeePerGas = maxBaseFee + maxPriorityFee; use provider value with same multiplier
+    const maxFee = feeData.maxFeePerGas
+      ? BigInt(Math.ceil(Number(feeData.maxFeePerGas) * GAS_PRIORITY_MULT))
+      : maxPriority * 2n;
+
+    console.debug(`[base-trader] gas: maxFee=${ethers.formatUnits(maxFee, 'gwei')}gwei priority=${ethers.formatUnits(maxPriority, 'gwei')}gwei`);
+    return { maxFeePerGas: maxFee, maxPriorityFeePerGas: maxPriority, gasLimit };
+  } catch (e: any) {
+    console.warn(`[base-trader] getFeeData failed (${e.message?.slice(0, 50)}) — falling back to gasLimit only`);
+    return { gasLimit };
+  }
+}
 
 // keccak256("Withdrawal(address,uint256)") — WETH unwrap event emitted during token→ETH swaps
 const WETH_WITHDRAWAL_TOPIC = ethers.id('Withdrawal(address,uint256)');
@@ -38,7 +62,8 @@ export async function buyToken(
 
   try {
     let tx: ethers.TransactionResponse;
-    const deadline = BigInt(Math.floor(Date.now() / 1000) + 120);
+    const deadline  = BigInt(Math.floor(Date.now() / 1000) + 120);
+    const gasOverrides = await getEip1559Overrides(GAS_LIMIT_BUY);
 
     if (quote.dex === 'uniswap_v3') {
       const router = new ethers.Contract(ADDRESSES.UNISWAP_V3_ROUTER, UNISWAP_V3_ROUTER_ABI, wallet);
@@ -52,7 +77,7 @@ export async function buyToken(
         sqrtPriceLimitX96: 0n,
       };
       await router.exactInputSingle.staticCall(params, { value: ethAmountWei });
-      tx = await router.exactInputSingle(params, { value: ethAmountWei, gasLimit: GAS_LIMIT_BUY });
+      tx = await router.exactInputSingle(params, { ...gasOverrides, value: ethAmountWei });
     } else if (quote.dex === 'uniswap_v2') {
       const router   = new ethers.Contract(ADDRESSES.UNISWAP_V2_ROUTER, UNISWAP_V2_ROUTER_ABI, wallet);
       const path     = [ADDRESSES.WETH, tokenAddress];
@@ -62,7 +87,7 @@ export async function buyToken(
         path,
         wallet.address,
         deadline,
-        { value: ethAmountWei, gasLimit: GAS_LIMIT_BUY }
+        { ...gasOverrides, value: ethAmountWei }
       );
     } else {
       const router = new ethers.Contract(ADDRESSES.AERODROME_ROUTER, AERODROME_ROUTER_ABI, wallet);
@@ -73,7 +98,7 @@ export async function buyToken(
         routes,
         wallet.address,
         deadline,
-        { value: ethAmountWei, gasLimit: GAS_LIMIT_BUY }
+        { ...gasOverrides, value: ethAmountWei }
       );
     }
 
@@ -119,7 +144,8 @@ export async function sellToken(
 
   try {
     let tx: ethers.TransactionResponse;
-    const deadline = BigInt(Math.floor(Date.now() / 1000) + 120);
+    const deadline     = BigInt(Math.floor(Date.now() / 1000) + 120);
+    const gasOverrides = await getEip1559Overrides(GAS_LIMIT_SELL);
 
     if (dex === 'uniswap_v3') {
       const router = new ethers.Contract(ADDRESSES.UNISWAP_V3_ROUTER, UNISWAP_V3_ROUTER_ABI, wallet);
@@ -133,7 +159,7 @@ export async function sellToken(
           amountOutMinimum:  amountOutMin,
           sqrtPriceLimitX96: 0n,
         },
-        { gasLimit: GAS_LIMIT_SELL }
+        gasOverrides
       );
     } else if (dex === 'uniswap_v2') {
       const router = new ethers.Contract(ADDRESSES.UNISWAP_V2_ROUTER, UNISWAP_V2_ROUTER_ABI, wallet);
@@ -143,7 +169,7 @@ export async function sellToken(
         [tokenAddress, ADDRESSES.WETH],
         wallet.address,
         deadline,
-        { gasLimit: GAS_LIMIT_SELL }
+        gasOverrides
       );
     } else {
       const router = new ethers.Contract(ADDRESSES.AERODROME_ROUTER, AERODROME_ROUTER_ABI, wallet);
@@ -153,7 +179,7 @@ export async function sellToken(
         [{ from: tokenAddress, to: ADDRESSES.WETH, stable: false, factory: ADDRESSES.AERODROME_FACTORY }],
         wallet.address,
         deadline,
-        { gasLimit: GAS_LIMIT_SELL }
+        gasOverrides
       );
     }
 

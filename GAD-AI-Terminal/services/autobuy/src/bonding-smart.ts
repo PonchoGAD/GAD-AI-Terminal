@@ -30,6 +30,7 @@
 
 import WebSocket from 'ws';
 import axios from 'axios';
+import { createGuardedWS, WsGuardHandle } from './websocket-guard';
 import { Connection, Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { query } from '@lib/db';
@@ -562,38 +563,28 @@ async function handleTrade(ev: any): Promise<void> {
   }
 }
 
-// ─── WebSocket ────────────────────────────────────────────────────────────────
+// ─── WebSocket (guarded — exponential backoff + ping-pong heartbeat) ──────────
 
-let ws: WebSocket | null = null;
-let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let wsGuard: WsGuardHandle | null = null;
 
 function connectWS(): void {
-  if (ws) { try { ws.terminate(); } catch {} ws = null; }
-
-  ws = new WebSocket(PUMPPORTAL_WS);
-
-  ws.on('open', () => {
-    console.info('[bonding-smart] WebSocket connected');
-    ws!.send(JSON.stringify({ method: 'subscribeNewToken' }));
-    ws!.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [] }));
-  });
-
-  ws.on('message', async (raw: Buffer) => {
-    try {
-      const ev = JSON.parse(raw.toString());
-      if (ev.txType === 'create')                      await handleCreate(ev);
-      else if (ev.txType === 'buy' || ev.txType === 'sell') await handleTrade(ev);
-    } catch {}
-  });
-
-  ws.on('close', () => {
-    console.warn('[bonding-smart] WS closed — reconnecting in 5s');
-    if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
-    wsReconnectTimer = setTimeout(connectWS, 5_000);
-  });
-
-  ws.on('error', (err: Error) => {
-    console.warn(`[bonding-smart] WS error: ${err.message?.slice(0, 60)}`);
+  wsGuard = createGuardedWS({
+    url: PUMPPORTAL_WS,
+    onOpen: () => {
+      console.info('[bonding-smart] WebSocket connected');
+      wsGuard!.send(JSON.stringify({ method: 'subscribeNewToken' }));
+      wsGuard!.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [] }));
+    },
+    onMessage: async (ev: any) => {
+      try {
+        if (ev.txType === 'create')                           await handleCreate(ev);
+        else if (ev.txType === 'buy' || ev.txType === 'sell') await handleTrade(ev);
+      } catch {}
+    },
+    pingIntervalMs:  30_000,  // heartbeat каждые 30s
+    maxReconnects:   0,        // 0 = бесконечно (контейнер сам перезапустится при OOM)
+    reconnectBaseMs: 1_000,
+    reconnectCapMs:  30_000,
   });
 }
 

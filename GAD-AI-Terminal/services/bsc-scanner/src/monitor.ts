@@ -5,20 +5,20 @@ import { sellBscToken, getBscTokenBalance, getBnbBalance } from '@lib/bsc';
 
 // ─── Config — Momentum Strategy ──────────────────────────────────────────────
 // Buy BSC meme coins $500k-$10M on upward momentum.
-// TP1: 1.3x → sell 70% (lock profit fast), TP2: 2.5x → sell 100%.
-// Breakeven stop activates after TP1 (entry-2%), trail 12% from ATH.
+// TP1: 1.2x → sell 60% (fast lock), TP2: 1.45x → sell 100% (close remainder).
+// After TP1: breakeven stop (entry-2%), trail 10% from ATH, time limit 30min.
 
-const STOP_LOSS_PCT   = Number(process.env.BSC_STOP_LOSS_PCT   || '8');    // 8% — tight stop for meme momentum
-const TRAIL_PCT       = Number(process.env.BSC_TRAIL_PCT       || '12');   // 12% trailing stop
-const TIME_LIMIT_SEC  = Number(process.env.BSC_TIME_LIMIT_SEC  || '3600'); // 1 hour — meme momentum is short
+const STOP_LOSS_PCT   = Number(process.env.BSC_STOP_LOSS_PCT    || '8');    // 8% — tight stop for meme momentum
+const TRAIL_PCT       = Number(process.env.BSC_TRAIL_PCT        || '10');   // 10% trailing stop (tighter than before)
+const TIME_LIMIT_SEC  = Number(process.env.BSC_TIME_LIMIT_SEC   || '1800'); // 30 min — faster capital recycling
 const POLL_INTERVAL   = Number(process.env.BSC_POLL_INTERVAL_MS || '15000'); // 15s poll — meme moves fast
 
-//   TP1: 1.3x → sell 70% — capture most profit on typical meme spike
-//   TP2: 2.5x → sell 100% — close remainder if continues
-//   After TP1: breakeven stop (entry-2%) — never give back the win
+//   TP1: 1.2x → sell 60% — quick profit lock on BSC meme spike
+//   TP2: 1.45x → sell 100% — close remainder
+//   After TP1: breakeven stop (entry-2%) — never give back a win
 const BSC_TPS = [
-  { mult: 1.3, sellPct: 70  },  // 1.3x: sell 70% — immediate profit lock
-  { mult: 2.5, sellPct: 100 },  // 2.5x: sell 100% — moon target
+  { mult: 1.2, sellPct: 60  },  // 1.2x: sell 60% — fast profit lock
+  { mult: 1.45, sellPct: 100 }, // 1.45x: sell 100% — close position
 ];
 
 interface BscPosition {
@@ -208,8 +208,47 @@ async function checkPosition(pos: BscPosition): Promise<void> {
   }
 }
 
+// Reload active positions on startup — handles cases where service restarted mid-sell.
+// Checks token balance for each active position; if balance = 0 (sell TX completed but
+// DB not updated), marks the position as sold with reason=RESTART_CLEANUP.
+async function reloadActiveBscPositions(): Promise<void> {
+  const positions = await getOpenPositions();
+  if (!positions.length) {
+    console.info('[bsc-monitor] reloadActiveBscPositions: no active positions');
+    return;
+  }
+  console.info(`[bsc-monitor] reloadActiveBscPositions: checking ${positions.length} active positions…`);
+  for (const pos of positions) {
+    try {
+      const tokenBalance = await getBscTokenBalance(pos.contract_address).catch(() => -1n);
+      if (tokenBalance === 0n) {
+        // Sell completed before restart but DB wasn't updated
+        console.warn(`[bsc-monitor] ${pos.symbol} balance=0 after restart → marking sold (RESTART_CLEANUP)`);
+        await query(
+          `UPDATE bsc_positions SET is_active=false, sell_reason='RESTART_CLEANUP', sold_at=NOW() WHERE id=$1`,
+          [pos.id]
+        );
+      } else {
+        // Normal active position — reset any stale sell-in-progress flag (already cleared by Set re-init)
+        console.info(
+          `[bsc-monitor] ✅ Resume monitoring: ${pos.symbol}` +
+          ` entry:${pos.entry_price_bnb.toFixed(8)} tp_index:${pos.tp_index}` +
+          ` age:${Math.floor((Date.now() - new Date(pos.bought_at).getTime()) / 60000)}min`
+        );
+      }
+    } catch (e: any) {
+      console.warn(`[bsc-monitor] reloadActiveBscPositions ${pos.symbol}: ${e.message}`);
+    }
+  }
+}
+
 export async function startBscMonitor(): Promise<void> {
-  console.info(`[bsc-monitor] Position monitor started — poll:${POLL_INTERVAL}ms stop:${STOP_LOSS_PCT}% trail:${TRAIL_PCT}% time:${TIME_LIMIT_SEC}s`);
+  console.info(`[bsc-monitor] Position monitor started — poll:${POLL_INTERVAL}ms stop:${STOP_LOSS_PCT}% trail:${TRAIL_PCT}% time:${TIME_LIMIT_SEC}s TP1:1.2x/60% TP2:1.45x/100%`);
+
+  // Startup: check for positions that may have been partially sold before restart
+  await reloadActiveBscPositions().catch(e =>
+    console.warn(`[bsc-monitor] reloadActiveBscPositions failed: ${e.message}`)
+  );
 
   async function loop(): Promise<void> {
     try {

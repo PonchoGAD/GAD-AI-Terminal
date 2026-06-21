@@ -2150,6 +2150,82 @@ bot.on('message', async (msg: any) => {
   }
 });
 
+// ─── Admin: cross-chain portfolio snapshot ────────────────────────────────────
+bot.onText(/^\/crossstatus(@\w+)?$/, async (msg) => {
+  if (String(msg.chat.id) !== String(ADMIN_ID)) return;
+  const chatId = msg.chat.id;
+  try {
+    // Solana (autobuy_jobs)
+    const solOpen = await query<any>(
+      `SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_sol),0) AS invested
+       FROM autobuy_jobs WHERE is_active = true`
+    );
+    const solClosed = await query<any>(
+      `SELECT COUNT(*) AS cnt,
+              COALESCE(SUM(CASE WHEN received_sol >= amount_sol THEN 1 ELSE 0 END), 0) AS wins,
+              COALESCE(SUM(received_sol - amount_sol), 0) AS net_sol
+       FROM autobuy_jobs WHERE is_active = false AND DATE(bought_at) = CURRENT_DATE`
+    );
+    const sol = solOpen.rows[0] ?? {};
+    const solD = solClosed.rows[0] ?? {};
+
+    // Base (base_positions)
+    const baseOpen = await query<any>(
+      `SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_eth),0) AS invested
+       FROM base_positions WHERE is_active = true`
+    );
+    const baseClosed = await query<any>(
+      `SELECT COUNT(*) AS cnt,
+              COALESCE(SUM(CASE WHEN received_eth >= amount_eth THEN 1 ELSE 0 END), 0) AS wins,
+              COALESCE(SUM(received_eth - amount_eth), 0) AS net_eth
+       FROM base_positions WHERE is_active = false AND DATE(bought_at) = CURRENT_DATE`
+    );
+    const base = baseOpen.rows[0] ?? {};
+    const baseD = baseClosed.rows[0] ?? {};
+
+    // BSC (bsc_positions)
+    const bscOpen = await query<any>(
+      `SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_bnb),0) AS invested
+       FROM bsc_positions WHERE is_active = true`
+    );
+    const bscClosed = await query<any>(
+      `SELECT COUNT(*) AS cnt,
+              COALESCE(SUM(CASE WHEN total_sold_bnb >= amount_bnb THEN 1 ELSE 0 END), 0) AS wins,
+              COALESCE(SUM(total_sold_bnb - amount_bnb), 0) AS net_bnb
+       FROM bsc_positions WHERE is_active = false AND DATE(bought_at) = CURRENT_DATE`
+    );
+    const bsc = bscOpen.rows[0] ?? {};
+    const bscD = bscClosed.rows[0] ?? {};
+
+    const fmt = (v: any, dec = 4) => Number(v ?? 0).toFixed(dec);
+    const pnlStr = (v: any, unit: string) => {
+      const n = Number(v ?? 0);
+      return `${n >= 0 ? '+' : ''}${n.toFixed(4)} ${unit}`;
+    };
+
+    const lines = [
+      `🌐 *CROSS-CHAIN STATUS*  ${new Date().toUTCString().slice(0, 22)}`,
+      ``,
+      `🟣 *Solana (Raydium)*`,
+      `  Open: ${sol.cnt ?? 0} pos | invested: ${fmt(sol.invested)} SOL`,
+      `  Today: ${solD.cnt ?? 0} closed | W:${solD.wins ?? 0} | PnL: ${pnlStr(solD.net_sol, 'SOL')}`,
+      ``,
+      `⛓ *Base (Uniswap V3)*`,
+      `  Open: ${base.cnt ?? 0} pos | invested: ${fmt(base.invested, 5)} ETH`,
+      `  Today: ${baseD.cnt ?? 0} closed | W:${baseD.wins ?? 0} | PnL: ${pnlStr(baseD.net_eth, 'ETH')}`,
+      ``,
+      `🟡 *BSC (Four.meme)*`,
+      `  Open: ${bsc.cnt ?? 0} pos | invested: ${fmt(bsc.invested)} BNB`,
+      `  Today: ${bscD.cnt ?? 0} closed | W:${bscD.wins ?? 0} | PnL: ${pnlStr(bscD.net_bnb, 'BNB')}`,
+      ``,
+      `Total open: ${Number(sol.cnt ?? 0) + Number(base.cnt ?? 0) + Number(bsc.cnt ?? 0)} positions`,
+    ];
+    await send(chatId, lines.join('\n'));
+  } catch (e: any) {
+    await send(chatId, `❌ crossstatus error: ${e.message}`);
+  }
+});
+
 // ─── Errors ───────────────────────────────────────────────────────────────────
 bot.on('polling_error', (err) => log('error', 'polling:', err.message));
 if (ADMIN_ID) bot.sendMessage(ADMIN_ID, '🤖 GAD AI Terminal online.').catch(() => {});
