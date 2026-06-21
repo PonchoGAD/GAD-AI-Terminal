@@ -7,7 +7,8 @@ const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const MIN_EV         = Number(process.env.POLYMARKET_MIN_EV           || '0.12');
 const MIN_CONFIDENCE = process.env.POLYMARKET_MIN_CONFIDENCE           || 'MEDIUM'; // HIGH | MEDIUM
 
-// LLM abstraction: Claude Haiku → OpenAI gpt-4o-mini fallback on credit errors
+// LLM abstraction: Claude Haiku → DeepSeek → OpenAI gpt-4o-mini
+// Falls back on credit exhaustion (status 400) or rate limit (status 429)
 async function callLLM(userContent: string, maxTokens: number): Promise<string> {
   // 1. Try Claude Haiku
   try {
@@ -17,14 +18,33 @@ async function callLLM(userContent: string, maxTokens: number): Promise<string> 
     });
     return msg.content[0].type === 'text' ? msg.content[0].text : '';
   } catch (err: any) {
-    const isCredits = err.status === 400 || (err.message ?? '').toLowerCase().includes('credit');
-    if (!isCredits) throw err; // only fallback on credit errors
-    console.warn('[poly-scorer] Claude credits exhausted — trying OpenAI fallback');
+    const isTransient = err.status === 400 || err.status === 429 || err.status === 529
+      || (err.message ?? '').toLowerCase().includes('credit')
+      || (err.message ?? '').toLowerCase().includes('overload');
+    if (!isTransient) throw err;
+    console.warn(`[poly-scorer] Claude unavailable (${err.status}) — trying DeepSeek`);
   }
 
-  // 2. OpenAI gpt-4o-mini fallback
+  // 2. DeepSeek (OpenAI-compatible, cheap fallback)
+  const deepseekKey = process.env.DEEPSEEK_API_KEY;
+  if (deepseekKey) {
+    try {
+      const res = await axios.post('https://api.deepseek.com/v1/chat/completions', {
+        model: 'deepseek-chat', max_tokens: maxTokens,
+        messages: [{ role: 'user', content: userContent }],
+      }, {
+        headers: { Authorization: `Bearer ${deepseekKey}`, 'Content-Type': 'application/json' },
+        timeout: 25000,
+      });
+      return res.data.choices[0]?.message?.content ?? '';
+    } catch (deepErr: any) {
+      console.warn(`[poly-scorer] DeepSeek failed (${deepErr.status ?? deepErr.message}) — trying OpenAI`);
+    }
+  }
+
+  // 3. OpenAI gpt-4o-mini final fallback
   const openaiKey = process.env.OPENAI_API_KEY;
-  if (!openaiKey) throw new Error('Anthropic credits exhausted and OPENAI_API_KEY not set');
+  if (!openaiKey) throw new Error('All LLM providers exhausted (no OPENAI_API_KEY set)');
 
   const res = await axios.post('https://api.openai.com/v1/chat/completions', {
     model: 'gpt-4o-mini', max_tokens: maxTokens,
