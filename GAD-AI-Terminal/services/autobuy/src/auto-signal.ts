@@ -807,10 +807,35 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     }
   }
 
-  // Source 6 (REMOVED): PumpSwap graduates were included here but caused Token-2022
-  // simulation failures. PumpSwap tokens use Token-2022 format; Jupiter's simulation
-  // invokes GetAccountDataSize on the Token-2022 program and fails with custom error 0x1.
-  // PumpSwap graduates are only tradeable via PumpPortal (disabled) — skip entirely.
+  // Source 6: GeckoTerminal newest Raydium pools — sorted by creation date DESC.
+  // This is the key source for fresh pump.fun graduates and new Raydium launches.
+  // DexScreener Source 0 (sorted by volume) returns only established large-cap tokens.
+  // GeckoTerminal "newest" endpoint returns pools that appeared on Raydium in the last hours.
+  // geckoPoolToPair() filters to GECKO_DEX_MAP (raydium variants only, no pumpswap/fluxbeam).
+  try {
+    for (let page = 1; page <= 3; page++) {
+      const gR = await axios.get(
+        `${GECKO_BASE}/networks/solana/dexes/raydium/pools?sort=pool_created_at_desc&page=${page}&limit=25`,
+        { headers: GECKO_HEADERS, timeout: 7_000 }
+      );
+      const pools: any[] = gR.data?.data ?? [];
+      if (!pools.length) break;
+      let added = 0;
+      for (const pool of pools) {
+        const pair = geckoPoolToPair(pool);
+        if (!pair) continue;
+        const mint = pair.baseToken?.address;
+        if (!mint || seen.has(mint)) continue;
+        seen.add(mint);
+        results.push(pair);
+        added++;
+      }
+      if (added > 0) console.debug(`[raydium-scan] GeckoTerminal newest (page ${page}): ${added} fresh Raydium pairs`);
+      await new Promise(r => setTimeout(r, 300));
+    }
+  } catch (e: any) {
+    console.debug(`[raydium-scan] GeckoTerminal newest error: ${e.message?.slice(0, 40)}`);
+  }
 
   const dxCount = results.length - raydiumDexCount;
   console.debug(`[raydium-scan] total: ${results.length} unique candidates (${raydiumDexCount} raydium-dex + ${dxCount} dx)`);
