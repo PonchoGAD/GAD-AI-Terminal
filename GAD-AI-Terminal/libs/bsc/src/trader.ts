@@ -87,6 +87,12 @@ export async function buyBscToken(
     const balance = await token.balanceOf(wallet.address);
 
     console.info(`[bsc-trade] ✅ BUY ${tokenAddress.slice(0,8)} ${bnbAmountBnb} BNB → ${ethers.formatUnits(balance, 18)} tokens tx:${tx.hash.slice(0,12)}`);
+
+    // TRAP 1: Pre-approve router for MaxUint256 immediately after buy (non-blocking).
+    // Doing this now means the sell TX has no approve latency at TP/SL time.
+    ensureAllowance(tokenAddress, ADDRESSES.PANCAKESWAP_ROUTER_V2, ethers.MaxUint256)
+      .catch(e => console.warn(`[bsc-trade] post-buy pre-approve failed (non-fatal): ${e.message}`));
+
     return {
       ok:         true,
       tx_hash:    tx.hash,

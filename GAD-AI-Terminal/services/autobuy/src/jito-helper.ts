@@ -38,8 +38,10 @@ let _cachedTip: number | null = null;
 let _tipCacheTs = 0;
 const TIP_CACHE_MS = 30_000;  // refresh every 30s
 
-export async function getOptimalJitoTip(): Promise<number> {
-  if (_cachedTip !== null && Date.now() - _tipCacheTs < TIP_CACHE_MS) return _cachedTip;
+// TRAP 3: bypassCache=true skips the 30s stale cache for elite signals (weight ≥ 3.0).
+// Stale tip during a volatile launch means underpaying → bundle dropped → missed entry.
+export async function getOptimalJitoTip(bypassCache = false): Promise<number> {
+  if (!bypassCache && _cachedTip !== null && Date.now() - _tipCacheTs < TIP_CACHE_MS) return _cachedTip;
 
   try {
     const res = await axios.get('https://mainnet.block-engine.jito.wtf/api/v1/tips', { timeout: 4_000 });
@@ -68,10 +70,12 @@ export async function getOptimalJitoTip(): Promise<number> {
  * Cap: 0.0015 SOL (avoid overpaying in volatile fee markets).
  */
 export async function calculateJitoTipForSignal(totalSignalWeight: number): Promise<number> {
-  const baseTip = await getOptimalJitoTip();
-  if (totalSignalWeight >= 3.0) {
+  const isElite = totalSignalWeight >= 3.0;
+  // For elite signals, bypass cache to get a fresh market tip — stale tip risks bundle rejection.
+  const baseTip = await getOptimalJitoTip(isElite);
+  if (isElite) {
     const tip = Math.min(baseTip * 3, 0.0015);
-    console.info(`[jito] 🔥 Elite signal (w${totalSignalWeight}) → priority tip: ${tip.toFixed(6)} SOL`);
+    console.info(`[jito] 🔥 Elite signal (w${totalSignalWeight}) → fresh priority tip: ${tip.toFixed(6)} SOL`);
     return tip;
   }
   return baseTip * 1.15;

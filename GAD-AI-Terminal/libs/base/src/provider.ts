@@ -42,7 +42,7 @@ function rotateRpc(): void {
   if (_wallet) _wallet = new ethers.Wallet(_wallet.privateKey, _provider);
 }
 
-// withRetry: retry with RPC rotation on network errors, up to 3 attempts
+// withRetry: retry with RPC rotation on network or rate-limit errors, up to 3 attempts
 export async function withRetry<T>(fn: (p: ethers.JsonRpcProvider) => Promise<T>, attempts = 3): Promise<T> {
   for (let i = 0; i < attempts; i++) {
     try {
@@ -50,7 +50,12 @@ export async function withRetry<T>(fn: (p: ethers.JsonRpcProvider) => Promise<T>
     } catch (e: any) {
       const isNetworkErr = e.code === 'NETWORK_ERROR' || e.code === 'TIMEOUT' ||
                            e.message?.includes('timeout') || e.message?.includes('connection');
-      if (isNetworkErr && i < attempts - 1) {
+      // TRAP 4: 429 Rate Limit — rotate RPC node immediately; free RPCs allow ~150 req/min
+      const is429 = e.status === 429 || e.code === 429 ||
+                    e.message?.includes('429') || e.message?.includes('rate limit') ||
+                    e.message?.includes('Too Many') || e.message?.includes('Limit exceeded');
+      if ((isNetworkErr || is429) && i < attempts - 1) {
+        if (is429) console.warn(`[base-rpc] 429 Rate Limited on #${_rpcIndex} — rotating RPC`);
         rotateRpc();
         continue;
       }

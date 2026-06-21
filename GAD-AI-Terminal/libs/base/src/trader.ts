@@ -103,6 +103,15 @@ export async function buyToken(
     }
 
     await tx.wait(1);
+
+    // TRAP 1: Pre-approve the sell router immediately after buy (non-blocking).
+    // Selling during TP/SL requires prior approve — doing it now eliminates that latency.
+    const buySpender = quote.dex === 'uniswap_v3' ? ADDRESSES.UNISWAP_V3_ROUTER
+                     : quote.dex === 'uniswap_v2' ? ADDRESSES.UNISWAP_V2_ROUTER
+                     : ADDRESSES.AERODROME_ROUTER;
+    ensureAllowance(tokenAddress, buySpender, ethers.MaxUint256)
+      .catch(e => console.warn(`[base-trader] post-buy pre-approve failed (non-fatal): ${e.message}`));
+
     return {
       ok:         true,
       tx_hash:    tx.hash,

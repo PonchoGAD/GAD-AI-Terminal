@@ -2,6 +2,7 @@ import { internal } from '@ton/ton';
 import { toNano, fromNano } from '@ton/core';
 import { DEX, pTON } from '@ston-fi/sdk';
 import { getClient, getKeyPair, getWalletOpen, getJettonBalance } from './client';
+import { getNextSecureSeqno } from './nonce-guard';
 
 // STON.fi v1 Router (most liquidity, most pools)
 const STONFI_ROUTER = 'EQB3ncyBUTjZUA5EnFKR5_EnOMI9V1tTEAAPaiU71gc4TiUt';
@@ -50,7 +51,7 @@ export async function buyJetton(
     });
 
     const totalValue = offerAmount + GAS_RESERVE_TON;
-    const seqno = await wo.getSeqno();
+    const seqno = await getNextSecureSeqno(wo);
     await wo.sendTransfer({
       seqno,
       secretKey: keyPair.secretKey,
@@ -110,7 +111,7 @@ export async function sellJetton(
       queryId:            BigInt(Date.now()),
     });
 
-    const seqno = await wo.getSeqno();
+    const seqno = await getNextSecureSeqno(wo);
     await wo.sendTransfer({
       seqno,
       secretKey: keyPair.secretKey,
