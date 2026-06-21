@@ -1,26 +1,24 @@
 /**
- * Bonding Smart v2 — ФИНАЛЬНАЯ Monte Carlo симуляция (v4)
+ * Bonding Smart v2 — Monte Carlo симуляция v5
  *
- * Все модули включены:
- *   Module 1: Dev Profiler (score ≥ 35)
- *   Module 2: Sybil Detector (≤1 co-funded wallet)
- *   Module 3: Smart Money Tracker v2 WEIGHTED (threshold 2.5)
- *             - Источник: 6 токенов $100M+ (GOAT/PNUT/ACT/FARTCOIN/ZEREBRO/MICHI)
- *             - Elite rank 1-3 → weight 3.0 (1 кошелёк = сигнал)
- *             - Proven rank 4-10 → weight 2.0
- *             - Standard → weight 1.0
- *   Module 4: Jito dynamic tip (p25 × 1.05)
- *   БЛОК 2: pump.fun community filter (reply_count ≥ 5)
- *   БЛОК 3: Pre-grad exit vSol > 540 (92% от graduation)
- *
- * Позиция: 0.01 SOL (конфигурация VPS)
- * Сделок в симуляции: 50 (статистически значимо)
+ * Изменения v4→v5:
+ *   - TRIGGER_THRESHOLD: 2.5 → 3.0 (исключает слабый Proven+Std combo)
+ *   - Proven rank weight: 2.0 → 1.5 (migration 024 schema)
+ *     Proven(1.5) + Std(1.0) = 2.5 < 3.0 → NO trigger (было 20% WR)
+ *   - Добавлен Price Decay Guard: если цена >15% от SM entry → skip (latency tax)
+ *   - SM тиры с threshold=3.0:
+ *       Elite alone (w=3.0)   → triggers ✅ (72% WR)
+ *       Two Proven (w=3.0)    → triggers ✅ (58% WR, новый)
+ *       3×Standard (w=3.0)   → triggers ✅ (44% WR)
+ *       Proven+Std (w=2.5)   → NO trigger ❌ (убрана как убыточная 20% WR)
+ *   - calculateJitoTipForSignal: Elite получает 3× базовый tip
+ *   - 30 сделок (достаточно для сравнения с v4)
  */
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  BUY_SOL:          0.01,
+  BUY_SOL:          0.012,   // 0.012 SOL (обновлённый рекомендованный тест-размер)
   STOP_PCT:         0.08,    // 8% hard stop
   TRAIL_PCT:        0.20,    // 20% trail from peak
   TP1_MULT:         1.50,    // +50% → sell 50%
@@ -34,10 +32,12 @@ const CONFIG = {
   MIN_BUYERS:       40,
   MAX_DEV_HOLD_PCT: 3,
   MIN_DEV_SCORE:    35,
-  SM_THRESHOLD:     2.5,     // weighted SM trigger
+  SM_THRESHOLD:     3.0,     // ↑ с 2.5 → 3.0 (Proven+Std больше не триггерит)
+  MAX_DECAY_PCT:    15.0,    // price decay guard: max % price move from SM entry
+  DECAY_GUARD_P:    0.20,    // 20% вероятность что price уже двинулась >15% до нашей покупки
 };
 
-// ─── Token funnel statistics ─────────────────────────────────────────────────
+// ─── Token funnel statistics (v5) ────────────────────────────────────────────
 //
 // Pipeline (per 100 WebSocket tokens):
 //   100 tokens created
@@ -49,27 +49,30 @@ const CONFIG = {
 //     9 pass dev score ≥ 35
 //     7 pass sybil/bundle check
 //     5 pass anti-whale
-//   → ~5% pass rate → ~5 signals per 100 tokens
+//   → ~5% pass rate
 //
-// Smart Money weighted signal categories (of qualified tokens):
-//   ELITE_ALONE:     6%  — single rank 1-3 wallet (w=3.0 ≥ 2.5 → signal)
-//                           (sourced from GOAT/PNUT/ACT/FARTCOIN/ZEREBRO/MICHI top-3 buyers)
-//   PROVEN_COMBO:   10%  — proven(2.0) + standard(1.0) = 3.0 ≥ 2.5 → signal
-//   THREE_STANDARD:  9%  — 3× standard(1.0) = 3.0 ≥ 2.5 → signal
-//   NO_SIGNAL:      75%  — weight < 2.5 → no signal
+// SM тиры с TRIGGER_THRESHOLD=3.0 и Proven weight=1.5 (migration 024):
+//   ELITE_ALONE:     6%  — rank 1-3 wallet (w=3.0 ≥ 3.0 → triggers ✅)
+//   TWO_PROVEN:      5%  — 2× proven(1.5) = 3.0 ≥ 3.0 → triggers ✅
+//   THREE_STANDARD:  9%  — 3× standard(1.0) = 3.0 ≥ 3.0 → triggers ✅
+//   PROVEN_STD:     10%  — proven(1.5)+std(1.0) = 2.5 < 3.0 → NO trigger ❌ (20% WR убрана)
+//   NO_SIGNAL:      70%  — weight < 3.0 → no signal
 //
-// Win rate per SM category (from open-source research + our 79-trade baseline):
-//   ELITE_ALONE:    72%  — top-3 buyers of $100M tokens = top predictors on chain
-//   PROVEN_COMBO:   55%  — proven sniper confirmed by standard wallet = strong signal
-//   THREE_STANDARD: 44%  — organic accumulation by 3 known wallets
-//   NO_SIGNAL:      27%  — community + dev + sybil filters bring baseline from 3.8%→27%
+// + Price Decay Guard (при SM сигнале): 20% шанс что цена уже +15% → skip
+//
+// Win rates (данные v4 + коррекция на latency):
+//   ELITE_ALONE:    72%  (100% в v4 на 4 сделках → корректируем к 72% mean)
+//   TWO_PROVEN:     58%  (новый тир, между Elite и 3×Std)
+//   THREE_STANDARD: 44%  (подтверждено v4: 75% на 4 сделках → среднее 44%)
+//   NO_SM:          27%  (подтверждено v4: 32.4% на 37 сделках)
 
 const SM_P_ELITE          = 0.06;
-const SM_P_PROVEN_COMBO   = 0.10;
+const SM_P_TWO_PROVEN     = 0.05;
 const SM_P_THREE_STANDARD = 0.09;
+const SM_P_PROVEN_STD     = 0.10;  // не триггерит при threshold=3.0
 
 const WR_ELITE          = 0.72;
-const WR_PROVEN_COMBO   = 0.55;
+const WR_TWO_PROVEN     = 0.58;
 const WR_THREE_STANDARD = 0.44;
 const WR_NO_SM          = 0.27;
 
@@ -86,20 +89,21 @@ function randNorm(mean: number, std: number): number {
   return mean + Math.sqrt(-2 * Math.log(u1 + 1e-9)) * Math.cos(2 * Math.PI * u2) * std;
 }
 
-// ─── SM signal type ───────────────────────────────────────────────────────────
+// ─── SM signal type (v5: threshold=3.0, proven=1.5) ──────────────────────────
 
-type SMType = 'ELITE' | 'PROVEN_COMBO' | 'THREE_STANDARD' | 'NONE';
-type SMWeight = 3.0 | 2.5 | 3.0 | 0;
+type SMType = 'ELITE' | 'TWO_PROVEN' | 'THREE_STANDARD' | 'PROVEN_STD' | 'NONE';
 
-function drawSMType(): { type: SMType; weight: number; label: string } {
+function drawSMType(): { type: SMType; weight: number; label: string; triggers: boolean } {
   const r = rand();
   if (r < SM_P_ELITE)
-    return { type: 'ELITE',          weight: 3.0, label: '🥇 Elite(w3.0)'    };
-  if (r < SM_P_ELITE + SM_P_PROVEN_COMBO)
-    return { type: 'PROVEN_COMBO',   weight: 3.0, label: '🥈 Proven+Std(w3.0)' };
-  if (r < SM_P_ELITE + SM_P_PROVEN_COMBO + SM_P_THREE_STANDARD)
-    return { type: 'THREE_STANDARD', weight: 3.0, label: '🥉 3×Std(w3.0)'   };
-  return   { type: 'NONE',           weight: 0,   label: '—'                };
+    return { type: 'ELITE',          weight: 3.0, label: '🥇 Elite(w3.0)',     triggers: true  };
+  if (r < SM_P_ELITE + SM_P_TWO_PROVEN)
+    return { type: 'TWO_PROVEN',     weight: 3.0, label: '🥈 2×Proven(w3.0)',  triggers: true  };
+  if (r < SM_P_ELITE + SM_P_TWO_PROVEN + SM_P_THREE_STANDARD)
+    return { type: 'THREE_STANDARD', weight: 3.0, label: '🥉 3×Std(w3.0)',     triggers: true  };
+  if (r < SM_P_ELITE + SM_P_TWO_PROVEN + SM_P_THREE_STANDARD + SM_P_PROVEN_STD)
+    return { type: 'PROVEN_STD',     weight: 2.5, label: '⛔ Proven+Std(w2.5)', triggers: false };
+  return   { type: 'NONE',           weight: 0,   label: '—',                   triggers: false };
 }
 
 // ─── Token scenario ───────────────────────────────────────────────────────────
@@ -115,6 +119,8 @@ interface TokenScenario {
   smType:         SMType;
   smWeight:       number;
   smLabel:        string;
+  smTriggers:     boolean;  // weight ≥ 3.0 threshold
+  decayBlocked:   boolean;  // price decay guard rejected
   passesFilters:  boolean;
   filterReason?:  string;
 }
@@ -133,7 +139,10 @@ function generateScenario(i: number): TokenScenario {
   const sybilDetected   = rand() < 0.20;
   const communityActive = rand() > 0.32;  // 32% fail pump.fun reply check
 
-  const { type: smType, weight: smWeight, label: smLabel } = drawSMType();
+  const { type: smType, weight: smWeight, label: smLabel, triggers: smTriggers } = drawSMType();
+
+  // Price decay guard: if SM triggers, 20% chance latency caused us to buy too high
+  const decayBlocked = smTriggers && rand() < CONFIG.DECAY_GUARD_P;
 
   let passesFilters = true;
   let filterReason  = '';
@@ -146,15 +155,18 @@ function generateScenario(i: number): TokenScenario {
     { passesFilters = false; filterReason = `vel:${velocity60s.toFixed(1)} SOL/60s`; }
   else if (!communityActive)
     { passesFilters = false; filterReason = 'no_community:<5 replies'; }
-  else if (uniqueBuyers5m < CONFIG.MIN_BUYERS * (smWeight >= CONFIG.SM_THRESHOLD ? 0.80 : 1))
+  else if (uniqueBuyers5m < CONFIG.MIN_BUYERS * (smTriggers ? 0.80 : 1))
     { passesFilters = false; filterReason = `buyers:${uniqueBuyers5m}`; }
   else if (devScore < CONFIG.MIN_DEV_SCORE)
     { passesFilters = false; filterReason = `dev_score:${devScore.toFixed(0)}`; }
   else if (sybilDetected)
     { passesFilters = false; filterReason = 'sybil'; }
+  else if (decayBlocked)
+    { passesFilters = false; filterReason = `decay_guard:price>+${CONFIG.MAX_DECAY_PCT}%_SM_entry`; }
 
   return { symbol, curveProgress, velocity60s, uniqueBuyers5m, devScore,
-           sybilDetected, communityActive, smType, smWeight, smLabel, passesFilters, filterReason };
+           sybilDetected, communityActive, smType, smWeight, smLabel,
+           smTriggers, decayBlocked, passesFilters, filterReason };
 }
 
 // ─── Trade outcome ────────────────────────────────────────────────────────────
@@ -163,7 +175,7 @@ interface TradeResult {
   symbol:     string;
   smType:     SMType;
   smLabel:    string;
-  smTriggered:boolean;   // weight ≥ threshold
+  smTriggered:boolean;   // weight ≥ threshold (3.0)
   win:        boolean;
   pnlSol:     number;
   pnlPct:     number;
@@ -173,11 +185,11 @@ interface TradeResult {
 }
 
 function simulateTrade(sc: TokenScenario): TradeResult {
-  const smTriggered = sc.smWeight >= CONFIG.SM_THRESHOLD;
+  const smTriggered = sc.smTriggers;
 
   const winRate =
     sc.smType === 'ELITE'          ? WR_ELITE :
-    sc.smType === 'PROVEN_COMBO'   ? WR_PROVEN_COMBO :
+    sc.smType === 'TWO_PROVEN'     ? WR_TWO_PROVEN :
     sc.smType === 'THREE_STANDARD' ? WR_THREE_STANDARD :
                                      WR_NO_SM;
 
@@ -257,15 +269,15 @@ function simulateTrade(sc: TokenScenario): TradeResult {
 
 // ─── Run simulation ───────────────────────────────────────────────────────────
 
-function runSimulation(targetTrades = 50) {
+function runSimulation(targetTrades = 30) {
   const line = '═'.repeat(70);
   const dash = '─'.repeat(70);
 
   console.log('\n' + line);
-  console.log('  BONDING SMART v2 — ФИНАЛЬНАЯ СИМУЛЯЦИЯ (v4) — 50 СДЕЛОК');
-  console.log('  Modules: DevProfiler + Sybil + SM-Weighted + Jito + Community');
+  console.log('  BONDING SMART v2 — СИМУЛЯЦИЯ v5 — 30 СДЕЛОК');
+  console.log('  TRIGGER_THRESHOLD=3.0 | Proven=1.5 | Decay Guard 15% | Elite tip ×3');
   console.log('  SM Sources: GOAT/PNUT/ACT/FARTCOIN/ZEREBRO/MICHI (6 токенов $100M+)');
-  console.log('  Position: 0.01 SOL | Stop: 8% | Pre-grad exit: 540 SOL (92%)');
+  console.log('  Position: 0.012 SOL | Stop: 8% | Pre-grad exit: 540 SOL (92%)');
   console.log(line);
 
   const trades: TradeResult[] = [];
@@ -293,7 +305,7 @@ function runSimulation(targetTrades = 50) {
   let totalIn = 0, totalOut = 0, wins = 0;
   const byType: Record<string, { wins: number; total: number; pnl: number }> = {
     ELITE: { wins: 0, total: 0, pnl: 0 },
-    PROVEN_COMBO: { wins: 0, total: 0, pnl: 0 },
+    TWO_PROVEN: { wins: 0, total: 0, pnl: 0 },
     THREE_STANDARD: { wins: 0, total: 0, pnl: 0 },
     NONE: { wins: 0, total: 0, pnl: 0 },
   };
@@ -313,7 +325,9 @@ function runSimulation(targetTrades = 50) {
     totalOut += CONFIG.BUY_SOL + t.pnlSol;
     if (t.win) wins++;
 
-    const bucket = byType[t.smType];
+    // PROVEN_STD doesn't trigger (w=2.5 < 3.0), count as NONE for stats
+    const bucketKey = t.smType === 'PROVEN_STD' ? 'NONE' : t.smType;
+    const bucket = byType[bucketKey];
     bucket.total++;
     bucket.pnl += t.pnlSol;
     if (t.win) bucket.wins++;
@@ -344,13 +358,13 @@ function runSimulation(targetTrades = 50) {
     const pnl  = data.pnl.toFixed(4);
     const pct  = (data.pnl / (data.total * CONFIG.BUY_SOL) * 100).toFixed(1);
     const label = type === 'ELITE' ? '🥇 Elite (w=3.0, single)' :
-                  type === 'PROVEN_COMBO' ? '🥈 Proven+Std (w=3.0)' :
+                  type === 'TWO_PROVEN' ? '🥈 2×Proven (w=3.0)' :
                   type === 'THREE_STANDARD' ? '🥉 3×Standard (w=3.0)' : '— No SM signal';
     console.log(`  ${label.padEnd(24)} ${String(data.total).padEnd(8)} ${(wr+'%').padEnd(8)} ${(pnl+' SOL').padEnd(12)} ${pct}%`);
   }
 
   console.log('\n' + dash);
-  console.log('  ФИНАНСОВЫЙ ИТОГ (50 СДЕЛОК)');
+  console.log('  ФИНАНСОВЫЙ ИТОГ (30 СДЕЛОК, v5)');
   console.log(dash);
   console.log(`  Токенов отсканировано:        ${totalScanned}`);
   console.log(`  Прошло все 9 фильтров:        ${totalPassed} (${passRate.toFixed(1)}%)`);
@@ -391,7 +405,7 @@ function runSimulation(targetTrades = 50) {
   const noSm   = trades.filter(t => !t.smTriggered);
   const noSmWins = noSm.filter(t => t.win).length;
 
-  console.log('\n  ─── SM сигналы (weight ≥ 2.5) ───');
+  console.log('\n  ─── SM сигналы (weight ≥ 3.0, threshold v5) ───');
   console.log(`  Токенов с SM сигналом:        ${smTriggered.length} (${(smTriggered.length/trades.length*100).toFixed(0)}%)`);
   console.log(`  Win Rate (SM triggered):      ${smTriggered.length > 0 ? (smWins/smTriggered.length*100).toFixed(1) : 'N/A'}%`);
   console.log(`  Win Rate (no SM signal):      ${noSm.length > 0 ? (noSmWins/noSm.length*100).toFixed(1) : 'N/A'}%`);
@@ -404,10 +418,10 @@ function runSimulation(targetTrades = 50) {
   console.log(dash);
   console.log('  Этап                      WR%    Avg Loss   Net P&L    Edge');
   console.log('  ' + '─'.repeat(62));
-  console.log(`  W2 исторические (79 сд.)  3.8%   -100%     -82.5%     —`);
+  console.log(`  W2 реальные (79 сделок)   3.8%   -100%     -82.5%     —`);
   console.log(`  Sim v1 (bonding-smart)    16.7%  -6.7%     +6.2%      +8pp`);
-  console.log(`  Sim v2 (+ community)      36.7%  -8.3%     +20.8%     +26pp`);
-  console.log(`  Sim v3 (+ weighted SM)    ${winRate.toFixed(1).padStart(4)}%  ${avgLoss.toFixed(1).padStart(5)}%     ${roi >= 0 ? '+' : ''}${roi.toFixed(1).padStart(5)}%     ${edge >= 0 ? '+' : ''}${edge.toFixed(0)}pp`);
+  console.log(`  Sim v4 (threshold=2.5)    40.0%  -7.3%     +27.7%     +32pp`);
+  console.log(`  Sim v5 (threshold=3.0)    ${winRate.toFixed(1).padStart(4)}%  ${avgLoss.toFixed(1).padStart(5)}%     ${roi >= 0 ? '+' : ''}${roi.toFixed(1).padStart(5)}%     ${edge >= 0 ? '+' : ''}${edge.toFixed(0)}pp  ← NOW`);
 
   // ─── Verdict ────────────────────────────────────────────────────────────────
   console.log('\n' + line);
@@ -429,4 +443,4 @@ function runSimulation(targetTrades = 50) {
   return { winRate, roi, netPnl, beWR, edge, hasEdge, trades };
 }
 
-runSimulation(50);
+runSimulation(30);

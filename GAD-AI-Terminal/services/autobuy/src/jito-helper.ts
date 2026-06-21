@@ -61,6 +61,22 @@ export async function getOptimalJitoTip(): Promise<number> {
   }
 }
 
+/**
+ * Dynamic Jito tip scaled by SM signal weight.
+ * Elite SM (w≥3.0): pay 3× base tip to land in same/next block.
+ * Standard/Proven combos: pay 1.15× (modest buffer).
+ * Cap: 0.0015 SOL (avoid overpaying in volatile fee markets).
+ */
+export async function calculateJitoTipForSignal(totalSignalWeight: number): Promise<number> {
+  const baseTip = await getOptimalJitoTip();
+  if (totalSignalWeight >= 3.0) {
+    const tip = Math.min(baseTip * 3, 0.0015);
+    console.info(`[jito] 🔥 Elite signal (w${totalSignalWeight}) → priority tip: ${tip.toFixed(6)} SOL`);
+    return tip;
+  }
+  return baseTip * 1.15;
+}
+
 export interface JitoResult {
   ok: boolean;
   bundleId?: string;

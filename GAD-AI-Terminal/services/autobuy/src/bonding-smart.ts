@@ -36,7 +36,7 @@ import { query } from '@lib/db';
 import { analyzeDevReputation }   from './dev-profiler';
 import { detectSybilAttack, detectEarlyBundle } from './sybil-detector';
 import { registerBuy, getConfirmations }        from './smart-money-tracker';
-import { sendTxWithFallback }                   from './jito-helper';
+import { sendTxWithFallback, calculateJitoTipForSignal } from './jito-helper';
 import { checkPumpFunSentiment }                from './social-sentiment';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -78,9 +78,30 @@ const USE_JITO             = process.env.USE_JITO !== 'false';  // default: true
 // Dev reputation min score (0-100)
 const MIN_DEV_SCORE        = Number(process.env.BONDING_SMART_MIN_DEV_SCORE || '35');
 
+// Price decay guard: max price movement from SM entry before we skip the trade
+const MAX_DECAY_PCT        = Number(process.env.BONDING_SMART_MAX_DECAY_PCT || '15');
+
 // Slippage
 const BASE_SLIPPAGE_BPS    = 500;
 const DUMP_SLIPPAGE_BPS    = 1500;
+
+// ─── Price decay guard ────────────────────────────────────────────────────────
+// When copy-trading SM, if the price already moved >MAX_DECAY_PCT from their entry
+// we are buying the top and become exit liquidity — skip the trade.
+export function checkPriceDecay(
+  smEntryPrice: number,
+  currentPrice: number,
+  maxDecayPct: number = MAX_DECAY_PCT,
+): { allowed: boolean; decayPct: number } {
+  if (smEntryPrice <= 0) return { allowed: true, decayPct: 0 };
+  const decayPct = ((currentPrice - smEntryPrice) / smEntryPrice) * 100;
+  if (decayPct > maxDecayPct) {
+    console.warn(`[decay-guard] ❌ Skip: price +${decayPct.toFixed(1)}% above SM entry (limit ${maxDecayPct}%)`);
+    return { allowed: false, decayPct };
+  }
+  console.debug(`[decay-guard] ✅ Decay OK: +${decayPct.toFixed(1)}%`);
+  return { allowed: true, decayPct };
+}
 
 const GRADUATION_SOL       = 588;
 const PUMPPORTAL_WS        = 'wss://pumpportal.fun/api/data';
