@@ -815,7 +815,7 @@ async function fetchRaydiumPairs(): Promise<any[]> {
   try {
     for (let page = 1; page <= 3; page++) {
       const gR = await axios.get(
-        `${GECKO_BASE}/networks/solana/dexes/raydium/pools?sort=pool_created_at_desc&page=${page}&limit=25`,
+        `${GECKO_BASE}/networks/solana/new_pools?page=${page}`,
         { headers: GECKO_HEADERS, timeout: 7_000 }
       );
       const pools: any[] = gR.data?.data ?? [];
@@ -823,14 +823,14 @@ async function fetchRaydiumPairs(): Promise<any[]> {
       let added = 0;
       for (const pool of pools) {
         const pair = geckoPoolToPair(pool);
-        if (!pair) continue;
+        if (!pair) continue; // geckoPoolToPair filters non-Raydium DEXes
         const mint = pair.baseToken?.address;
         if (!mint || seen.has(mint)) continue;
         seen.add(mint);
         results.push(pair);
         added++;
       }
-      if (added > 0) console.debug(`[raydium-scan] GeckoTerminal newest (page ${page}): ${added} fresh Raydium pairs`);
+      if (added > 0) console.debug(`[raydium-scan] GeckoTerminal new_pools (page ${page}): ${added} fresh Raydium pairs`);
       await new Promise(r => setTimeout(r, 300));
     }
   } catch (e: any) {
