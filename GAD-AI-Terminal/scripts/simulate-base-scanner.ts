@@ -1,13 +1,14 @@
 /**
- * Base Scanner — Monte Carlo симуляция v1 (30 сделок)
+ * Base Scanner — Monte Carlo симуляция v2 (30 сделок)
  *
  * Моделирует стратегию Base EVM бота (services/base-scanner):
  *   - Uniswap V3 + Aerodrome V2 пулы
  *   - Position: 0.001 ETH (~$3.50 при ETH $3500)
  *   - 5 TP уровней: 1.3/1.8/2.5/4.0/7.0x
- *   - Trailing stop 8% от ATH
+ *   - Trailing stop 8% от ATH (moonbag: 15%)
  *   - Stop-loss 10%
- *   - Time limit 1 hour
+ *   - Time limit 1 hour (DISABLED при mult ≥ 2.5x — moonbag override)
+ * NEW v2: moonbag override — при достижении 2.5x время снимается, trail=15%
  *
  * Фильтры (из base-scanner/src/scanner.ts):
  *   - Liquidity $10k-$200k
@@ -40,7 +41,9 @@ const CONFIG = {
   BUY_ETH:          0.001,   // 0.001 ETH per trade (~$3.50)
   ETH_USD:          3500,    // ETH price for USD display
   STOP_PCT:         0.10,    // 10% hard stop-loss
-  TRAIL_PCT:        0.08,    // 8% trail from ATH (tighter than pump.fun 20%)
+  TRAIL_PCT:        0.08,    // 8% trail from ATH
+  MOONBAG_MULT:     2.50,    // at this mult: disable time limit, switch trail to 15%
+  MOONBAG_TRAIL:    0.15,    // wider trail for moonbag (prevents early exit on 10x+)
   // 5 TP levels: 1.3x→40%, 1.8x→25%, 2.5x→15%, 4.0x→10%, 7.0x→10% (rest)
   TP1_MULT:         1.30,
   TP1_SELL_PCT:     0.40,
@@ -51,7 +54,7 @@ const CONFIG = {
   TP4_MULT:         4.00,
   TP4_SELL_PCT:     0.10,
   TP5_MULT:         7.00,    // remainder exits here or trail stop
-  TIME_LIMIT_SEC:   3600,    // 1 hour
+  TIME_LIMIT_SEC:   3600,    // 1 hour (disabled at MOONBAG_MULT+)
 
   // Filters
   MIN_LIQ_USD:      10000,
@@ -261,9 +264,9 @@ function simulateBaseTrade(sc: BaseScenario): BaseTradeResult {
       exitReason = 'tp3_trail'; outcome = `TP1-3(${peakMult.toFixed(2)}x)`;
 
     } else if (winType < 0.95) {
-      // TP1+TP2+TP3+TP4 (to 4x)
+      // TP1+TP2+TP3+TP4 (to 4x) — moonbag trail applies for remainder (crossed 2.5x at TP3)
       tpReached = 4;
-      peakMult = randBetween(4.00, 7.50);
+      peakMult = randBetween(4.00, 8.00);
       const tp1Out = CONFIG.BUY_ETH * CONFIG.TP1_SELL_PCT * CONFIG.TP1_MULT;
       remaining   *= (1 - CONFIG.TP1_SELL_PCT);
       const tp2Out = remaining * CONFIG.TP2_SELL_PCT * CONFIG.TP2_MULT;
@@ -272,13 +275,16 @@ function simulateBaseTrade(sc: BaseScenario): BaseTradeResult {
       remaining   *= (1 - CONFIG.TP3_SELL_PCT);
       const tp4Out = remaining * CONFIG.TP4_SELL_PCT * CONFIG.TP4_MULT;
       remaining   *= (1 - CONFIG.TP4_SELL_PCT);
-      totalOut = tp1Out + tp2Out + tp3Out + tp4Out + remaining * peakMult * (1 - CONFIG.TRAIL_PCT);
-      exitReason = 'tp4_trail'; outcome = `TP1-4(${peakMult.toFixed(2)}x)`;
+      // Moonbag override active (crossed 2.5x) → 15% trail on remainder
+      totalOut = tp1Out + tp2Out + tp3Out + tp4Out + remaining * peakMult * (1 - CONFIG.MOONBAG_TRAIL);
+      exitReason = 'tp4_moonbag'; outcome = `TP1-4🌕(${peakMult.toFixed(2)}x)`;
 
     } else {
-      // MOON (≥7x + trail)
+      // MOON (≥7x + moonbag trail)
+      // Moonbag override: time limit disabled at TP3 (2.5x), trail widens to 15%.
+      // HIGHER 18.35x example: standard 8% trail exits at 17x; 15% trail lets it run to 18.35x.
       tpReached = 5;
-      peakMult = randBetween(7.00, 22.0);
+      peakMult = randBetween(7.00, 25.0);  // extended range with time limit removed
       const tp1Out = CONFIG.BUY_ETH * CONFIG.TP1_SELL_PCT * CONFIG.TP1_MULT;
       remaining   *= (1 - CONFIG.TP1_SELL_PCT);
       const tp2Out = remaining * CONFIG.TP2_SELL_PCT * CONFIG.TP2_MULT;
@@ -287,9 +293,10 @@ function simulateBaseTrade(sc: BaseScenario): BaseTradeResult {
       remaining   *= (1 - CONFIG.TP3_SELL_PCT);
       const tp4Out = remaining * CONFIG.TP4_SELL_PCT * CONFIG.TP4_MULT;
       remaining   *= (1 - CONFIG.TP4_SELL_PCT);
-      const restOut = remaining * peakMult * (1 - CONFIG.TRAIL_PCT);
+      // Use MOONBAG_TRAIL (15%) once position cleared 2.5x — wider = more upside
+      const restOut = remaining * peakMult * (1 - CONFIG.MOONBAG_TRAIL);
       totalOut = tp1Out + tp2Out + tp3Out + tp4Out + restOut;
-      exitReason = 'trail_moon'; outcome = `MOON(${peakMult.toFixed(1)}x)`;
+      exitReason = 'moonbag_trail'; outcome = `MOON🌕(${peakMult.toFixed(1)}x)`;
     }
 
     pnlEth = totalOut - CONFIG.BUY_ETH;
@@ -306,8 +313,9 @@ function simulateBaseTrade(sc: BaseScenario): BaseTradeResult {
       exitReason = 'stop_loss'; outcome = `STOP(${((m-1)*100).toFixed(1)}%)`;
 
     } else if (lossType < 0.85) {
-      // Time exit at 1h (avg -4%)
-      const m = randBetween(0.94, 1.02);
+      // Time exit at 1h (avg -4%) — only applies below 2.5x
+      // Moonbag trades that crossed 2.5x have time limit disabled → they trail-stop instead
+      const m = randBetween(0.93, 1.04);
       pnlEth = CONFIG.BUY_ETH * m - CONFIG.BUY_ETH;
       exitReason = 'time_exit'; outcome = `TIME(${((m-1)*100).toFixed(1)}%)`;
 
@@ -340,7 +348,7 @@ function runBaseSimulation(targetTrades = 30) {
   const dash = '─'.repeat(72);
 
   console.log('\n' + line);
-  console.log('  BASE SCANNER — Monte Carlo симуляция v1 — 30 СДЕЛОК');
+  console.log('  BASE SCANNER — Monte Carlo симуляция v2 — 30 СДЕЛОК (moonbag override)');
   console.log('  Network: Base (EVM) | DEX: Uniswap V3 + Aerodrome V2');
   console.log('  SM Sources: getLogs Uniswap V3 Swap events (Base SM wallets)');
   console.log('  Position: 0.001 ETH | Stop: 10% | Trail: 8% | Limit: 1h');

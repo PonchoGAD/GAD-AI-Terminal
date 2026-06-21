@@ -14,6 +14,11 @@ const STOP_LOSS_PCT    = Number(process.env.BASE_STOP_LOSS_PCT     || '8');
 const TRAIL_PCT        = Number(process.env.BASE_TRAIL_PCT         || '10');   // 10% (was 12%)
 const EARLY_TRAIL_PCT  = Number(process.env.BASE_EARLY_TRAIL_PCT   || '3');
 const TIME_LIMIT_SEC   = Number(process.env.BASE_TIME_LIMIT_SEC    || '5400'); // 1.5h (was 2h)
+
+// Moonbag override: once a position reaches this multiplier, disable time limit
+// and widen the trail stop — let winners run instead of capping them at 1.5h.
+const MOONBAG_MULT     = Number(process.env.BASE_MOONBAG_MULT      || '2.5');
+const MOONBAG_TRAIL    = Number(process.env.BASE_MOONBAG_TRAIL_PCT || '15');
 const POLL_INTERVAL_MS = Number(process.env.BASE_POLL_INTERVAL_MS  || '10000');
 const BUY_ETH          = Number(process.env.BASE_BUY_ETH           || '0.001');
 
@@ -183,10 +188,22 @@ async function pollPosition(pos: Position): Promise<void> {
   const ageSec = (Date.now() - new Date(pos.bought_at).getTime()) / 1000;
   const stopPrice = pos.entry_price_eth * (1 - STOP_LOSS_PCT / 100);
 
-  // Time limit — forced exit
-  if (ageSec > TIME_LIMIT_SEC) {
+  // Moonbag override: once the position has hit MOONBAG_MULT (default 2.5x), disable time
+  // limit and widen trail to MOONBAG_TRAIL — let big winners run past the standard 1.5h cap.
+  const isMoonbag = mult >= MOONBAG_MULT || (pos.trail_high / pos.entry_price_eth >= MOONBAG_MULT);
+  const activeTrailPct = isMoonbag ? MOONBAG_TRAIL : TRAIL_PCT;
+
+  // Time limit — forced exit (skipped for moonbag positions)
+  if (!isMoonbag && ageSec > TIME_LIMIT_SEC) {
     await sellPosition(pos, 'TIME_LIMIT', 100, 0);
     return;
+  }
+  if (isMoonbag && pos.tp_index === 0) {
+    // Became a moonbag without hitting TP1 yet — unusual but protect against stall
+    if (ageSec > TIME_LIMIT_SEC * 2) {
+      await sellPosition(pos, 'MOONBAG_TIMEOUT', 100, 0);
+      return;
+    }
   }
 
   // Stop loss — forced exit
@@ -204,7 +221,7 @@ async function pollPosition(pos: Position): Promise<void> {
 
   if (trailActive) {
     const newHigh = Math.max(pos.trail_high, currentPrice);
-    const trailStop = newHigh * (1 - TRAIL_PCT / 100);
+    const trailStop = newHigh * (1 - activeTrailPct / 100);
 
     if (newHigh !== pos.trail_high) {
       await query(`UPDATE base_positions SET trail_high=$2 WHERE id=$1`, [pos.id, newHigh]);
@@ -212,10 +229,16 @@ async function pollPosition(pos: Position): Promise<void> {
     }
 
     if (currentPrice <= trailStop) {
-      const reason = earlyTrailActive && pos.tp_index === 0 ? 'EARLY_TRAIL' : 'TRAIL_STOP';
+      const reason = isMoonbag                          ? 'MOONBAG_TRAIL'
+                   : earlyTrailActive && pos.tp_index === 0 ? 'EARLY_TRAIL'
+                   :                                         'TRAIL_STOP';
       await sellPosition(pos, reason, 100, 0);
       return;
     }
+  }
+
+  if (isMoonbag && pos.tp_index === 0) {
+    console.info(`[base-monitor] 🌕 ${pos.symbol} MOONBAG ${mult.toFixed(2)}x — time limit lifted, trail widened to ${activeTrailPct}%`);
   }
 
   // TP levels — use 3% slippage protection against MEV sandwiches
@@ -226,7 +249,10 @@ async function pollPosition(pos: Position): Promise<void> {
     if (!isLast) console.info(`[base-monitor] ${pos.symbol} TP${pos.tp_index + 1} hit — holding ${100 - nextTp.sellPct}% with ${TRAIL_PCT}% trail`);
   }
 
-  console.debug(`[base-monitor] ${pos.symbol} ${mult.toFixed(3)}x [stop:${(STOP_LOSS_PCT)}% trail:${pos.trail_high > 0 ? `${(pos.trail_high * (1 - TRAIL_PCT / 100) / pos.entry_price_eth * 100 - 100).toFixed(0)}%` : 'inactive'}]`);
+  const trailStopPct = pos.trail_high > 0
+    ? (pos.trail_high * (1 - activeTrailPct / 100) / pos.entry_price_eth * 100 - 100).toFixed(0)
+    : 'inactive';
+  console.debug(`[base-monitor] ${pos.symbol} ${mult.toFixed(3)}x [stop:${STOP_LOSS_PCT}% trail:${trailStopPct}%${isMoonbag ? ' 🌕' : ''}]`);
 }
 
 let monitorRunning = false;
@@ -253,6 +279,7 @@ export function startMonitor(): void {
   console.info(
     `[base-monitor] Starting — poll:${POLL_INTERVAL_MS / 1000}s | ` +
     `stop:${STOP_LOSS_PCT}% | trail:${TRAIL_PCT}% (early@+${EARLY_TRAIL_PCT}%) | ` +
+    `moonbag@${MOONBAG_MULT}x→trail:${MOONBAG_TRAIL}% | ` +
     `TP:${BASE_TPS.map(t => `${t.mult}x→${t.sellPct}%`).join('/')} | time:${TIME_LIMIT_SEC / 3600}h`
   );
   setInterval(() => monitorLoop().catch(console.error), POLL_INTERVAL_MS);

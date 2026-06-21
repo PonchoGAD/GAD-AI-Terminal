@@ -22,6 +22,7 @@ import FormData from 'form-data';
 import bs58 from 'bs58';
 import { Keypair, Connection, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { query } from '@lib/db';
+import { cleanAndSlimTrendText } from '../utils/text-cleaner';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -66,13 +67,13 @@ interface TrendSignal {
 
 async function generateCoinConcept(trendText: string, tweetUrl: string): Promise<CoinConcept> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  const CONCEPT_PROMPT = (text: string, url: string) =>
-    `Based on this viral X (Twitter) post/trend, create a meme coin concept for pump.fun.\n` +
-    `Keep it fun, punchy, crypto-community style. Must be unique and memorable.\n\n` +
-    `Trend: "${text.slice(0, 300)}"\n` +
-    `Source: ${url || 'trending news'}\n\n` +
-    `Reply with ONLY valid JSON (no markdown fences):\n` +
-    `{"ticker":"TICK","name":"Full Token Name","description":"Fun description under 180 chars with crypto humor","imagePrompt":"simple meme coin logo, cartoon style, {theme imagery}, cute, vibrant colors, white background, flat illustration"}`;
+  // Clean text before sending to LLM — removes URLs/@mentions/special chars, caps at 250 chars
+  const cleanText = cleanAndSlimTrendText(trendText, 250);
+
+  const CONCEPT_PROMPT = (text: string) =>
+    `X trend: "${text}"\n` +
+    `Create pump.fun meme coin. Reply ONLY valid JSON:\n` +
+    `{"ticker":"TICK","name":"Name","description":"<180 chars","imagePrompt":"cartoon meme coin logo, {theme}, cute, vibrant, white bg"}`;
 
   function parseConcept(raw: string): CoinConcept {
     const jsonStr = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
@@ -88,8 +89,8 @@ async function generateCoinConcept(trendText: string, tweetUrl: string): Promise
       const Anthropic = (await import('@anthropic-ai/sdk')).default;
       const client = new Anthropic({ apiKey });
       const msg = await client.messages.create({
-        model: 'claude-haiku-4-5-20251001', max_tokens: 256,
-        messages: [{ role: 'user', content: CONCEPT_PROMPT(trendText, tweetUrl) }],
+        model: 'claude-haiku-4-5-20251001', max_tokens: 150,
+        messages: [{ role: 'user', content: CONCEPT_PROMPT(cleanText) }],
       });
       const parsed = parseConcept(((msg.content[0] as any).text ?? '').trim());
       console.info(`[trend-launch] Claude concept: $${parsed.ticker} — "${parsed.name}"`);
@@ -103,8 +104,8 @@ async function generateCoinConcept(trendText: string, tweetUrl: string): Promise
         try {
           const res = await axios.post(
             'https://api.openai.com/v1/chat/completions',
-            { model: 'gpt-4o-mini', max_tokens: 256,
-              messages: [{ role: 'user', content: CONCEPT_PROMPT(trendText, tweetUrl) }] },
+            { model: 'gpt-4o-mini', max_tokens: 150,
+              messages: [{ role: 'user', content: CONCEPT_PROMPT(cleanText) }] },
             { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
               timeout: 20000 }
           );
@@ -143,7 +144,7 @@ async function generateLogo(imagePrompt: string): Promise<Buffer> {
   const seed = Date.now() % 99999;
   const url  = `https://image.pollinations.ai/prompt/${encodeURIComponent(imagePrompt)}?width=500&height=500&nologo=true&seed=${seed}`;
   console.info('[trend-launch] Generating logo via Pollinations.ai…');
-  const res = await axios.get(url, { responseType: 'arraybuffer', timeout: 60000 });
+  const res = await axios.get(url, { responseType: 'arraybuffer', timeout: 45000 });
   const buf = Buffer.from(res.data as ArrayBuffer);
   console.info(`[trend-launch] Logo ready (${buf.length} bytes)`);
   return buf;
@@ -239,7 +240,32 @@ const WALLET_CONFIGS = [
   { envKey: 'PUMPFUN_WALLET_PRIVATE_KEY_2', alias: 'W3', buySol: 0.01 },
 ];
 
-// ─── Get top N qualifying trends (deduped by theme) ──────────────────────────
+// ─── 24h theme dedup — prevents launching the same theme twice in one day ─────
+
+async function isThemeOnCooldown(theme: string): Promise<boolean> {
+  try {
+    const { rows } = await query<{ cnt: string }>(`
+      SELECT COUNT(*) as cnt FROM coin_launches
+      WHERE ticker = (
+        SELECT ticker FROM coin_ideas
+        WHERE description LIKE $1
+          AND source = 'trend_auto_launch'
+          AND created_at > now() - interval '24 hours'
+        LIMIT 1
+      )
+    `, [`%${theme}%`]);
+    // Simpler: check x_trend_signals action for the same theme in last 24h
+    const { rows: rows2 } = await query<{ cnt: string }>(`
+      SELECT COUNT(*) as cnt FROM x_trend_signals
+      WHERE theme = $1
+        AND action LIKE 'LAUNCHED%'
+        AND created_at > now() - interval '24 hours'
+    `, [theme]);
+    return Number(rows2[0]?.cnt ?? 0) > 0;
+  } catch { return false; } // fail-open: allow launch on DB error
+}
+
+// ─── Get top N qualifying trends (deduped by theme, 24h cooldown applied) ─────
 
 async function getTopTrends(limit: number): Promise<TrendSignal[]> {
   try {
@@ -260,11 +286,15 @@ async function getTopTrends(limit: number): Promise<TrendSignal[]> {
     const seen = new Set<string>();
     const result: TrendSignal[] = [];
     for (const row of rows) {
-      if (!seen.has(row.theme)) {
-        seen.add(row.theme);
-        result.push(row);
-        if (result.length >= limit) break;
+      if (seen.has(row.theme)) continue;
+      // Skip themes launched in last 24h (prevents spam from same narrative)
+      if (await isThemeOnCooldown(row.theme)) {
+        console.info(`[trend-launch] Theme ${row.theme} on 24h cooldown — skipping`);
+        continue;
       }
+      seen.add(row.theme);
+      result.push(row);
+      if (result.length >= limit) break;
     }
     return result;
   } catch (err: any) {
@@ -455,7 +485,7 @@ export async function runTrendLaunchCycle(): Promise<void> {
     if (!kp) { console.warn(`[trend-launch] ${cfg.alias}: key not configured — skipping`); continue; }
 
     const bal = await getWalletSolBalance(kp);
-    const minRequired = 0.025;
+    const minRequired = 0.05;  // rent (~0.016) + max dev buy (0.03) + gas buffer (0.004)
     if (bal < minRequired) {
       console.warn(`[trend-launch] ${cfg.alias}: balance ${bal.toFixed(4)} SOL < ${minRequired} SOL minimum — skipping`);
       await tgNotifyPrivate(`⚠️ *${cfg.alias} skipped* — balance ${bal.toFixed(4)} SOL (need ≥${minRequired} SOL)`);
