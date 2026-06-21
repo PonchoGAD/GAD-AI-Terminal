@@ -269,12 +269,12 @@ function simulateTrade(sc: TokenScenario): TradeResult {
 
 // ─── Run simulation ───────────────────────────────────────────────────────────
 
-function runSimulation(targetTrades = 30) {
+function runSimulation(targetTrades = 50) {
   const line = '═'.repeat(70);
   const dash = '─'.repeat(70);
 
   console.log('\n' + line);
-  console.log('  BONDING SMART v2 — СИМУЛЯЦИЯ v5 — 30 СДЕЛОК');
+  console.log(`  BONDING SMART v2 — СИМУЛЯЦИЯ v5 — ${targetTrades} СДЕЛОК`);
   console.log('  TRIGGER_THRESHOLD=3.0 | Proven=1.5 | Decay Guard 15% | Elite tip ×3');
   console.log('  SM Sources: GOAT/PNUT/ACT/FARTCOIN/ZEREBRO/MICHI (6 токенов $100M+)');
   console.log('  Position: 0.012 SOL | Stop: 8% | Pre-grad exit: 540 SOL (92%)');
@@ -443,4 +443,4 @@ function runSimulation(targetTrades = 30) {
   return { winRate, roi, netPnl, beWR, edge, hasEdge, trades };
 }
 
-runSimulation(30);
+runSimulation(50);

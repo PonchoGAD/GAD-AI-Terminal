@@ -8,7 +8,10 @@ import { getOpenPositions, closePosition, LIVE_MODE } from './drift-trader';
 import { getCapitalState, updateCapitalState } from './capital-manager';
 import { OpenPosition } from './types';
 
-const POLL_MS       = parseInt(process.env.FUTURES_RISK_POLL_MS || '3000', 10);
+// VULN 4: Tightened from 3000ms → 1000ms to reduce Flash Crash exposure window.
+// Off-chain poll can't beat on-chain liquidation in extreme events — for LIVE mode,
+// place Stop-Market orders via Drift SDK in openPosition() instead of relying on this loop.
+const POLL_MS       = parseInt(process.env.FUTURES_RISK_POLL_MS || '1000', 10);
 const TP_PCT        = parseFloat(process.env.FUTURES_TP_PCT     || '0.04');
 const SL_PCT        = parseFloat(process.env.FUTURES_SL_PCT     || '0.02');
 const TRAIL_PCT     = parseFloat(process.env.FUTURES_TRAIL_PCT  || '0.015');

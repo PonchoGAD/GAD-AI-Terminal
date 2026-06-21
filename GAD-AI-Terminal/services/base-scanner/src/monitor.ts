@@ -1,6 +1,8 @@
 import { ethers } from 'ethers';
 import { query } from '@lib/db';
 import { sellToken, getTokenBalance, getEthBalance } from '@lib/base';
+import { getProvider } from '@lib/base/src/provider';
+import { checkTokenV3Liquidity } from './v3-liquidity-check';
 import axios from 'axios';
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -108,11 +110,23 @@ async function sellPosition(pos: Position, reason: string, sellPct: number, slip
 
   const ethBalBefore = await getEthBalance();
 
-  // Always sell via same DEX used for buying (stored in pos.dex) — avoids K-invariant reverts.
-  // pos.dex is stored as 'uniswap_v3' | 'uniswap_v2' | 'aerodrome' from TradeResult.
-  const sellDex = (pos.dex === 'aerodrome' ? 'aerodrome'
-                 : pos.dex === 'uniswap_v2' ? 'uniswap_v2'
-                 : 'uniswap_v3') as 'uniswap_v3' | 'uniswap_v2' | 'aerodrome';
+  // VULN 1: V3 Tick Liquidity Starvation guard.
+  // If token price fell below the LP range lower bound, V3 active liquidity = 0.
+  // Router will STF-revert at any slippage setting — must downgrade to V2 route.
+  let sellDex = (pos.dex === 'aerodrome' ? 'aerodrome'
+               : pos.dex === 'uniswap_v2' ? 'uniswap_v2'
+               : 'uniswap_v3') as 'uniswap_v3' | 'uniswap_v2' | 'aerodrome';
+
+  if (sellDex === 'uniswap_v3') {
+    const { isActiveLiquidityEmpty } = await checkTokenV3Liquidity(
+      getProvider(), pos.contract_address, pos.fee_tier || 10000
+    ).catch(() => ({ isActiveLiquidityEmpty: false })); // fail-open: attempt V3 if check errors
+    if (isActiveLiquidityEmpty) {
+      console.warn(`[base-monitor] ${pos.symbol} V3 tick empty — downgrading sell route to uniswap_v2`);
+      sellDex = 'uniswap_v2';
+    }
+  }
+
   const result = await sellToken(
     pos.contract_address,
     amountToSell,

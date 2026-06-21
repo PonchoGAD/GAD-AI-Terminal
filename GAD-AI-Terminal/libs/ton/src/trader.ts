@@ -52,9 +52,13 @@ export async function buyJetton(
 
     const totalValue = offerAmount + GAS_RESERVE_TON;
     const seqno = await getNextSecureSeqno(wo);
+    // VULN 3: Hard TTL of 90s — if STON.fi is congested and TX stays in mempool >90s,
+    // the network auto-expires it without executing. Without this, a 3-min-delayed sell
+    // executes at a price 90% lower than when it was sent.
     await wo.sendTransfer({
       seqno,
       secretKey: keyPair.secretKey,
+      timeout: 90,
       messages: [
         internal({
           to:    txParams.to,
@@ -112,9 +116,13 @@ export async function sellJetton(
     });
 
     const seqno = await getNextSecureSeqno(wo);
+    // VULN 3: Hard TTL of 90s — if STON.fi is congested and TX stays in mempool >90s,
+    // the network auto-expires it without executing. Without this, a 3-min-delayed sell
+    // executes at a price 90% lower than when it was sent.
     await wo.sendTransfer({
       seqno,
       secretKey: keyPair.secretKey,
+      timeout: 90,
       messages: [
         internal({
           to:    txParams.to,

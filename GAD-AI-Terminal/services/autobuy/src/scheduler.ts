@@ -14,6 +14,7 @@ import { startGraduationScanner } from './graduation-scanner';
 import { startBondingScanner } from './bonding-scanner';
 import { startBondingSmart } from './bonding-smart';
 import { startCopyTrader } from './copy-trader';
+import { getRaydiumOnChainPrice, hasRaydiumVaults } from './raydium-price-fetcher';
 
 const POLL_MS    = Number(process.env.AUTOBUY_POLL_SECONDS  || '15') * 1000;
 const MAX_ERRORS = Number(process.env.AUTOBUY_MAX_ERRORS    || '5');
@@ -138,11 +139,24 @@ async function checkMarketBuyGate(): Promise<{ allowed: boolean; reason: string;
   }
 }
 
-// ─── Jupiter Lite price fetch (primary — fast, batch-friendly, no auth) ───────
-// Falls back to DexScreener if Jupiter returns 0.
+// ─── Price fetch pipeline ──────────────────────────────────────────────────────
+// Priority: 1. Raydium on-chain (0ms lag, needs vault cache) → 2. Jupiter Lite (~200ms)
+// → 3. DexScreener (15-45s lag, fallback only).
+// VULN 2: Raydium on-chain added as primary to eliminate DexScreener stop-loss lag.
 async function getPriceSolViaDS(mint: string): Promise<number> {
   const cached = priceCache.get(mint);
   if (cached && Date.now() - cached.ts < PRICE_CACHE_MS) return cached.price;
+
+  // Primary: on-chain Raydium vault balance read (0ms lag) — if vault addresses cached
+  if (hasRaydiumVaults(mint)) {
+    try {
+      const onChainPrice = await getRaydiumOnChainPrice(getConnection(), mint);
+      if (onChainPrice > 0) {
+        priceCache.set(mint, { price: onChainPrice, ts: Date.now() });
+        return onChainPrice;
+      }
+    } catch { /* fall through to Jupiter */ }
+  }
 
   // Try Jupiter Lite first — typically <200ms, no rate-limit issues with single-mint calls
   try {
