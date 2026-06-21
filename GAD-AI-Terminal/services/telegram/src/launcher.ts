@@ -20,7 +20,10 @@
 import axios from 'axios';
 import FormData from 'form-data';
 import bs58 from 'bs58';
-import { Keypair, Connection, VersionedTransaction } from '@solana/web3.js';
+import {
+  Keypair, Connection, VersionedTransaction, Transaction,
+  ComputeBudgetProgram,
+} from '@solana/web3.js';
 import { query } from '@lib/db';
 
 const SOLANA_RPC     = process.env.SOLANA_RPC   ?? 'https://api.mainnet-beta.solana.com';
@@ -206,30 +209,45 @@ async function createSingleToken(
     const mintKp = Keypair.generate();
     const mintAddr = mintKp.publicKey.toBase58();
 
-    // Fetch raw image bytes for SDK blob
-    const imageBytes = await axios.get(`https://gateway.pinata.cloud/ipfs/${imageCid}`, {
-      responseType: 'arraybuffer', timeout: 15000
-    }).then(r => Buffer.from(r.data));
-    const imageBlob = new Blob([imageBytes as unknown as ArrayBuffer], { type: 'image/png' });
-
-    const createResult = await sdk.createAndBuy(
-      wallet, mintKp,
-      {
-        name: cfg.name, symbol: cfg.ticker, description: cfg.description,
-        file: imageBlob, twitter: cfg.twitter ?? '', telegram: cfg.telegram ?? '',
-        website: cfg.website ?? 'https://gadai.shop', metadataUri: metaUri,
-      } as any,
-      BigInt(Math.round(cfg.devBuySol * 1e9)),
-      500n, // 5% slippage
-      { unitLimit: 250000, unitPrice: 250000 }
+    // Step 1: create token — uses only the `create` instruction (no buy, no broken 18-acc structure)
+    // sdk.getCreateInstructions takes the pre-built Pinata metaUri directly — no IPFS upload needed
+    const createIx = await (sdk as any).getCreateInstructions(
+      wallet.publicKey, cfg.name, cfg.ticker, metaUri, mintKp
     );
 
-    if (!createResult.success) {
-      return { ok: false, walletAlias, error: 'createAndBuy failed' };
+    const cuIx = ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 });
+    const cuPrice = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 250_000 });
+
+    const createTxObj = new Transaction().add(cuIx, cuPrice);
+    // getCreateInstructions returns a Transaction — extract its instructions
+    if (createIx instanceof Transaction) {
+      createIx.instructions.forEach((ix: any) => createTxObj.add(ix));
+    } else {
+      createTxObj.add(createIx);
     }
 
-    const createTx = createResult.signature;
-    console.info(`[launcher] ✅ ${walletAlias} token created: ${mintAddr} TX: ${createTx}`);
+    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
+    createTxObj.recentBlockhash = blockhash;
+    createTxObj.feePayer = wallet.publicKey;
+    createTxObj.sign(wallet, mintKp);
+
+    const createSig = await conn.sendRawTransaction(createTxObj.serialize(), {
+      skipPreflight: false, maxRetries: 3,
+    });
+    await conn.confirmTransaction({ signature: createSig, blockhash, lastValidBlockHeight }, 'confirmed');
+    console.info(`[launcher] ✅ ${walletAlias} token created: ${mintAddr} TX: ${createSig}`);
+
+    // Step 2: dev buy via PumpPortal trade-local (server builds correct 18-account TX)
+    if (cfg.devBuySol > 0) {
+      try {
+        // Wait a few seconds for the bonding curve to be indexed
+        await new Promise(r => setTimeout(r, 4000));
+        const buySig = await pumpBuy(conn, wallet, mintAddr, cfg.devBuySol);
+        console.info(`[launcher] ✅ ${walletAlias} dev buy TX: ${buySig}`);
+      } catch (buyErr: any) {
+        console.warn(`[launcher] ⚠️ ${walletAlias} dev buy failed (token created): ${buyErr.message}`);
+      }
+    }
 
     // Log to DB
     await query(`
@@ -237,10 +255,10 @@ async function createSingleToken(
                                   wallet_alias, wallet_address, coin_idea_id, created_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now())
       ON CONFLICT DO NOTHING
-    `, [mintAddr, cfg.ticker, cfg.name, cfg.devBuySol, imageUrl, metaUri, createTx,
+    `, [mintAddr, cfg.ticker, cfg.name, cfg.devBuySol, imageUrl, metaUri, createSig,
         walletAlias, wallet.publicKey.toBase58(), coinIdeaId ?? null]).catch(() => {});
 
-    return { ok: true, walletAlias, mintAddr, createTx };
+    return { ok: true, walletAlias, mintAddr, createTx: createSig };
   } catch (err: any) {
     console.error(`[launcher] ${walletAlias} createSingleToken failed:`, err.message);
     return { ok: false, walletAlias, error: err.message };
