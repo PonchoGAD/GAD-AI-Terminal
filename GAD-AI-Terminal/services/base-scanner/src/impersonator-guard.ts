@@ -1,18 +1,25 @@
 /**
  * Anti-Impersonator Guard for Base Network
  *
- * Problem: Scammers create tokens named SOL, BNB, cbSOL, wSOL.base, etc.
+ * Problem: Scammers create tokens named SOL, BNB, cbSOL, cbXRP, wSOL.base, etc.
  * to appear in DexScreener/aggregator searches. These are honeypots 99.9% of the time.
  *
- * Solution: Two-layer defense:
- *   Layer 1 (fast): Symbol pattern matching — catches exact and variant matches (wSOL, cbSOL, SOL-wrapped)
- *   Layer 2 (precise): If the symbol matches a known cross-chain asset but the contract
- *                      address is NOT the official bridge address → confirmed impersonator
+ * Root cause of missed detections: `/\bXRP\b/` does NOT match "cbXRP" because
+ * there is no word boundary between 'b' and 'X' in "cbXRP" — both are word chars.
+ * Fix: Add explicit `/\bCB[A-Z]{2,8}\b/` pattern to catch ALL cb-prefixed tokens
+ * (cbXRP, cbADA, cbDOT, cbETH, cbNEAR, cbSUI, ...).
  *
- * Why not just block all matching symbols?
- *   The real cbBTC (Coinbase BTC) and real cbSOL ARE legitimate Base tokens with known addresses.
- *   We still don't want to trade them (they're bridge assets, not meme tokens), but the
- *   address check gives us ground truth for future use cases.
+ * Solution: Two-layer defense:
+ *   Layer 1 (fast): Symbol pattern matching — catches exact, variant, and prefix matches
+ *     - Standalone:  XRP, SOL, BNB, ETH, BTC ...
+ *     - cb-prefix:   cbXRP, cbSOL, cbBTC, cbETH, cbADA ... ← key fix
+ *     - w-prefix:    wSOL, wBTC, wBNB, wXRP, wETH ...
+ *     - st-prefix:   stETH, stSOL (liquid staking scams)
+ *   Layer 2 (precise): If symbol matches AND address IS an official bridge → block (bridge asset)
+ *
+ * Known incidents:
+ *   SOL  (June 2026): missed by old hardcoded Set, lost ~$12.50 × 3
+ *   cbXRP (June 2026): missed by /\bXRP\b/ — word boundary gap. Lost ETH.
  */
 
 // Official bridge/wrapped token addresses on Base (lowercase)
@@ -49,43 +56,87 @@ const VERIFIED_BRIDGE_ADDRESSES = new Set<string>([
 
 // Symbol patterns that indicate a cross-chain impersonation or bridge asset.
 // Tested against symbol.toUpperCase().
+//
+// CRITICAL: Use explicit prefixed variants (cbXXX, wXXX) because \bXRP\b does NOT
+// match "cbXRP" — 'b' before 'X' is a word char → no word boundary → pattern miss.
+// Added generic /\bCB[A-Z]{2,8}\b/ as a catch-all for Coinbase-style prefix scams.
 const IMPERSONATOR_PATTERNS: RegExp[] = [
-  // Bitcoin variants
-  /\bBTC\b/, /\bWBTC\b/, /\bCBBTC\b/, /\bBITCOIN\b/,
-  // Solana variants
-  /\bSOL\b/, /\bWSOL\b/, /\bCBSOL\b/, /\bSOLANA\b/,
-  // BNB / Binance
+  // ── Generic prefix catch-alls (added June 2026 — cbXRP incident) ─────────────
+  // Catches cbXRP, cbADA, cbDOT, cbETH, cbNEAR, cbSUI, cbATOM, cbMATIC...
+  // Word boundary works at string start/end and space boundaries.
+  /\bCB[A-Z]{2,8}\b/,
+  // Catches stETH, stSOL, stMATIC, stBTC (liquid staking scams)
+  /\bST(ETH|SOL|BTC|MATIC|AVAX|BNB|NEAR|XRP)\b/,
+
+  // ── Bitcoin variants ──────────────────────────────────────────────────────────
+  /\bBTC\b/, /\bWBTC\b/, /\bCBBTC\b/, /\bBITCOIN\b/, /\bRENBTC\b/,
+
+  // ── Ethereum variants (MISSING before — key addition) ────────────────────────
+  // ETH itself is native on Base, but scammer tokens named ETH/WETH/cbETH are common
+  /\bWETH\b/, /\bCBETH\b/, /\bRETH\b/, /\bSTETH\b/, /\bSETH\b/, /\bETHEREUM\b/,
+  // Note: plain /\bETH\b/ is intentionally omitted — many meme tokens legitimately
+  //       use ETH in name (e.g. "ETHCAT", "BABYETH"). cbETH is covered by CB prefix.
+
+  // ── Solana variants ───────────────────────────────────────────────────────────
+  /\bSOL\b/, /\bWSOL\b/, /\bCBSOL\b/, /\bSOLANA\b/, /\bSOLETH\b/,
+
+  // ── BNB / Binance ─────────────────────────────────────────────────────────────
   /\bBNB\b/, /\bWBNB\b/, /\bBINANCE\b/,
-  // Avalanche
+
+  // ── Avalanche ─────────────────────────────────────────────────────────────────
   /\bAVAX\b/, /\bWAVAX\b/, /\bAVALANCHE\b/,
-  // Polygon
-  /\bMATIC\b/, /\bWMATIC\b/, /\bPOL\b/, /\bPOLYGON\b/,
-  // Cardano
-  /\bADA\b/, /\bCARDANO\b/,
-  // Polkadot
+
+  // ── Polygon ───────────────────────────────────────────────────────────────────
+  /\bMATIC\b/, /\bWMATIC\b/, /\bPOLYGON\b/,
+  // Note: /\bPOL\b/ removed — too broad (hits POLLY, POLAR, etc.)
+
+  // ── XRP ── (the cbXRP incident: \bXRP\b missed cbXRP — now covered by CB prefix)
+  /\bXRP\b/, /\bWXRP\b/, /\bRIPPLE\b/,
+
+  // ── Cardano ───────────────────────────────────────────────────────────────────
+  /\bADA\b/, /\bCARDANO\b/, /\bWADA\b/,
+
+  // ── Polkadot ──────────────────────────────────────────────────────────────────
   /\bDOT\b/, /\bPOLKADOT\b/,
-  // Tron
+  // Note: /\bDOT\b/ kept despite possible false positives — no common meme uses it
+
+  // ── Tron ──────────────────────────────────────────────────────────────────────
   /\bTRX\b/, /\bTRON\b/,
-  // XRP
-  /\bXRP\b/, /\bRIPPLE\b/,
-  // Near
-  /\bNEAR\b/,
-  // Sui / Aptos
-  /\bSUI\b/, /\bAPT\b/, /\bAPTOS\b/,
-  // Fantom
-  /\bFTM\b/, /\bFANTOM\b/,
-  // Cosmos
-  /\bATOM\b/, /\bCOSMOS\b/,
-  // ICP
-  /\bICP\b/,
-  // Algorand
+
+  // ── Near ──────────────────────────────────────────────────────────────────────
+  /\bNEAR\b/, /\bWNEAR\b/,
+
+  // ── Sui / Aptos ───────────────────────────────────────────────────────────────
+  /\bSUI\b/, /\bAPTOS\b/,
+  // Note: /\bAPT\b/ removed — too short, catches legitimate tokens (APES, APT as abbreviation)
+
+  // ── Fantom ────────────────────────────────────────────────────────────────────
+  /\bFTM\b/, /\bFANTOM\b/, /\bWFTM\b/,
+
+  // ── Cosmos ────────────────────────────────────────────────────────────────────
+  /\bATOM\b/, /\bCOSMOS\b/, /\bWATOM\b/,
+
+  // ── ICP ───────────────────────────────────────────────────────────────────────
+  /\bICPT\b/, /\bINTERNETCOMPUTER\b/,
+  // Note: /\bICP\b/ removed — 3-letter acronym too risky for false positives
+
+  // ── Algorand ──────────────────────────────────────────────────────────────────
   /\bALGO\b/, /\bALGORAND\b/,
-  // Stellar
+
+  // ── Stellar ───────────────────────────────────────────────────────────────────
   /\bXLM\b/, /\bSTELLAR\b/,
-  // VeChain
-  /\bVET\b/,
-  // Egld
+
+  // ── VeChain ───────────────────────────────────────────────────────────────────
+  /\bVECHAIN\b/, /\bVETH\b/,
+  // Note: /\bVET\b/ removed — catches VET (any 3-letter ending in VET)
+
+  // ── Egld / MultiversX ─────────────────────────────────────────────────────────
   /\bEGLD\b/, /\bMULTIVERSX\b/,
+
+  // ── Major DeFi protocols (commonly impersonated on Base) ─────────────────────
+  /\bCHAINLINK\b/, /\bUNISWAP\b/, /\bAAVE\b/, /\bCURVE\b/, /\bCOMPOUND\b/,
+  /\bMAKER\b/, /\bMKR\b/, /\bSNX\b/, /\bSYNTHETIX\b/, /\bYEARN\b/,
+  /\bLIDO\b/, /\bRPL\b/, /\bROCKETPOOL\b/,
 ];
 
 // Cache checked addresses to avoid redundant logging
