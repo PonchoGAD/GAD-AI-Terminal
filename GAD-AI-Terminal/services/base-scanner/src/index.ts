@@ -5,6 +5,7 @@ import { runScanCycle, loadBaseRecentBuys, BaseToken } from './scanner';
 import { startMonitor, getPositionSummary } from './monitor';
 import { registerMoralisStream, handleMoralisWebhook } from './moralis-stream';
 import { calculateDynamicSlippage } from './slippage';
+import { isTokenSafeToTrade } from './security-shield';
 
 const PORT           = Number(process.env.PORT              || '4005');
 const BUY_ETH        = Number(process.env.BASE_BUY_ETH     || '0.001');  // 0.001 ETH = ~$3.50
@@ -175,6 +176,15 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
   const maxDaily = Number(process.env.BASE_MAX_ETH_DAILY || '0.1');
   if (Number(dailyUsed.rows[0]?.eth_in ?? 0) + BUY_ETH > maxDaily) {
     console.info(`[base-scanner] Daily ETH limit reached — skipping ${token.symbol}`);
+    return;
+  }
+
+  // EVM Security Shield: hard-block on GoPlus flags not caught by score-based checkTokenSafety
+  // Checks: CONTRACT_NOT_VERIFIED, HONEYPOT_DETECTED, MODIFIABLE_TAX, MINTABLE+TAX, EXCESSIVE_TAX
+  const secShield = await isTokenSafeToTrade(token.contract_address, 8453);
+  if (!secShield.isSafe) {
+    buyFailBlacklist.set(token.contract_address, Date.now() + BUY_FAIL_COOLDOWN_MS);
+    console.warn(`[base-scanner] 🛡 BLOCKED ${token.symbol} (${token.contract_address.slice(0,10)}): ${secShield.reason}`);
     return;
   }
 

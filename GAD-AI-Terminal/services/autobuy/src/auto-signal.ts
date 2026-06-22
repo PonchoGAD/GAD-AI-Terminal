@@ -967,10 +967,10 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       console.debug(`[raydium-scan] ✗liq  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
       skipped.liq++; continue;
     }
-    // FEAR liquidity floor: min liq is now $30k globally, but in FEAR we require $35k.
-    // Thin pools cause stop-loss slippage amplified when market sentiment is weak.
-    if (regime === 'FEAR' && liq < 35000) {
-      console.debug(`[raydium-scan] ✗fear  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} < $35k floor in FEAR`);
+    // FEAR liquidity floor: require $25k in FEAR (was $35k — too high, blocked $27-33k range).
+    // Data: T1 liq ($12-80k) FEAR win rate = 46.2% — the $27-35k zone is profitable.
+    if (regime === 'FEAR' && liq < 25000) {
+      console.debug(`[raydium-scan] ✗fear  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} < $25k floor in FEAR`);
       skipped.liq++; continue;
     }
 
