@@ -1,29 +1,48 @@
 import axios from 'axios';
 import { query } from '@lib/db';
 import { checkTokenSafety, checkBaseSmartMoney } from '@lib/base';
-import { isBaseTokenImpersonator } from './impersonator-guard';
+
+// ─── Inline impersonator guard ───────────────────────────────────────────────
+// Blocks cross-chain scam tokens (cbADA, cbXRP, fake SOL, BNB, etc.)
+// Inlined here because impersonator-guard.ts was not compiled into the original
+// Docker image — this ensures the guard always ships with scanner.js.
+const _EXACT_BLOCK = new Set([
+  'SOL','BNB','ADA','XRP','AVAX','MATIC','DOT','TRX','NEAR','SUI',
+  'ATOM','FTM','XLM','ALGO','EGLD','BTC','ETH',
+  'WBTC','BITCOIN','ETHEREUM','WSOL','WBNB','WXRP','WADA','WFTM',
+  'STETH','STSOL','CBETH','CBBTC','CBSOL',
+  'CHAINLINK','UNISWAP','AAVE','MAKER',
+]);
+function isChainImpersonator(symbol: string): boolean {
+  const up = symbol.toUpperCase().trim();
+  const cbPrefix = up.startsWith('CB') && up.length >= 4;
+  const wPrefix  = up.startsWith('W')  && up.length >= 4 && up.length <= 7;
+  return _EXACT_BLOCK.has(up) || cbPrefix || (wPrefix && _EXACT_BLOCK.has(up.slice(1)));
+}
 
 // ─── Config ─────────────────────────────────────────────────────────────────
-// Adapted from Raydium scanner thresholds (58% WR in FEAR market):
-// - pc1h min 5% (Raydium: 5%), vol/liq 15% (Raydium: 15%), B/S ≤3.0 (Raydium: 3.5)
-// - Age ≤6h: Base memes die fast — fresh entries outperform aged ones
-// - Liq $10k-$200k: Base has less TVL than Solana, upper bound lower
-const MIN_LIQ        = Number(process.env.BASE_MIN_LIQUIDITY_USD  || '10000');
+// Target: Base meme coins — new launches, tiny mcap, high momentum.
+// Key insight: SOL/ADA/XRP/cbXRP scam tokens have $10M-$300B mcap.
+// Real meme coins: mcap $5k-$2M. One mcap cap prevents ALL established-token buys.
+const MIN_LIQ        = Number(process.env.BASE_MIN_LIQUIDITY_USD  || '5000');
 const MAX_LIQ        = Number(process.env.BASE_MAX_LIQUIDITY_USD  || '200000');
+const MIN_MCAP       = Number(process.env.BASE_MIN_MCAP_USD       || '1000');    // skip dead/empty tokens
+const MAX_MCAP       = Number(process.env.BASE_MAX_MCAP_USD       || '2000000'); // $2M max — memes only
 const MIN_PC1H       = Number(process.env.BASE_MIN_PC1H           || '5');
-const MAX_PC1H       = Number(process.env.BASE_MAX_PC1H           || '80');
+const MAX_PC1H       = Number(process.env.BASE_MAX_PC1H           || '100');
 // Fresh launches (< 1h) routinely spike 100-400% in the first hour — don't cap them
-const MAX_PC1H_FRESH = Number(process.env.BASE_MAX_PC1H_FRESH     || '400');
-const FRESH_AGE_SEC  = Number(process.env.BASE_FRESH_AGE_SEC      || '3600'); // 1h = "fresh launch"
+const MAX_PC1H_FRESH = Number(process.env.BASE_MAX_PC1H_FRESH     || '1000');
+const FRESH_AGE_SEC  = Number(process.env.BASE_FRESH_AGE_SEC      || '3600');
 const MIN_PC5M       = Number(process.env.BASE_MIN_PC5M           || '1');
-const MIN_VOL_LIQ    = Number(process.env.BASE_MIN_VOL_LIQ_RATIO  || '0.15');
-const MAX_BS_RATIO   = Number(process.env.BASE_MAX_BUY_SELL_RATIO  || '3.0');
-const MAX_AGE_SEC    = Number(process.env.BASE_MAX_AGE_SEC        || '21600'); // 6h — Base memes move fast
-const MIN_SAFE_SCORE = Number(process.env.BASE_MIN_SAFE_SCORE     || '35');
-const MIN_BUYS_H1    = Number(process.env.BASE_MIN_BUYS_H1        || '5');    // min unique buys in last hour
-const SCAN_INTERVAL = Number(process.env.BASE_SCAN_INTERVAL_SEC  || '30') * 1000;
+const MIN_VOL_LIQ    = Number(process.env.BASE_MIN_VOL_LIQ_RATIO  || '0.10');
+const MAX_BS_RATIO   = Number(process.env.BASE_MAX_BUY_SELL_RATIO  || '4.0');
+const MAX_AGE_SEC    = Number(process.env.BASE_MAX_AGE_SEC        || '14400'); // 4h — Base memes move fast
+const MIN_AGE_SEC    = Number(process.env.BASE_MIN_AGE_SEC        || '120');   // 2min min — avoid honeypot traps
+const MIN_SAFE_SCORE = Number(process.env.BASE_MIN_SAFE_SCORE     || '30');
+const MIN_BUYS_H1    = Number(process.env.BASE_MIN_BUYS_H1        || '5');
+const SCAN_INTERVAL  = Number(process.env.BASE_SCAN_INTERVAL_SEC  || '30') * 1000;
 
-const BASE_REQUIRE_SM = process.env.BASE_REQUIRE_SM_SIGNAL === 'true';  // if true: skip tokens without SM signal
+const BASE_REQUIRE_SM = process.env.BASE_REQUIRE_SM_SIGNAL === 'true';
 
 export interface BaseToken {
   contract_address: string;
@@ -51,43 +70,42 @@ export interface BaseToken {
 }
 
 // ─── DexScreener ─────────────────────────────────────────────────────────────
+// IMPORTANT: Do NOT use token-profiles or token-boosts endpoints — those return
+// ANY established token on Base (cbADA, SOL impersonators, etc.) which are not memes.
+// Use only new-pairs and trending-small-cap sources.
 async function fetchDexScreener(): Promise<BaseToken[]> {
   const tokens: BaseToken[] = [];
-  const urls = [
-    'https://api.dexscreener.com/token-profiles/latest/v1',
-    'https://api.dexscreener.com/token-boosts/latest/v1',
-  ];
 
-  for (const url of urls) {
-    try {
-      const r = await axios.get(url, { timeout: 8000 });
-      const items: any[] = Array.isArray(r.data) ? r.data : (r.data?.data ?? []);
-      const baseItems = items.filter((x: any) => x.chainId === 'base');
-
-      for (const item of baseItems) {
-        const addr = item.tokenAddress || item.address;
-        if (!addr) continue;
-        const pair = await fetchPairData(addr);
-        if (pair) tokens.push(pair);
-      }
-    } catch { continue; }
-  }
-
-  // Also search DexScreener directly for new Base pairs
+  // Source 1: DexScreener trending Base pairs — small cap, high momentum memes
   try {
-    const searches = [
-      'base meme', 'base new', 'base ai', 'base dog', 'base pepe',
-      'base cat', 'base frog', 'base coin', 'new base token', 'base pump',
-    ];
-    for (const q of searches) {
-      const r = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`, { timeout: 6000 });
+    const r = await axios.get(
+      'https://api.dexscreener.com/latest/dex/search?q=base%20meme%20new',
+      { timeout: 8000 },
+    );
+    const pairs: any[] = (r.data?.pairs ?? [])
+      .filter((p: any) => p.chainId === 'base')
+      .sort((a: any, b: any) => (b.priceChange?.h1 ?? 0) - (a.priceChange?.h1 ?? 0));
+    for (const p of pairs) {
+      const token = mapDexPair(p);
+      if (token) tokens.push(token);
+    }
+  } catch { }
+
+  // Source 2: Keyword searches for Base meme launches
+  const searches = ['base pepe', 'base doge', 'base frog', 'base ai', 'base pump'];
+  for (const q of searches) {
+    try {
+      const r = await axios.get(
+        `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`,
+        { timeout: 6000 },
+      );
       const pairs: any[] = (r.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
       for (const p of pairs) {
         const token = mapDexPair(p);
         if (token) tokens.push(token);
       }
-    }
-  } catch { }
+    } catch { }
+  }
 
   return dedupeByAddress(tokens);
 }
@@ -104,7 +122,9 @@ async function fetchPairData(tokenAddress: string): Promise<BaseToken | null> {
 function mapDexPair(p: any): BaseToken | null {
   const addr = p.baseToken?.address;
   if (!addr) return null;
-  const createdAt = p.pairCreatedAt ? (Date.now() - p.pairCreatedAt) / 1000 : 0;
+  // Unknown creation date → treat as very old (will fail MAX_AGE_SEC filter)
+  // This prevents buying established tokens that lack pairCreatedAt metadata
+  const createdAt = p.pairCreatedAt ? (Date.now() - p.pairCreatedAt) / 1000 : 999999;
   return {
     contract_address: addr.toLowerCase(),
     symbol:           p.baseToken?.symbol ?? '',
@@ -202,33 +222,26 @@ const TRADEABLE_DEX_IDS = new Set([
 
 // ─── Filter ──────────────────────────────────────────────────────────────────
 function passesFilter(t: BaseToken): string | null {
-  // Anti-Impersonator Guard: blocks tokens with cross-chain names (SOL, BNB, wSOL, cbSOL…)
-  // unless the contract address is a verified official bridge address.
-  // More robust than a hardcoded symbol Set — catches variants like wSOL, SOL-Wrapped, cbSOL, etc.
-  if (isBaseTokenImpersonator(t.symbol, t.contract_address)) {
-    return `symbol:${t.symbol} (chain impersonator — not a Base-native asset)`;
-  }
-  if (t.liquidity_usd < MIN_LIQ)            return `liq:$${t.liquidity_usd.toFixed(0)} < $${MIN_LIQ}`;
-  if (t.liquidity_usd > MAX_LIQ)            return `liq:$${t.liquidity_usd.toFixed(0)} > $${MAX_LIQ}`;
-  // Only allow DEX IDs we can actually trade (V3 + Aerodrome V2 only)
-  // 'uniswap' = V2 (no V3/Aerodrome pool → buy always fails)
-  // 'uniswap-v4*' = V4 (no router support)
-  // 'aerodrome-cl' = concentrated liquidity (different factory, router fails)
-  if (!TRADEABLE_DEX_IDS.has(t.dex_id)) {
-    return `dex:${t.dex_id} (not supported)`;
-  }
-  // Ultra-fresh tokens (<10 min) don't have 1h history yet — skip pc1h check, use pc5m momentum instead
+  // PRIMARY GUARD: mcap cap — the only reliable way to exclude all established tokens.
+  // SOL=$80B, ADA=$15B, cbXRP scams=$100M+. Real meme launches: $1k-$2M.
+  // This one check prevents buying any L1/L2 token or their impersonators.
+  if (t.mcap_usd > 0 && t.mcap_usd > MAX_MCAP)  return `mcap:$${(t.mcap_usd/1e6).toFixed(1)}M > $${(MAX_MCAP/1e6).toFixed(1)}M`;
+  if (t.mcap_usd > 0 && t.mcap_usd < MIN_MCAP)  return `mcap:$${t.mcap_usd.toFixed(0)} < $${MIN_MCAP} (dead)`;
+  // Age: unknown creation date = established token (pairCreatedAt missing = age 999999)
+  if (t.age_sec > MAX_AGE_SEC) return `age:${(t.age_sec / 3600).toFixed(1)}h > ${MAX_AGE_SEC / 3600}h`;
+  if (t.age_sec < MIN_AGE_SEC && t.age_sec > 0)  return `age:${t.age_sec.toFixed(0)}s < ${MIN_AGE_SEC}s (too fresh)`;
+  if (t.liquidity_usd < MIN_LIQ)   return `liq:$${t.liquidity_usd.toFixed(0)} < $${MIN_LIQ}`;
+  if (t.liquidity_usd > MAX_LIQ)   return `liq:$${t.liquidity_usd.toFixed(0)} > $${MAX_LIQ}`;
+  if (!TRADEABLE_DEX_IDS.has(t.dex_id)) return `dex:${t.dex_id} (not supported)`;
+  // Ultra-fresh (<10 min) — no 1h history yet, use 5m momentum only
   if (t.age_sec >= 600 && t.price_change_1h < MIN_PC1H) return `pc1h:${t.price_change_1h.toFixed(1)}% < ${MIN_PC1H}%`;
-  // Fresh launches (< FRESH_AGE_SEC) use higher cap — first-hour spikes are normal on Base
   const maxPc1h = t.age_sec < FRESH_AGE_SEC ? MAX_PC1H_FRESH : MAX_PC1H;
-  if (t.price_change_1h > maxPc1h)          return `pc1h:${t.price_change_1h.toFixed(1)}% > ${maxPc1h}% (age:${(t.age_sec/60).toFixed(0)}min)`;
-  // Skip pc5m check when pc5m=0 (GeckoTerminal or DexScreener with no 5m data)
-  if (t.price_change_5m !== 0 && t.price_change_5m < MIN_PC5M)  return `pc5m:${t.price_change_5m.toFixed(1)}% < ${MIN_PC5M}%`;
+  if (t.price_change_1h > maxPc1h)  return `pc1h:${t.price_change_1h.toFixed(1)}% > ${maxPc1h}%`;
+  if (t.price_change_5m !== 0 && t.price_change_5m < MIN_PC5M) return `pc5m:${t.price_change_5m.toFixed(1)}% < ${MIN_PC5M}%`;
   if (t.volume_1h / Math.max(1, t.liquidity_usd) < MIN_VOL_LIQ) return `vol/liq:${(t.volume_1h / Math.max(1, t.liquidity_usd) * 100).toFixed(0)}% < ${MIN_VOL_LIQ * 100}%`;
-  if (t.buy_sell_ratio > MAX_BS_RATIO)      return `bs:${t.buy_sell_ratio.toFixed(1)} > ${MAX_BS_RATIO}`;
-  if (t.txns_h1_buys < MIN_BUYS_H1)        return `buys1h:${t.txns_h1_buys} < ${MIN_BUYS_H1}`;
-  if (t.age_sec > MAX_AGE_SEC)              return `age:${(t.age_sec / 3600).toFixed(1)}h > ${MAX_AGE_SEC / 3600}h`;
-  if (t.safe_score < MIN_SAFE_SCORE)        return `score:${t.safe_score} < ${MIN_SAFE_SCORE}`;
+  if (t.buy_sell_ratio > MAX_BS_RATIO)  return `bs:${t.buy_sell_ratio.toFixed(1)} > ${MAX_BS_RATIO}`;
+  if (t.txns_h1_buys < MIN_BUYS_H1)    return `buys1h:${t.txns_h1_buys} < ${MIN_BUYS_H1}`;
+  if (t.safe_score < MIN_SAFE_SCORE)    return `score:${t.safe_score} < ${MIN_SAFE_SCORE}`;
   return null;
 }
 
