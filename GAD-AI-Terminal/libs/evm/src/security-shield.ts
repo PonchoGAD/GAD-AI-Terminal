@@ -97,8 +97,12 @@ async function _run(address: string, chainId: number): Promise<SecurityResult> {
     }
     const buyTax  = parseFloat(report.buy_tax  ?? '0');
     const sellTax = parseFloat(report.sell_tax ?? '0');
-    if (buyTax > 12 || sellTax > 12) {
-      return { isSafe: false, reason: `EXCESSIVE_TAX_${Math.round(Math.max(buyTax, sellTax))}PCT` };
+    // BSC (56): max 5% — a 12%+12% round-trip tax needs >30% gain just to break even,
+    // destroying Sharpe Ratio. Base (8453): 12% — higher upside potential justifies it.
+    const maxTax = chainId === 56 ? 5 : 12;
+    if (buyTax > maxTax || sellTax > maxTax) {
+      const tag = chainId === 56 ? 'BSC' : 'BASE';
+      return { isSafe: false, reason: `${tag}_EXCESSIVE_TAX_${Math.round(Math.max(buyTax, sellTax))}PCT_LIMIT${maxTax}` };
     }
 
     return { isSafe: true };

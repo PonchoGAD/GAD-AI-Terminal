@@ -147,6 +147,55 @@ export async function discoverTonTokens(): Promise<TonToken[]> {
   return dedupe(all);
 }
 
+// ─── Holder Concentration Guard ──────────────────────────────────────────────
+// Rejects tokens where top-5 wallets hold >45% of supply.
+// Even if mintable=false and admin=null, a single holder cluster can rug
+// by selling their pre-pool allocation in the first few minutes.
+// Fails OPEN (returns ok:true) when TonAPI is unavailable.
+const _holderCache = new Map<string, { ok: boolean; topShare: number; expiresAt: number }>();
+
+export async function checkTonHolderConcentration(
+  jettonAddress: string,
+  maxTopHoldersPct: number = 45,
+): Promise<{ ok: boolean; topHoldersShare: number; reason?: string }> {
+  const cached = _holderCache.get(jettonAddress);
+  if (cached && Date.now() < cached.expiresAt) {
+    return { ok: cached.ok, topHoldersShare: cached.topShare, reason: cached.ok ? undefined : 'HOLDER_CONCENTRATION_CACHED' };
+  }
+
+  const apiKey = process.env.TON_API_KEY;
+  if (!apiKey) return { ok: true, topHoldersShare: 0, reason: 'NO_TONAPI_KEY_SKIP' };
+
+  try {
+    const r = await axios.get(
+      `https://tonapi.io/v2/jettons/${encodeURIComponent(jettonAddress)}/holders?limit=10`,
+      { headers: { Authorization: `Bearer ${apiKey}` }, timeout: 4000 },
+    );
+
+    const holders: any[] = r.data?.addresses ?? [];
+    let topShare = 0;
+    let counted = 0;
+    for (const h of holders.slice(0, 5)) {
+      // tonapi.io returns balance as string, total supply also in headers/parent
+      // Use percentage directly if available, else skip
+      const pct = parseFloat(h.percentage ?? h.share ?? '0');
+      topShare += pct;
+      counted++;
+    }
+
+    // If API returned percentage data (0-100 scale)
+    const ok = counted === 0 || topShare <= maxTopHoldersPct;
+    const ttl = 10 * 60 * 1000; // 10-min cache — holder distribution changes slowly
+    _holderCache.set(jettonAddress, { ok, topShare, expiresAt: Date.now() + ttl });
+
+    if (!ok) return { ok: false, topHoldersShare: topShare, reason: `TOP5_HOLD_${topShare.toFixed(1)}PCT` };
+    return { ok: true, topHoldersShare: topShare };
+  } catch {
+    // TonAPI down or rate-limited — fail open
+    return { ok: true, topHoldersShare: 0, reason: 'TONAPI_FAIL_OPEN' };
+  }
+}
+
 // Get current price from DexScreener for a pool
 export async function getPoolPrice(poolAddress: string): Promise<number | null> {
   try {

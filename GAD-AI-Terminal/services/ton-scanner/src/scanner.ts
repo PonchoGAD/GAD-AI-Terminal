@@ -1,5 +1,5 @@
 import { query } from '@lib/db';
-import { discoverTonTokens, checkJettonSafety, buyJetton, getTonBalance, getWalletAddress, TonToken, checkTonSmartMoney } from '@lib/ton';
+import { discoverTonTokens, checkJettonSafety, buyJetton, getTonBalance, getWalletAddress, TonToken, checkTonSmartMoney, checkTonHolderConcentration } from '@lib/ton';
 
 const TON_REQUIRE_SM = process.env.TON_REQUIRE_SM_SIGNAL === 'true';
 const TON_SM_MIN_WEIGHT = Number(process.env.TON_SM_MIN_WEIGHT ?? '2.0');
@@ -82,6 +82,14 @@ export async function runTonScanCycle(): Promise<void> {
       }
 
       seen.add(addr);
+
+      // Holder concentration check — rejects rug-setup wallets (top-5 > 45% supply)
+      const holderCheck = await checkTonHolderConcentration(addr).catch(() => ({ ok: true, topHoldersShare: 0 }));
+      if (!holderCheck.ok) {
+        console.info(`${label} 🚨 SKIP ${t.symbol} ${holderCheck.reason} (top5:${holderCheck.topHoldersShare.toFixed(1)}%)`);
+        skipped.rug++;
+        continue;
+      }
 
       // Smart Money signal check (non-blocking)
       let smWeight = 0;
