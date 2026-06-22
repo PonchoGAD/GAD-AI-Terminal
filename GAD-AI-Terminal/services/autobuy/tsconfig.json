@@ -11,7 +11,8 @@
       "@lib/liqhealth":   ["../../libs/liqhealth/src/index.d.ts"],
       "@lib/hype":        ["../../libs/hype/src/index.d.ts"],
       "@lib/walletintel": ["../../libs/walletintel/src/index.d.ts"],
-      "@lib/botshield":   ["../../libs/botshield/src/index.d.ts"]
+      "@lib/botshield":   ["../../libs/botshield/src/index.d.ts"],
+      "@lib/solana":      ["../../libs/solana/src/index.d.ts"]
     }
   },
   "include": [
@@ -22,6 +23,7 @@
     "../../libs/liqhealth/src/index.d.ts",
     "../../libs/hype/src/index.d.ts",
     "../../libs/walletintel/src/index.d.ts",
-    "../../libs/botshield/src/index.d.ts"
+    "../../libs/botshield/src/index.d.ts",
+    "../../libs/solana/src/index.d.ts"
   ]
 }

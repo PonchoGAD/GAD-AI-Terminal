@@ -39,3 +39,4 @@ export async function fetchRecentTokenTransfers(limit = 100) {
 export async function fetchRecentTransactions(address: string, limit = 50) {
   return connection.getSignaturesForAddress(new PublicKey(address), { limit });
 }
+export * from './safety-guard';

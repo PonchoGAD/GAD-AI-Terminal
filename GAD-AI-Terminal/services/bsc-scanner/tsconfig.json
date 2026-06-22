@@ -8,7 +8,8 @@
     "baseUrl": "../..",
     "paths": {
       "@lib/db":  ["libs/db/src/index.d.ts"],
-      "@lib/bsc": ["libs/bsc/src/index.d.ts"]
+      "@lib/bsc": ["libs/bsc/src/index.d.ts"],
+      "@lib/evm": ["libs/evm/src/index.ts"]
     }
   },
   "include": [

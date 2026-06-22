@@ -23,6 +23,7 @@ import { analyzeTrend }   from '@lib/trend';
 import { assessLiquidity } from '@lib/liqhealth';
 import { detectHype }     from '@lib/hype';
 import { detectBotActivity, randomTradeDelay } from '@lib/botshield';
+import { verifySolanaTokenSafety, getConnection } from '@lib/solana';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -1136,6 +1137,19 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       console.info(`[raydium-scan] 🐋 SKIP ${pair.baseToken?.symbol ?? mint.slice(0,8)} — top holder ${topHolderPct.toFixed(0)}% (>${TOP_HOLDER_RUG_PCT}% = rug risk)`);
       skipped.bot++;
       continue;
+    }
+
+    // ── Gate 7: On-chain Solana safety (mint/freeze authority + LP burn) ──────
+    // Uses getMint() — fast single RPC call. Runs only for tokens passing all 6 gates.
+    const solSafety = await verifySolanaTokenSafety(
+      getConnection(),
+      mint,
+      pair.pairAddress ?? undefined, // LP pool address for burn check
+    ).catch(() => ({ isSafe: true, reason: 'RPC_SKIP' }));
+
+    if (!solSafety.isSafe) {
+      console.info(`[raydium-scan] 🔐 Gate7 BLOCKED ${pair.baseToken?.symbol ?? mint.slice(0,8)}: ${solSafety.reason}`);
+      skipped.bot++; continue;
     }
 
     const slippage = shield.slippage_bps;

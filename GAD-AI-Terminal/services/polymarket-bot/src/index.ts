@@ -7,6 +7,7 @@ import { openPosition } from './trader';
 import { startMonitor } from './monitor';
 import { fetchRssHeadlines } from './rss-sync';
 import { getWikipediaPageviews, searchGdeltNews, extractEntitiesFromMarket, getUSMacroSignal } from './data-sources';
+import { validatePolymarketMarket } from './market-validator';
 
 const PORT         = Number(process.env.PORT                   || '4009');
 const DRY_RUN      = process.env.POLYMARKET_DRY_RUN            !== 'false';
@@ -219,6 +220,28 @@ async function tryOpenPosition(scored: Awaited<ReturnType<typeof processNewsSign
   if (dup.length) {
     console.info(`[poly] Already have position on market ${scored.marketId.slice(0, 12)} — skipping`);
     return;
+  }
+
+  // Market Validator: reject wash-traded / illiquid / long-duration markets
+  const { rows: mktData } = await query<{
+    volume_usd: string; price_yes: string; price_no: string; ends_at: string;
+  }>(
+    `SELECT volume_usd::float, price_yes::float, price_no::float, ends_at::text
+       FROM polymarket_markets WHERE market_id=$1 LIMIT 1`,
+    [scored.marketId]
+  );
+  if (mktData.length) {
+    const mv = mktData[0];
+    const validation = validatePolymarketMarket(
+      Number(mv.volume_usd),
+      Number(mv.price_yes),
+      Number(mv.price_no),
+      mv.ends_at,
+    );
+    if (!validation.isTradeable) {
+      console.info(`[poly] ❌ Market rejected: ${validation.reason} | ${scored.marketTitle?.slice(0,50)}`);
+      return;
+    }
   }
 
   // Get the signal_id for the last inserted signal

@@ -5,7 +5,8 @@ import { runScanCycle, loadBaseRecentBuys, BaseToken } from './scanner';
 import { startMonitor, getPositionSummary } from './monitor';
 import { registerMoralisStream, handleMoralisWebhook } from './moralis-stream';
 import { calculateDynamicSlippage } from './slippage';
-import { isTokenSafeToTrade } from './security-shield';
+import { isTokenSafeToTrade, simulateEvmSwap } from '@lib/evm';
+import { getProvider } from '@lib/base';
 
 const PORT           = Number(process.env.PORT              || '4005');
 const BUY_ETH        = Number(process.env.BASE_BUY_ETH     || '0.001');  // 0.001 ETH = ~$3.50
@@ -186,6 +187,18 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
     buyFailBlacklist.set(token.contract_address, Date.now() + BUY_FAIL_COOLDOWN_MS);
     console.warn(`[base-scanner] 🛡 BLOCKED ${token.symbol} (${token.contract_address.slice(0,10)}): ${secShield.reason}`);
     return;
+  }
+
+  // Virtual Swap Simulator: simulate buy→sell round-trip via V2 router getAmountsOut
+  // Catches tax honeypots that pass static API checks (can buy but >15% loss on sell)
+  const swapSim = await simulateEvmSwap(getProvider(), token.contract_address, 8453).catch(() => null);
+  if (swapSim && !swapSim.canSwap) {
+    buyFailBlacklist.set(token.contract_address, Date.now() + BUY_FAIL_COOLDOWN_MS);
+    console.warn(`[base-scanner] 🔬 SWAP_SIM blocked ${token.symbol}: ${swapSim.reason}`);
+    return;
+  }
+  if (swapSim) {
+    console.debug(`[base-scanner] 🔬 SwapSim ${token.symbol}: loss=${swapSim.totalLossPct.toFixed(1)}% OK`);
   }
 
   const smTag = (token.sm_weight ?? 0) >= 2.0 ? ` 🔥SM(w${token.sm_weight})` : '';
