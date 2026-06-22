@@ -1875,6 +1875,66 @@ bot.onText(/^\/rmwallet(?:@\w+)?\s+([1-9A-HJ-NP-Za-km-z]{32,44})$/, (msg, match)
   }
 }));
 
+// /shadow_report — Admin: show shadow mode stats (what bots WOULD have bought)
+bot.onText(/^\/shadow_report(@\w+)?$/, async (msg) => {
+  if (!isAdmin(msg.chat.id)) return;
+  const chatId = msg.chat.id;
+  try {
+    const r = await query<any>(`
+      SELECT strategy, chain,
+        COUNT(*) as total,
+        COUNT(*) FILTER (WHERE status='tp1_hit') as wins,
+        COUNT(*) FILTER (WHERE status='stopped') as losses,
+        COUNT(*) FILTER (WHERE status='expired') as expired,
+        COUNT(*) FILTER (WHERE status='open') as open_cnt,
+        ROUND(AVG(outcome_pct)::numeric, 1) as avg_pct,
+        ROUND(AVG(check_1h_pct)::numeric, 1) as avg_1h,
+        ROUND(AVG(check_4h_pct)::numeric, 1) as avg_4h
+      FROM shadow_trades
+      GROUP BY strategy, chain
+      ORDER BY chain, strategy
+    `);
+
+    if (!r.rows.length) {
+      return send(chatId, '📊 *Shadow Mode Report*\n\nNo shadow trades yet. Run bots in dry-run mode for 12h to collect data.');
+    }
+
+    const recentR = await query<any>(`
+      SELECT symbol, chain, strategy, entry_mcap_usd, entry_pc1h,
+             check_30m_pct, check_1h_pct, check_4h_pct, status, created_at
+      FROM shadow_trades ORDER BY created_at DESC LIMIT 5
+    `);
+
+    let out = '📊 *Shadow Mode Report*\n\n';
+    for (const row of r.rows) {
+      const total = Number(row.total);
+      const wins  = Number(row.wins);
+      const losses= Number(row.losses);
+      const finished = wins + losses + Number(row.expired);
+      const wr    = finished > 0 ? Math.round((wins / finished) * 100) : 0;
+      out += `*[${row.strategy}/${row.chain}]*\n`;
+      out += `Trades:${total} open:${row.open_cnt} | WR:${wr}% (${wins}W/${losses}L)\n`;
+      out += `avg final:${row.avg_pct ?? '—'}% | 1h:${row.avg_1h ?? '—'}% 4h:${row.avg_4h ?? '—'}%\n\n`;
+    }
+
+    if (recentR.rows.length) {
+      out += '📋 *Recent 5:*\n';
+      for (const t of recentR.rows) {
+        const age = Math.floor((Date.now() - new Date(t.created_at).getTime()) / 60000);
+        const icon = t.status === 'tp1_hit' ? '✅' : t.status === 'stopped' ? '🔴' : t.status === 'open' ? '⏳' : '⏱';
+        const h1 = t.check_1h_pct != null ? `1h:${Number(t.check_1h_pct) > 0 ? '+' : ''}${Number(t.check_1h_pct).toFixed(1)}%` : '';
+        out += `${icon} ${t.symbol} [${t.strategy}] mcap:$${Math.round(t.entry_mcap_usd/1000)}k pc1h:${Number(t.entry_pc1h).toFixed(1)}% ${h1} (${age}m ago)\n`;
+      }
+    }
+
+    out += `\n_Targets: TP1=+30% | Stop=-8% | Final check at 8h_\n`;
+    out += `_Run /bot /basestatus /bscstatus for real trade stats_`;
+    await send(chatId, out);
+  } catch (e: any) {
+    await send(chatId, `❌ Shadow report error: ${e.message}`);
+  }
+});
+
 // /marketdata — macro market context: DeFiLlama + CoinGecko + Fear&Greed (STARTER+)
 bot.onText(/^\/marketdata(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
   if (!await requireSub(msg.chat.id, msg.from?.id ?? msg.chat.id)) return;

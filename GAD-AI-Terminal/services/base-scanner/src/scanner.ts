@@ -348,6 +348,16 @@ export async function runScanCycle(): Promise<BaseToken[]> {
       continue;
     }
 
+    // Shadow Mode: if BASE_AUTO_BUY=false, record what we would buy for P&L analysis
+    const autoBuyEnabled = process.env.BASE_AUTO_BUY === 'true';
+    if (!autoBuyEnabled) {
+      query(`INSERT INTO shadow_trades (chain,strategy,symbol,contract_address,entry_price,entry_mcap_usd,entry_liq_usd,entry_pc1h,filter_params,tp1_target,stop_pct) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`,
+        ['base','base-scan',token.symbol,token.contract_address,token.price_eth,token.mcap_usd,token.liquidity_usd,token.price_change_1h,JSON.stringify({pc5m:token.price_change_5m,dex_id:token.dex_id,age_sec:token.age_sec}),30,8]
+      ).catch(()=>{});
+      console.info(`[base-scan] 📝 [SHADOW] WOULD BUY ${token.symbol} @ mcap:$${token.mcap_usd.toFixed(0)} liq:$${token.liquidity_usd.toFixed(0)} pc1h:${token.price_change_1h.toFixed(1)}%`);
+      continue;
+    }
+
     // Upsert to DB
     await upsertBaseToken(token);
     recentScanned.add(token.contract_address);

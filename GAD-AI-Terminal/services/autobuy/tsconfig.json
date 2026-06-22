@@ -12,7 +12,8 @@
       "@lib/hype":        ["../../libs/hype/src/index.d.ts"],
       "@lib/walletintel": ["../../libs/walletintel/src/index.d.ts"],
       "@lib/botshield":   ["../../libs/botshield/src/index.d.ts"],
-      "@lib/solana":      ["../../libs/solana/src/index.d.ts"]
+      "@lib/solana":      ["../../libs/solana/src/index.d.ts"],
+      "@lib/shared":      ["../../libs/shared/src/index.ts"]
     }
   },
   "include": [
@@ -24,6 +25,7 @@
     "../../libs/hype/src/index.d.ts",
     "../../libs/walletintel/src/index.d.ts",
     "../../libs/botshield/src/index.d.ts",
-    "../../libs/solana/src/index.d.ts"
+    "../../libs/solana/src/index.d.ts",
+    "../../libs/shared/src/index.ts"
   ]
 }

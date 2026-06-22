@@ -15,6 +15,7 @@ import { startBondingScanner } from './bonding-scanner';
 import { startBondingSmart } from './bonding-smart';
 import { startCopyTrader } from './copy-trader';
 import { getRaydiumOnChainPrice, hasRaydiumVaults } from './raydium-price-fetcher';
+import { checkShadowTrades } from '@lib/shared';
 
 const POLL_MS    = Number(process.env.AUTOBUY_POLL_SECONDS  || '15') * 1000;
 const MAX_ERRORS = Number(process.env.AUTOBUY_MAX_ERRORS    || '5');
@@ -1245,6 +1246,15 @@ export async function startAutobuyScheduler() {
       console.error('[autobuy] Copy-trader start error:', e.message)
     );
   }
+
+  // ─── Shadow mode checker — runs every 30 min ─────────────────────────────
+  // Checks open shadow trades (WOULD BUY records) and updates price checkpoints.
+  // After 50+ shadow trades we get real win-rate data to validate filters.
+  setInterval(() => {
+    checkShadowTrades().catch(e => console.warn('[shadow] Checker error:', e.message));
+  }, 30 * 60 * 1000);
+  // Run once 5 minutes after startup (allow DB to be ready)
+  setTimeout(() => checkShadowTrades().catch(() => {}), 5 * 60 * 1000);
 
   // ─── Fast sell loop — checks every 1 second for TP/SL hits ───────────────
   // The main poll loop runs every 5s (including raydium scan). Memecoins pump and

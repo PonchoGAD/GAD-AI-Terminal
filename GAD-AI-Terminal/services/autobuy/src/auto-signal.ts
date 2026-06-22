@@ -1201,6 +1201,11 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
           `holders:${holderCheck.holders ?? 'n/a'} ` +
           `trend:${trend.stage} hype:${hype.hype_stage}(${hype.hype_score}) slip:${slippage}bps`
         );
+        // Shadow Mode DB tracking: record for P&L analysis
+        try {
+          const { recordShadowTrade } = await import('@lib/shared');
+          await recordShadowTrade({ chain:'solana', strategy:'raydium', symbol: pair.baseToken?.symbol ?? mint.slice(0,8), contract_address: mint, entry_price: Number(pair.priceNative ?? 0), entry_mcap_usd: Number(pair.marketCap ?? 0), entry_liq_usd: liq, entry_pc1h: pc1h, filter_params: { pc5m, liq, vol1h, ageSec, regime, tier: tier.label }, tp1_target: tier.stopPct <= 0.08 ? 25 : 30, stop_pct: tier.stopPct * 100 });
+        } catch {}
         newJobs++;
         continue;
       }
