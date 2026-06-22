@@ -23,6 +23,7 @@ export interface WsGuardOptions {
   maxReconnects?:     number;          // default: 10 (0 = бесконечно)
   reconnectBaseMs?:   number;          // default: 1000 (первая задержка)
   reconnectCapMs?:    number;          // default: 30000 (максимальная задержка)
+  agent?:             any;             // optional proxy agent (SocksProxyAgent / HttpsProxyAgent)
 }
 
 export interface WsGuardHandle {
@@ -40,6 +41,7 @@ export function createGuardedWS(opts: WsGuardOptions): WsGuardHandle {
     maxReconnects   = 10,
     reconnectBaseMs = 1_000,
     reconnectCapMs  = 30_000,
+    agent,
   } = opts;
 
   let ws:             WebSocket | null = null;
@@ -53,7 +55,7 @@ export function createGuardedWS(opts: WsGuardOptions): WsGuardHandle {
     if (ws) { try { ws.terminate(); } catch {} ws = null; }
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
 
-    ws = new WebSocket(url);
+    ws = agent ? new WebSocket(url, { agent }) : new WebSocket(url);
 
     ws.on('open', () => {
       attempts = 0;

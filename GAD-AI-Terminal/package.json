@@ -61,6 +61,8 @@
     "pumpdotfun-sdk": "github:D3AD-E/pumpdotfun-sdk-repumped",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "ws": "^8.17.1"
+    "ws": "^8.17.1",
+    "https-proxy-agent": "^7.0.4",
+    "socks-proxy-agent": "^8.0.4"
   }
 }

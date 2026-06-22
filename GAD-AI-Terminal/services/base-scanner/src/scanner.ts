@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { query } from '@lib/db';
 import { checkTokenSafety, checkBaseSmartMoney } from '@lib/base';
+import { checkLaunchpadOrigin } from './launcher-filter';
 
 // ─── Inline impersonator guard ───────────────────────────────────────────────
 // Blocks cross-chain scam tokens (cbADA, cbXRP, fake SOL, BNB, etc.)
@@ -106,6 +107,27 @@ async function fetchDexScreener(): Promise<BaseToken[]> {
       }
     } catch { }
   }
+
+  // Source 3: Clanker launchpad tokens (viral memes on Farcaster/Base)
+  // Clanker is the dominant meme launchpad on Base — tokens here are genuine community memes
+  try {
+    const r = await axios.get('https://api.dexscreener.com/latest/dex/search?q=clanker', { timeout: 6000 });
+    const pairs: any[] = (r.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
+    for (const p of pairs) {
+      const token = mapDexPair(p);
+      if (token) { (token as any)._hintLaunchpad = 'clanker'; tokens.push(token); }
+    }
+  } catch { }
+
+  // Source 4: Virtual.tech AI agent tokens on Base
+  try {
+    const r = await axios.get('https://api.dexscreener.com/latest/dex/search?q=virtual+base+agent', { timeout: 6000 });
+    const pairs: any[] = (r.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
+    for (const p of pairs) {
+      const token = mapDexPair(p);
+      if (token) tokens.push(token);
+    }
+  } catch { }
 
   return dedupeByAddress(tokens);
 }
@@ -297,6 +319,21 @@ export async function runScanCycle(): Promise<BaseToken[]> {
     if (postReason) {
       console.debug(`[base-scan] ✗ ${token.symbol} (post-safety) ${postReason}`);
       continue;
+    }
+
+    // Launchpad factory check (BASE_LAUNCHER_ONLY=true → require Clanker or Virtual factory)
+    // This is the definitive filter against L1 impersonators: real meme launchpad tokens
+    // are deployed by factory contracts, not random EOAs.
+    const launchpadOnly = process.env.BASE_LAUNCHER_ONLY === 'true';
+    if (launchpadOnly || process.env.BASESCAN_API_KEY) {
+      const lp = await checkLaunchpadOrigin(token.contract_address);
+      if (launchpadOnly && !lp.isLaunchpad) {
+        console.debug(`[base-scan] ✗ ${token.symbol} not a launchpad token (creator:${lp.creator?.slice(0,10) ?? 'unknown'})`);
+        continue;
+      }
+      if (lp.isLaunchpad) {
+        console.info(`[base-scan] [${lp.launchpad?.toUpperCase()}] ${token.symbol} verified factory token`);
+      }
     }
 
     // Smart Money signal check (non-blocking — fail open)

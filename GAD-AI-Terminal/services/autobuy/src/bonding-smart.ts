@@ -31,6 +31,31 @@
 import WebSocket from 'ws';
 import axios from 'axios';
 import { createGuardedWS, WsGuardHandle } from './websocket-guard';
+
+// ─── Residential proxy (bypasses Cloudflare/Hetzner IP block on PumpPortal) ──
+// Set RESIDENTIAL_PROXY_URL=socks5://user:pass@host:port in .env to enable.
+// Without proxy, BONDING_SMART_ENABLED must stay false (403 from VPS Hetzner IP).
+function buildProxyAgent(): any | undefined {
+  const proxyUrl = process.env.RESIDENTIAL_PROXY_URL;
+  if (!proxyUrl) return undefined;
+  try {
+    if (proxyUrl.startsWith('socks')) {
+      // socks5:// or socks4:// — use SocksProxyAgent for WSS tunneling
+      const { SocksProxyAgent } = require('socks-proxy-agent');
+      console.info(`[bonding-smart] Proxy: SOCKS ${proxyUrl.replace(/:[^@]+@/, ':***@')}`);
+      return new SocksProxyAgent(proxyUrl);
+    } else {
+      // http:// or https:// — HttpsProxyAgent supports both HTTP CONNECT and WSS
+      const { HttpsProxyAgent } = require('https-proxy-agent');
+      console.info(`[bonding-smart] Proxy: HTTPS ${proxyUrl.replace(/:[^@]+@/, ':***@')}`);
+      return new HttpsProxyAgent(proxyUrl);
+    }
+  } catch (e: any) {
+    console.warn(`[bonding-smart] Proxy agent build failed (package not installed?): ${e.message}`);
+    return undefined;
+  }
+}
+const PROXY_AGENT = buildProxyAgent();
 import { Connection, Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { query } from '@lib/db';
@@ -166,7 +191,11 @@ function getConnection(): Connection {
 }
 
 function getKeypair(): Keypair | null {
-  const raw = process.env.WALLET_PRIVATE_KEY;
+  // BONDING_SMART_USE_W2=true → use W2 (CFmHWpmQ / PUMPFUN_WALLET_PRIVATE_KEY_2)
+  // Default: W1 (WALLET_PRIVATE_KEY) for backwards compat
+  const useW2 = process.env.BONDING_SMART_USE_W2 === 'true';
+  const raw   = (useW2 ? process.env.PUMPFUN_WALLET_PRIVATE_KEY_2 : undefined)
+              ?? process.env.WALLET_PRIVATE_KEY;
   if (!raw) return null;
   try {
     const arr = JSON.parse(raw) as number[];
@@ -327,7 +356,7 @@ async function doBuy(state: TokenState, context: string, smBoost: boolean): Prom
       priorityFee:        USE_JITO ? 0.0001 : 0.003,  // lower if using Jito (tip handles priority)
       pool:               'pump',
     };
-    const res = await axios.post(PUMPPORTAL_BUY, params, { responseType: 'arraybuffer', timeout: 10_000 });
+    const res = await axios.post(PUMPPORTAL_BUY, params, { responseType: 'arraybuffer', timeout: 10_000, ...(PROXY_AGENT ? { httpsAgent: PROXY_AGENT } : {}) });
     if (res.status !== 200) throw new Error(`PumpPortal ${res.status}`);
 
     const txBytes = Buffer.from(res.data);
@@ -397,7 +426,7 @@ async function doSell(mint: string, symbol: string, pct: number, reason: string,
       priorityFee:      USE_JITO ? 0.0001 : 0.003,
       pool:             'pump',
     };
-    const res = await axios.post(PUMPPORTAL_BUY, params, { responseType: 'arraybuffer', timeout: 10_000 });
+    const res = await axios.post(PUMPPORTAL_BUY, params, { responseType: 'arraybuffer', timeout: 10_000, ...(PROXY_AGENT ? { httpsAgent: PROXY_AGENT } : {}) });
 
     if (res.status === 200 && USE_JITO) {
       const txBytes = Buffer.from(res.data);
@@ -583,6 +612,7 @@ let wsGuard: WsGuardHandle | null = null;
 function connectWS(): void {
   wsGuard = createGuardedWS({
     url: PUMPPORTAL_WS,
+    agent: PROXY_AGENT,
     onOpen: () => {
       console.info('[bonding-smart] WebSocket connected');
       wsGuard!.send(JSON.stringify({ method: 'subscribeNewToken' }));
