@@ -42,6 +42,7 @@ export interface BaseToken {
   age_sec:          number;
   buy_sell_ratio:   number;
   txns_h1_buys:     number; // unique buy count in last 1h — filters dead/fake volume
+  volume_5m?:       number; // 5-min volume (not always available from DexScreener)
   is_verified:      boolean;
   lp_locked:        boolean;
   safe_score:       number;
