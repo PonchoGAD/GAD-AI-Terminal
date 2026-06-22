@@ -935,6 +935,43 @@ async function checkAndExecuteSells(walletAddress: string) {
   }
 }
 
+// ─── Trailing stop helper (exported for testing / external use) ───────────────
+// Strictly separates pre-TP1 (early trail) and post-TP1 (standard trail) phases.
+// Caller tracks peakPrice between calls — pass the highest price seen so far.
+export function calculateTrailingStop(
+  currentPrice: number,
+  entryPrice:   number,
+  peakPrice:    number,
+  tp1Triggered: boolean,
+): { shouldSell: boolean; reason: string } {
+  const earlyTrailPct = Number(process.env.EARLY_TRAIL_PCT || '3') / 100;  // default 3%
+  const trailPct      = Number(process.env.TRAIL_PCT       || '7') / 100;  // default 7%
+
+  // PHASE 1 — pre-TP1 early trail
+  // Activates only once peak has risen ≥10% above entry.
+  // Guard: earlyStop must be > entry*1.02 — guarantees exit at a profit, never at a loss.
+  if (!tp1Triggered && earlyTrailPct > 0 && entryPrice > 0) {
+    const earlyMinPeak = entryPrice * 1.10;
+    if (peakPrice >= earlyMinPeak) {
+      const earlyStop = peakPrice * (1 - earlyTrailPct);
+      if (currentPrice <= earlyStop && earlyStop > entryPrice * 1.02) {
+        return { shouldSell: true, reason: `EARLY_TRAILING_STOP_${(earlyTrailPct * 100).toFixed(0)}PCT` };
+      }
+    }
+    return { shouldSell: false, reason: 'HOLD_PRE_TP1' };
+  }
+
+  // PHASE 2 — post-TP1 standard trail
+  if (tp1Triggered && trailPct > 0) {
+    const standardStop = peakPrice * (1 - trailPct);
+    if (currentPrice <= standardStop) {
+      return { shouldSell: true, reason: `STANDARD_TRAILING_STOP_${(trailPct * 100).toFixed(0)}PCT_POST_TP1` };
+    }
+  }
+
+  return { shouldSell: false, reason: 'HOLD' };
+}
+
 // ─── Buy cycle ────────────────────────────────────────────────────────────────
 
 async function runBuyCycle() {

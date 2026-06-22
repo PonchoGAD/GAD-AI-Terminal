@@ -358,6 +358,31 @@ export async function processAutoSignals(walletAddress: string): Promise<void> {
   }
 }
 
+// ─── Age Gate Helper (exported for use by scheduler / tests) ─────────────────
+// Encapsulates all age-related filters in one place.
+// Returns {passed:true} or {passed:false, reason} — caller decides whether to log.
+export function checkTokenAgeGate(
+  ageSeconds: number,
+  liquidityUsd: number,
+): { passed: boolean; reason?: string } {
+  if (ageSeconds < 0) return { passed: true }; // unknown age — allow, momentum filters will catch stale tokens
+
+  const minAge = Number(process.env.RAYDIUM_MIN_AGE_SEC || '1800');
+  const maxAge = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(6 * 3600));
+
+  if (ageSeconds < minAge)
+    return { passed: false, reason: `TOKEN_TOO_FRESH: ${ageSeconds}s < ${minAge}s` };
+  if (ageSeconds > maxAge)
+    return { passed: false, reason: `TOKEN_TOO_OLD: ${ageSeconds}s > ${maxAge}s` };
+
+  // Microcap guard: tokens < $45k liq are still vulnerable to dev dump in first 60 min
+  const microcapMaxAge = 3600; // 60 min — hardcoded: first hour is highest rug risk for thin pools
+  if (liquidityUsd < 45000 && ageSeconds < microcapMaxAge)
+    return { passed: false, reason: `MICROCAP_TOO_FRESH: liq:$${liquidityUsd.toFixed(0)} needs ≥60min (has ${(ageSeconds/60).toFixed(0)}min)` };
+
+  return { passed: true };
+}
+
 // ─── Market Regime Auto-Detection ────────────────────────────────────────────
 // Fear & Greed index from Alternative.me. Cached 30 min.
 // EXTREME_FEAR (<13): PAUSE all buys — true capitulation/black swan only
