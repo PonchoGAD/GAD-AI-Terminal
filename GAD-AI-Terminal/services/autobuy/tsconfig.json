@@ -13,7 +13,7 @@
       "@lib/walletintel": ["../../libs/walletintel/src/index.d.ts"],
       "@lib/botshield":   ["../../libs/botshield/src/index.d.ts"],
       "@lib/solana":      ["../../libs/solana/src/index.d.ts"],
-      "@lib/shared":      ["../../libs/shared/src/index.ts"]
+      "@lib/shared":      ["../../libs/shared/src/index.d.ts"]
     }
   },
   "include": [
@@ -26,6 +26,6 @@
     "../../libs/walletintel/src/index.d.ts",
     "../../libs/botshield/src/index.d.ts",
     "../../libs/solana/src/index.d.ts",
-    "../../libs/shared/src/index.ts"
+    "../../libs/shared/src/index.d.ts"
   ]
 }
