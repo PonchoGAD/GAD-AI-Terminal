@@ -1202,10 +1202,14 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
           `trend:${trend.stage} hype:${hype.hype_stage}(${hype.hype_score}) slip:${slippage}bps`
         );
         // Shadow Mode DB tracking: record for P&L analysis
-        try {
-          const { recordShadowTrade } = await import('@lib/shared');
-          await recordShadowTrade({ chain:'solana', strategy:'raydium', symbol: pair.baseToken?.symbol ?? mint.slice(0,8), contract_address: mint, entry_price: Number(pair.priceNative ?? 0), entry_mcap_usd: Number(pair.marketCap ?? 0), entry_liq_usd: liq, entry_pc1h: pc1h, filter_params: { pc5m, liq, vol1h, ageSec, regime, tier: tier.label }, tp1_target: tier.stopPct <= 0.08 ? 25 : 30, stop_pct: tier.stopPct * 100 });
-        } catch {}
+        query(
+          `INSERT INTO shadow_trades (chain,strategy,symbol,contract_address,entry_price,entry_mcap_usd,entry_liq_usd,entry_pc1h,filter_params,tp1_target,stop_pct)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`,
+          ['solana','raydium',pair.baseToken?.symbol ?? mint.slice(0,8),mint,
+           Number(pair.priceNative ?? 0),Number(pair.marketCap ?? 0),liq,pc1h,
+           JSON.stringify({pc5m,liq,vol1h,ageSec,regime,tier:tier.label}),
+           tier.stopPct <= 0.08 ? 25 : 30, tier.stopPct * 100]
+        ).catch(()=>{});
         newJobs++;
         continue;
       }

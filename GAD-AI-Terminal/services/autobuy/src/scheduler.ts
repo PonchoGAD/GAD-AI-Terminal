@@ -15,7 +15,6 @@ import { startBondingScanner } from './bonding-scanner';
 import { startBondingSmart } from './bonding-smart';
 import { startCopyTrader } from './copy-trader';
 import { getRaydiumOnChainPrice, hasRaydiumVaults } from './raydium-price-fetcher';
-import { checkShadowTrades } from '@lib/shared';
 
 const POLL_MS    = Number(process.env.AUTOBUY_POLL_SECONDS  || '15') * 1000;
 const MAX_ERRORS = Number(process.env.AUTOBUY_MAX_ERRORS    || '5');
@@ -1248,13 +1247,46 @@ export async function startAutobuyScheduler() {
   }
 
   // ─── Shadow mode checker — runs every 30 min ─────────────────────────────
-  // Checks open shadow trades (WOULD BUY records) and updates price checkpoints.
-  // After 50+ shadow trades we get real win-rate data to validate filters.
-  setInterval(() => {
-    checkShadowTrades().catch(e => console.warn('[shadow] Checker error:', e.message));
-  }, 30 * 60 * 1000);
-  // Run once 5 minutes after startup (allow DB to be ready)
-  setTimeout(() => checkShadowTrades().catch(() => {}), 5 * 60 * 1000);
+  async function runShadowCheck() {
+    try {
+      const open = await query<any>(
+        `SELECT id, chain, symbol, contract_address, entry_price::float, tp1_target::float,
+                stop_pct::float, created_at, check_30m_pct::float, check_1h_pct::float,
+                check_4h_pct::float, check_8h_pct::float
+         FROM shadow_trades
+         WHERE status='open' AND created_at > NOW() - INTERVAL '9 hours'
+         ORDER BY created_at ASC LIMIT 50`
+      );
+      if (!open.rows.length) return;
+      let checked = 0;
+      for (const row of open.rows) {
+        const ageMin = (Date.now() - new Date(row.created_at).getTime()) / 60000;
+        try {
+          const r = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${row.contract_address}`, { timeout: 5000 });
+          const pairs: any[] = (r.data?.pairs ?? []).filter((p: any) => p.chainId === row.chain || p.chainId === `${row.chain}chain`);
+          if (!pairs.length) continue;
+          const price = Number(pairs[0].priceNative ?? 0);
+          if (!price || !row.entry_price) continue;
+          const pct = ((price - row.entry_price) / row.entry_price) * 100;
+          const updates: string[] = []; const params: any[] = []; let idx = 1;
+          if (ageMin >= 30  && !row.check_30m_pct) { updates.push(`check_30m_pct=$${idx++}`); params.push(pct); }
+          if (ageMin >= 60  && !row.check_1h_pct)  { updates.push(`check_1h_pct=$${idx++}`);  params.push(pct); }
+          if (ageMin >= 240 && !row.check_4h_pct)  { updates.push(`check_4h_pct=$${idx++}`);  params.push(pct); }
+          if (ageMin >= 480 && !row.check_8h_pct)  { updates.push(`check_8h_pct=$${idx++}`);  params.push(pct); }
+          if (ageMin >= 480) {
+            const st = pct >= (row.tp1_target ?? 25) ? 'tp1_hit' : pct <= -(row.stop_pct ?? 8) ? 'stopped' : 'expired';
+            updates.push(`status=$${idx++}`, `outcome_price=$${idx++}`, `outcome_pct=$${idx++}`, `outcome_at=NOW()`);
+            params.push(st, price, pct);
+            console.info(`[shadow] ${st === 'tp1_hit' ? '✅' : '🔴'} ${row.symbol} ${pct >= 0 ? '+' : ''}${pct.toFixed(1)}% (${st})`);
+          }
+          if (updates.length) { params.push(row.id); await query(`UPDATE shadow_trades SET ${updates.join(',')} WHERE id=$${idx}`, params); checked++; }
+        } catch { continue; }
+      }
+      if (checked) console.info(`[shadow] Updated ${checked} checkpoints`);
+    } catch (e: any) { console.warn('[shadow] Check error:', e.message); }
+  }
+  setInterval(runShadowCheck, 30 * 60 * 1000);
+  setTimeout(runShadowCheck, 5 * 60 * 1000);
 
   // ─── Fast sell loop — checks every 1 second for TP/SL hits ───────────────
   // The main poll loop runs every 5s (including raydium scan). Memecoins pump and
