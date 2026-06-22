@@ -176,14 +176,27 @@ export async function checkTonHolderConcentration(
     let topShare = 0;
     let counted = 0;
     for (const h of holders.slice(0, 5)) {
-      // tonapi.io returns balance as string, total supply also in headers/parent
-      // Use percentage directly if available, else skip
-      const pct = parseFloat(h.percentage ?? h.share ?? '0');
-      topShare += pct;
-      counted++;
+      // TonAPI v2 uses "share" (float, 0-100 scale e.g. 15.456 = 15.456%).
+      // Some SDKs/wrappers use "percentage" (string or number) or "percent".
+      // Some return fraction-of-one (0.1545 instead of 15.45) — detect and correct.
+      const raw = h.share !== undefined ? h.share
+                : h.percentage !== undefined ? h.percentage
+                : h.percent !== undefined ? h.percent
+                : 0;
+      let shareNum = parseFloat(String(raw));
+      if (!isNaN(shareNum) && shareNum > 0 && shareNum < 1.0) {
+        // Fraction-of-one representation → convert to percentage
+        shareNum *= 100;
+      }
+      if (!isNaN(shareNum)) {
+        topShare += shareNum;
+        counted++;
+      }
     }
 
-    // If API returned percentage data (0-100 scale)
+    console.info(`[ton-guard] top-5 holders: ${topShare.toFixed(2)}% (counted:${counted})`);
+
+    // If API returned 0 holders info (no TON_API_KEY or empty) — fail open
     const ok = counted === 0 || topShare <= maxTopHoldersPct;
     const ttl = 10 * 60 * 1000; // 10-min cache — holder distribution changes slowly
     _holderCache.set(jettonAddress, { ok, topShare, expiresAt: Date.now() + ttl });
