@@ -7,11 +7,21 @@ const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const MIN_EV         = Number(process.env.POLYMARKET_MIN_EV           || '0.12');
 const MIN_CONFIDENCE = process.env.POLYMARKET_MIN_CONFIDENCE           || 'MEDIUM'; // HIGH | MEDIUM
 
-// Lazy-init OpenAI-compatible clients — Groq/DeepSeek/OpenAI share the same SDK interface
+// Lazy-init OpenAI-compatible clients — all share the same SDK interface
+let _geminiClient: OpenAI | null = null;
 let _groqClient: OpenAI | null = null;
 let _dsClient: OpenAI | null = null;
 let _oaiClient: OpenAI | null = null;
 
+// Gemini Flash via OpenAI-compatible endpoint (free tier, 15 RPM / 1M TPD)
+function geminiClient(): OpenAI {
+  if (!_geminiClient) _geminiClient = new OpenAI({
+    apiKey: process.env.GEMINI_API_KEY ?? 'no-key',
+    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+    timeout: 20000,
+  });
+  return _geminiClient;
+}
 function groqClient(): OpenAI {
   if (!_groqClient) _groqClient = new OpenAI({
     apiKey: process.env.GROQ_API_KEY ?? 'no-key',
@@ -52,10 +62,25 @@ function acquireGroqToken(): Promise<void> {
   return token;
 }
 
-// ── FREE LLM: Groq → DeepSeek → OpenAI (OpenAI SDK client for all three) ───
+// ── FREE LLM: Gemini → Groq → DeepSeek → Claude Haiku ──────────────────────
+// Chain priority: cheapest/free first, paid Claude only as last resort.
+// Gemini Flash free tier: 15 RPM, 1M TPD — handles most load without cost.
 // Used for matchNewsToMarket + scorePosition (many calls per cycle).
-// response_format: json_object eliminates all JSON parse errors.
 async function callLLMFree(userContent: string, maxTokens: number): Promise<string> {
+  // 0. Gemini Flash (FREE — 15 RPM, 1M tokens/day, via OpenAI-compatible API)
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      const res = await geminiClient().chat.completions.create({
+        model: 'gemini-1.5-flash', max_tokens: maxTokens,
+        response_format: { type: 'json_object' },
+        messages: [{ role: 'user', content: userContent }],
+      });
+      return res.choices[0]?.message?.content ?? '';
+    } catch (err: any) {
+      console.debug(`[poly-scorer] Gemini (${err.status ?? err.message?.slice(0,30)}) — trying Groq`);
+    }
+  }
+
   // 1. Groq (FREE — TPM rate limited)
   if (process.env.GROQ_API_KEY) {
     try {
@@ -96,14 +121,21 @@ async function callLLMFree(userContent: string, maxTokens: number): Promise<stri
     }
   }
 
-  // 3. OpenAI gpt-4o-mini (last resort)
-  if (!process.env.OPENAI_API_KEY) throw new Error('No LLM available — add GROQ_API_KEY or top up DEEPSEEK_API_KEY');
-  const res = await oaiClient().chat.completions.create({
-    model: 'gpt-4o-mini', max_tokens: maxTokens,
-    response_format: { type: 'json_object' },
-    messages: [{ role: 'user', content: userContent }],
-  });
-  return res.choices[0]?.message?.content ?? '';
+  // 3. Claude Haiku (ANTHROPIC_API_KEY set on VPS)
+  if (process.env.ANTHROPIC_API_KEY) {
+    try {
+      const msg = await claude.messages.create({
+        model: 'claude-haiku-4-5-20251001', max_tokens: maxTokens,
+        messages: [{ role: 'user', content: userContent }],
+      });
+      return msg.content[0].type === 'text' ? msg.content[0].text : '';
+    } catch (err: any) {
+      console.warn(`[poly-scorer] Claude Haiku failed (${err.status}) — graceful fallback`);
+    }
+  }
+  // 4. All LLMs failed — graceful no-match
+  console.warn('[poly-scorer] All LLMs unavailable (Groq/DeepSeek/Claude) — returning no-match');
+  return JSON.stringify({match:false,ev:0});
 }
 
 // ── PREMIUM LLM: Claude → DeepSeek → Groq ───────────────────────────────────

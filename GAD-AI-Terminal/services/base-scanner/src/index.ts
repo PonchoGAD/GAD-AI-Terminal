@@ -140,9 +140,19 @@ app.post('/base/buy', async (req, res) => {
 const buyFailBlacklist = new Map<string, number>(); // address → expiry timestamp
 const BUY_FAIL_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2h cooldown after buy failure
 
+// ─── Pending buys mutex — prevents double-buy when scan cycles overlap ────────
+// Without this, if buy TX takes >30s (next scan cycle), the same token gets queued
+// twice and can be bought 2× before the first DB INSERT confirms position exists.
+const pendingBuys = new Set<string>();
+
 // ─── Auto-buy hook (called by scanner on new signals) ─────────────────────────
 export async function handleNewToken(token: BaseToken): Promise<void> {
   if (!AUTO_BUY) return;
+
+  if (pendingBuys.has(token.contract_address)) {
+    console.debug(`[base-scanner] ⏳ ${token.symbol} buy already in progress — skipping duplicate`);
+    return;
+  }
 
   // Skip blacklisted tokens (recent buy failures)
   const blacklistExpiry = buyFailBlacklist.get(token.contract_address);
@@ -201,57 +211,62 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
     console.debug(`[base-scanner] 🔬 SwapSim ${token.symbol}: loss=${swapSim.totalLossPct.toFixed(1)}% OK`);
   }
 
-  const smTag = (token.sm_weight ?? 0) >= 2.0 ? ` 🔥SM(w${token.sm_weight})` : '';
-  const dynSlippage = calculateDynamicSlippage(token.volume_5m ?? 0, token.liquidity_usd);
-  console.info(`[base-scanner] 🛒 Buying ${token.symbol} ${BUY_ETH} ETH | liq:$${token.liquidity_usd.toFixed(0)} score:${token.safe_score} dex:${token.dex_id} slip:${dynSlippage}%${smTag}`);
+  pendingBuys.add(token.contract_address);
+  try {
+    const smTag = (token.sm_weight ?? 0) >= 2.0 ? ` 🔥SM(w${token.sm_weight})` : '';
+    const dynSlippage = calculateDynamicSlippage(token.volume_5m ?? 0, token.liquidity_usd);
+    console.info(`[base-scanner] 🛒 Buying ${token.symbol} ${BUY_ETH} ETH | liq:$${token.liquidity_usd.toFixed(0)} score:${token.safe_score} dex:${token.dex_id} slip:${dynSlippage}%${smTag}`);
 
-  const result = await buyToken(token.contract_address, BUY_ETH, dynSlippage);
+    const result = await buyToken(token.contract_address, BUY_ETH, dynSlippage);
 
-  if (!result.ok) {
-    // Blacklist this token for 2h — simulation or execution failed
-    buyFailBlacklist.set(token.contract_address, Date.now() + BUY_FAIL_COOLDOWN_MS);
-    console.error(`[base-scanner] ❌ Buy failed ${token.symbol} (${result.dex}): ${result.error} — blacklisted 2h`);
-    return;
-  }
+    if (!result.ok) {
+      // Blacklist this token for 2h — simulation or execution failed
+      buyFailBlacklist.set(token.contract_address, Date.now() + BUY_FAIL_COOLDOWN_MS);
+      console.error(`[base-scanner] ❌ Buy failed ${token.symbol} (${result.dex}): ${result.error} — blacklisted 2h`);
+      return;
+    }
 
-  console.info(`[base-scanner] ✅ ${token.symbol} bought ${result.amount_out} tokens tx:${result.tx_hash?.slice(0,12)}`);
+    console.info(`[base-scanner] ✅ ${token.symbol} bought ${result.amount_out} tokens tx:${result.tx_hash?.slice(0,12)}`);
 
-  // Honeypot check: verify actual token balance 3s after buy
-  // If balance is 0, the token is a honeypot (ETH taken, no tokens received)
-  await new Promise(r => setTimeout(r, 3000));
-  const actualBalance = await getTokenBalance(token.contract_address).catch(() => 0n);
-  if (actualBalance === 0n) {
-    console.error(`[base-scanner] 🍯 HONEYPOT detected — ${token.symbol}: 0 tokens after buy, ${BUY_ETH} ETH lost`);
-    buyFailBlacklist.set(token.contract_address, Date.now() + 24 * 60 * 60 * 1000); // 24h blacklist
+    // Honeypot check: verify actual token balance 3s after buy
+    // If balance is 0, the token is a honeypot (ETH taken, no tokens received)
+    await new Promise(r => setTimeout(r, 3000));
+    const actualBalance = await getTokenBalance(token.contract_address).catch(() => 0n);
+    if (actualBalance === 0n) {
+      console.error(`[base-scanner] 🍯 HONEYPOT detected — ${token.symbol}: 0 tokens after buy, ${BUY_ETH} ETH lost`);
+      buyFailBlacklist.set(token.contract_address, Date.now() + 24 * 60 * 60 * 1000); // 24h blacklist
+      await query(
+        `INSERT INTO base_positions
+           (contract_address, symbol, wallet, amount_eth, token_amount, entry_price_eth,
+            bought_at, sold_at, dex, fee_tier, tp_index, is_active, trail_high, buy_tx,
+            total_sold_eth, sell_reason)
+         VALUES ($1,$2,$3,$4,'0',$5,NOW(),NOW(),$6,$7,0,false,0,$8,0,'HONEYPOT')`,
+        [token.contract_address, token.symbol, WALLET, BUY_ETH, token.price_eth,
+         result.dex, result.fee_tier ?? 3000, result.tx_hash]
+      );
+      return;
+    }
+
     await query(
       `INSERT INTO base_positions
          (contract_address, symbol, wallet, amount_eth, token_amount, entry_price_eth,
-          bought_at, sold_at, dex, fee_tier, tp_index, is_active, trail_high, buy_tx,
-          total_sold_eth, sell_reason)
-       VALUES ($1,$2,$3,$4,'0',$5,NOW(),NOW(),$6,$7,0,false,0,$8,0,'HONEYPOT')`,
-      [token.contract_address, token.symbol, WALLET, BUY_ETH, token.price_eth,
-       result.dex, result.fee_tier ?? 3000, result.tx_hash]
+          bought_at, dex, fee_tier, tp_index, is_active, trail_high, buy_tx)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7,$8,0,true,$6,$9)`,
+      [
+        token.contract_address,
+        token.symbol,
+        WALLET,
+        BUY_ETH,
+        actualBalance.toString(), // use actual on-chain balance, not quote
+        token.price_eth,
+        result.dex,
+        result.fee_tier ?? 3000,
+        result.tx_hash,
+      ]
     );
-    return;
+  } finally {
+    pendingBuys.delete(token.contract_address);
   }
-
-  await query(
-    `INSERT INTO base_positions
-       (contract_address, symbol, wallet, amount_eth, token_amount, entry_price_eth,
-        bought_at, dex, fee_tier, tp_index, is_active, trail_high, buy_tx)
-     VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7,$8,0,true,$6,$9)`,
-    [
-      token.contract_address,
-      token.symbol,
-      WALLET,
-      BUY_ETH,
-      actualBalance.toString(), // use actual on-chain balance, not quote
-      token.price_eth,
-      result.dex,
-      result.fee_tier ?? 3000,
-      result.tx_hash,
-    ]
-  );
 }
 
 // ─── Startup ──────────────────────────────────────────────────────────────────

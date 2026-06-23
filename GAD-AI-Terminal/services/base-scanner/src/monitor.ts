@@ -21,7 +21,7 @@ const TIME_LIMIT_SEC   = Number(process.env.BASE_TIME_LIMIT_SEC    || '5400'); /
 // and widen the trail stop — let winners run instead of capping them at 1.5h.
 const MOONBAG_MULT     = Number(process.env.BASE_MOONBAG_MULT      || '2.5');
 const MOONBAG_TRAIL    = Number(process.env.BASE_MOONBAG_TRAIL_PCT || '15');
-const POLL_INTERVAL_MS = Number(process.env.BASE_POLL_INTERVAL_MS  || '10000');
+const POLL_INTERVAL_MS = Number(process.env.BASE_POLL_INTERVAL_MS  || '3000');
 const BUY_ETH          = Number(process.env.BASE_BUY_ETH           || '0.001');
 
 let _ethUsdCache: { price: number; ts: number } = { price: 2700, ts: 0 };
