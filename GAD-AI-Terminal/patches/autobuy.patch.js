@@ -90,4 +90,21 @@ if (as.includes("|| '80000'")) {
 
 fs.writeFileSync(asPath, as);
 
+// ── PATCH 4: graduation-scanner.js — slow down reconnect 15s → 60s ──────────
+const gsPath = '/usr/src/app/services/autobuy/dist/graduation-scanner.js';
+let gs = fs.readFileSync(gsPath, 'utf8');
+if (gs.includes('reconnecting in 15s')) {
+  gs = gs.replace(/reconnecting in 15s/g, 'reconnecting in 60s');
+  gs = gs.replace(/setTimeout\(connectGradWS,\s*15000\)/g, 'setTimeout(connectGradWS, 60000)');
+  // fallback: any 15000 reconnect in this file
+  gs = gs.replace(/setTimeout\(\s*function\s*\(\)\s*\{[^}]*connectGradWS[^}]*\},\s*15000\)/g, function(m) {
+    return m.replace('15000', '60000');
+  });
+  fs.writeFileSync(gsPath, gs);
+  patchCount++;
+  console.log('[patch] graduation-scanner.js: reconnect 15s → 60s');
+} else {
+  console.log('[patch] graduation-scanner.js: reconnect already OK');
+}
+
 console.log('[patch] autobuy: ' + patchCount + ' patch(es) applied — starting service...');
