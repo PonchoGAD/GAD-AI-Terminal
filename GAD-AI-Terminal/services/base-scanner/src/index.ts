@@ -192,7 +192,7 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
 
   // EVM Security Shield: hard-block on GoPlus flags not caught by score-based checkTokenSafety
   // Checks: CONTRACT_NOT_VERIFIED, HONEYPOT_DETECTED, MODIFIABLE_TAX, MINTABLE+TAX, EXCESSIVE_TAX
-  const secShield = await isTokenSafeToTrade(token.contract_address, 8453);
+  const secShield = await isTokenSafeToTrade(token.contract_address, 8453, token.age_sec);
   if (!secShield.isSafe) {
     buyFailBlacklist.set(token.contract_address, Date.now() + BUY_FAIL_COOLDOWN_MS);
     console.warn(`[base-scanner] 🛡 BLOCKED ${token.symbol} (${token.contract_address.slice(0,10)}): ${secShield.reason}`);

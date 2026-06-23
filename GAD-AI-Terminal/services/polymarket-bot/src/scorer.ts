@@ -193,20 +193,20 @@ async function matchNewsToMarket(
   newsText: string,
   markets: Market[]
 ): Promise<{ marketId: string; outcome: 'YES' | 'NO'; relevance: number } | null> {
-  // Top 10 markets, numeric index as ID to minimize tokens (~470 tokens total vs 1100 with full hashes)
-  const top10 = markets.slice(0, 10);
-  const marketList = top10.map((m, i) => ({ i, q: m.title.slice(0, 60), y: +m.priceYes.toFixed(3) }));
+  // Top 30 markets by volume — broader set improves match rate. Numeric index keeps tokens low (~600 total).
+  const top30 = markets.slice(0, 30);
+  const marketList = top30.map((m, i) => ({ i, q: m.title.slice(0, 60), y: +m.priceYes.toFixed(3) }));
 
   const prompt =
     `Match news to most relevant Polymarket market. Return ONLY JSON.\n` +
     `NEWS: "${newsText.slice(0, 200)}"\n` +
     `MARKETS: ${JSON.stringify(marketList)}\n` +
-    `{"match":true/false,"idx":0-9,"outcome":"YES"/"NO","relevance":0-100} or {"match":false}`;
+    `{"match":true/false,"idx":0-29,"outcome":"YES"/"NO","relevance":0-100} or {"match":false}`;
 
   const text = await callLLMFree(prompt, 120);
   const json = JSON.parse(text.match(/\{[\s\S]*?\}/)?.[0] ?? 'null');
   if (!json?.match || json.relevance < 50) return null;
-  const mkt = top10[Number(json.idx)];
+  const mkt = top30[Number(json.idx)];
   if (!mkt) return null;
   return { marketId: mkt.id, outcome: json.outcome as 'YES' | 'NO', relevance: json.relevance };
 }

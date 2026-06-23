@@ -35,6 +35,7 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 export async function isTokenSafeToTrade(
   tokenAddress: string,
   chainId: number = 8453,
+  ageSec?: number,
 ): Promise<SecurityResult> {
   const address = tokenAddress.toLowerCase().trim();
   const cacheKey = `${chainId}:${address}`;
@@ -42,12 +43,12 @@ export async function isTokenSafeToTrade(
   const cached = _cache.get(cacheKey);
   if (cached && Date.now() < cached.expiresAt) return cached.result;
 
-  const result = await _run(address, chainId);
+  const result = await _run(address, chainId, ageSec);
   _cache.set(cacheKey, { result, expiresAt: Date.now() + CACHE_TTL_MS });
   return result;
 }
 
-async function _run(address: string, chainId: number): Promise<SecurityResult> {
+async function _run(address: string, chainId: number, ageSec?: number): Promise<SecurityResult> {
   try {
     // ── Layer 1: Contract verification ────────────────────────────────────────
     // Unverified contracts are a strong scam signal — legitimate meme tokens
@@ -78,8 +79,16 @@ async function _run(address: string, chainId: number): Promise<SecurityResult> {
     const report = goplusResp.data?.result?.[address];
 
     if (!report) {
-      // GoPlus returned nothing — API may be down. Degrade gracefully (fail open).
-      console.debug(`[evm-shield] ⚠ GoPlus returned no data for ${address.slice(0,10)} — proceeding`);
+      // GoPlus returned nothing — two cases:
+      // 1. Token is brand-new (< 1h) — GoPlus hasn't indexed it yet.
+      //    Fail-CLOSED: scam tokens flood the first hour before GoPlus sees them.
+      // 2. API outage on an older token — fail-open (don't block legitimate tokens).
+      const isNew = ageSec !== undefined && ageSec < 3600;
+      if (isNew) {
+        console.debug(`[evm-shield] ⚠ GoPlus no data + token <1h old (${Math.round((ageSec ?? 0) / 60)}min) — BLOCKING ${address.slice(0,10)}`);
+        return { isSafe: false, reason: 'GOPLUS_NO_DATA_NEW_TOKEN_UNDER_1H' };
+      }
+      console.debug(`[evm-shield] ⚠ GoPlus no data for ${address.slice(0,10)} (age unknown/old) — proceeding`);
       return { isSafe: true };
     }
 
