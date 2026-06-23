@@ -73,7 +73,7 @@ if (mon.includes("|| '10000'")) {
 // ── PATCH 3: scanner.js — impersonator guard for cbXRP/cbADA/cbBTC etc ──────
 const scannerPath = '/usr/src/app/services/base-scanner/dist/scanner.js';
 let sc = fs.readFileSync(scannerPath, 'utf8');
-if (!sc.includes('isChainImpersonator')) {
+if (!sc.includes('chain_impersonator:')) {  // guard call not yet injected
   var guardCode = [
     '// Chain impersonator guard (patched)',
     "var _EXACT_BLOCK = new Set(['SOL','BNB','ADA','XRP','AVAX','MATIC','DOT','TRX','NEAR','SUI','ATOM','FTM','XLM','ALGO','EGLD','BTC','ETH','WBTC','BITCOIN','ETHEREUM','WSOL','WBNB','WXRP','WADA','WFTM','STETH','STSOL','CBETH','CBBTC','CBSOL','CHAINLINK','UNISWAP','AAVE','MAKER']);",
@@ -109,7 +109,7 @@ if (!sc.includes('isChainImpersonator')) {
   }
   fs.writeFileSync(scannerPath, sc);
 } else {
-  console.log('[patch] base-scanner scanner.js: impersonator guard already present');
+  console.log('[patch] base-scanner scanner.js: impersonator guard already present and called');
 }
 
 console.log('[patch] done — ' + patchCount + ' change(s) applied');
