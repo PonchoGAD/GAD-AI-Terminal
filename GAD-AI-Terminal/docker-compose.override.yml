@@ -1,0 +1,31 @@
+# docker-compose.override.yml
+# Automatically picked up by docker compose alongside docker-compose.yml.
+# Mounts ./patches/ directory and runs patch scripts on container startup.
+# This ensures code patches survive ALL container recreates without rebuilding images.
+#
+# HOW IT WORKS:
+#   1. patches/*.patch.js files are mounted read-only into /patches/
+#   2. Each service's entrypoint runs the patch script BEFORE starting the service
+#   3. Patches are idempotent — safe to run on every start even if already applied
+#
+# ADDING A NEW PATCH:
+#   1. Create patches/<service>.patch.js
+#   2. Add the service override below
+#   3. git push gad main && ssh into VPS && git pull && docker compose up -d <service>
+
+services:
+  base-scanner:
+    volumes:
+      - ./patches:/patches:ro
+    entrypoint: ["sh", "-c"]
+    command: >
+      node /patches/base-scanner.patch.js 2>&1 || true;
+      npm --workspace services/base-scanner start
+
+  autobuy:
+    volumes:
+      - ./patches:/patches:ro
+    entrypoint: ["sh", "-c"]
+    command: >
+      node /patches/autobuy.patch.js 2>&1 || true;
+      npm --workspace services/autobuy start
