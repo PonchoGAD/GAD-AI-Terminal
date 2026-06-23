@@ -92,22 +92,20 @@ if (!sc.includes('isChainImpersonator')) {
     // Fallback: inject at top
     sc = guardCode + '\n' + sc;
   }
-  // Patch filterToken to reject impersonators early
-  // Find the filterToken function and add check after the function start
-  var FILTER_ENTRY = 'function filterToken(token)';
-  if (sc.includes(FILTER_ENTRY)) {
-    sc = sc.replace(FILTER_ENTRY, [
-      FILTER_ENTRY.replace('(token)', '(token) { /* patched entry */'),
-    ].join(''));
-    // Find first { after filterToken and inject
-    var filterIdx = sc.indexOf(FILTER_ENTRY);
+  // Patch passesFilter to reject impersonators early (actual function name in dist)
+  var FILTER_ENTRY = 'function passesFilter(t)';
+  var FILTER_ENTRY_ALT = 'function filterToken(token)';
+  var filterFn = sc.includes(FILTER_ENTRY) ? FILTER_ENTRY : (sc.includes(FILTER_ENTRY_ALT) ? FILTER_ENTRY_ALT : null);
+  if (filterFn) {
+    var filterIdx = sc.indexOf(filterFn);
     var braceIdx  = sc.indexOf('{', filterIdx);
-    var injectLine = '\n    if (isChainImpersonator(token.symbol || "")) { return false; } // guard\n';
+    var paramName = filterFn.includes('(t)') ? 't' : 'token';
+    var injectLine = '\n    if (isChainImpersonator((' + paramName + '.symbol || ""))) { return false; } // impersonator guard\n';
     sc = sc.slice(0, braceIdx + 1) + injectLine + sc.slice(braceIdx + 1);
     patchCount++;
-    console.log('[patch] base-scanner scanner.js: impersonator guard injected');
+    console.log('[patch] base-scanner scanner.js: impersonator guard call injected into ' + filterFn);
   } else {
-    console.log('[patch] base-scanner scanner.js: filterToken not found — manual review needed');
+    console.log('[patch] base-scanner scanner.js: passesFilter/filterToken not found — guard injected at top but not called');
   }
   fs.writeFileSync(scannerPath, sc);
 } else {

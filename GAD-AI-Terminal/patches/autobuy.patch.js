@@ -91,21 +91,21 @@ if (as.includes("|| '80000'")) {
 fs.writeFileSync(asPath, as);
 
 // ── PATCH 4: bonding-smart.js — disable social filter (default now env-driven) ─
-// BONDING_SMART_REQUIRE_SOCIAL is false by default in source, but old dist still
-// has hardcoded `if (!state.hasTwitter && !state.hasTelegram) return skip(...)`.
-// This patch makes it env-controlled so we don't need to rebuild.
-if (bs.includes("'no_socials: no Twitter/Telegram'")) {
+// Old dist has hardcoded `if (!state.hasTwitter && !state.hasTelegram) return skip(...)`
+// This patch makes it env-controlled. Dist message: 'no socials: no Twitter/Telegram in metadata'
+const SOCIAL_CONDITION = 'if (!state.hasTwitter && !state.hasTelegram)';
+if (bs.includes(SOCIAL_CONDITION) && !bs.includes('BONDING_SMART_REQUIRE_SOCIAL')) {
   bs = bs.replace(
-    /if\s*\(!state\.hasTwitter\s*&&\s*!state\.hasTelegram\)\s*return\s+skip\(['"](no_socials[^'"]*)['"]\)/,
-    function(m) {
-      return 'if ((process.env.BONDING_SMART_REQUIRE_SOCIAL === "true") && !state.hasTwitter && !state.hasTelegram) return skip("no_socials: no Twitter/Telegram")';
-    }
+    'if (!state.hasTwitter && !state.hasTelegram)',
+    'if ((process.env.BONDING_SMART_REQUIRE_SOCIAL === "true") && !state.hasTwitter && !state.hasTelegram)'
   );
   fs.writeFileSync(bsPath, bs);
   patchCount++;
   console.log('[patch] bonding-smart.js: social filter now env-controlled (BONDING_SMART_REQUIRE_SOCIAL)');
+} else if (bs.includes('BONDING_SMART_REQUIRE_SOCIAL')) {
+  console.log('[patch] bonding-smart.js: social filter already env-controlled');
 } else {
-  console.log('[patch] bonding-smart.js: social filter already env-controlled or pattern changed');
+  console.log('[patch] bonding-smart.js: social filter condition not found — check dist');
 }
 
 // ── PATCH 6: graduation-scanner.js — slow down reconnect 15s → 60s ──────────
