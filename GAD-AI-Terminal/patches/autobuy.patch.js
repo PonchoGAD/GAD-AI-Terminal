@@ -108,6 +108,60 @@ if (bs.includes(SOCIAL_CONDITION) && !bs.includes('BONDING_SMART_REQUIRE_SOCIAL'
   console.log('[patch] bonding-smart.js: social filter condition not found — check dist');
 }
 
+// ── PATCH 5: auto-signal.js — add GeckoTerminal new_pools via proxy ─────────
+// Source 6 in compiled dist was removed (PumpSwap Token-2022 issue).
+// Re-inject as a DIFFERENT source that only fetches Raydium pools (not PumpSwap).
+// Uses RESIDENTIAL_PROXY_URL to bypass VPS IP rate-limit (429 without proxy).
+const GECKO_INJECT_MARKER = '// Source 6 (REMOVED)';
+const GECKO_ALREADY_MARKER = 'GeckoTerminal_proxy_injected';
+if (as.includes(GECKO_INJECT_MARKER) && !as.includes(GECKO_ALREADY_MARKER)) {
+  var geckoBlock = [
+    '// GeckoTerminal_proxy_injected',
+    '// Source 6: GeckoTerminal new Raydium pools via residential proxy',
+    'try {',
+    '  const _proxyUrl = process.env.RESIDENTIAL_PROXY_URL;',
+    '  var _geckoAxiosCfg = { headers: { "Accept": "application/json;version=20230302" }, timeout: 8000 };',
+    '  if (_proxyUrl) {',
+    '    try {',
+    '      const { HttpsProxyAgent } = require("https-proxy-agent");',
+    '      _geckoAxiosCfg.httpsAgent = new HttpsProxyAgent(_proxyUrl);',
+    '      _geckoAxiosCfg.proxy = false; // use httpsAgent, not axios proxy',
+    '    } catch(_pe) { /* https-proxy-agent not available */ }',
+    '  }',
+    '  for (let _gPage = 1; _gPage <= 3; _gPage++) {',
+    '    const _gR = await axios_1.default.get(',
+    '      `${GECKO_BASE}/networks/solana/new_pools?page=${_gPage}`,',
+    '      _geckoAxiosCfg',
+    '    );',
+    '    const _gPools = _gR.data?.data ?? [];',
+    '    if (!_gPools.length) break;',
+    '    let _gAdded = 0;',
+    '    for (const _gPool of _gPools) {',
+    '      const _gPair = geckoPoolToPair(_gPool);',
+    '      if (!_gPair) continue;',
+    '      const _gMint = _gPair.baseToken?.address;',
+    '      if (!_gMint || seen.has(_gMint)) continue;',
+    '      seen.add(_gMint);',
+    '      results.push(_gPair);',
+    '      _gAdded++;',
+    '    }',
+    '    if (_gAdded > 0) console.debug(`[raydium-scan] GeckoTerminal proxy new_pools p${_gPage}: ${_gAdded} fresh`);',
+    '    await new Promise(_r => setTimeout(_r, 400));',
+    '  }',
+    '} catch (_gErr) {',
+    '  console.debug(`[raydium-scan] GeckoTerminal proxy err: ${_gErr.message?.slice(0,40)}`);',
+    '}',
+  ].join('\n');
+  as = as.replace(GECKO_INJECT_MARKER, geckoBlock + '\n    ' + GECKO_INJECT_MARKER);
+  fs.writeFileSync(asPath, as);
+  patchCount++;
+  console.log('[patch] auto-signal.js: GeckoTerminal proxy Source 6 injected');
+} else if (as.includes(GECKO_ALREADY_MARKER)) {
+  console.log('[patch] auto-signal.js: GeckoTerminal proxy already injected');
+} else {
+  console.log('[patch] auto-signal.js: Source 6 marker not found — check dist');
+}
+
 // ── PATCH 6: graduation-scanner.js — slow down reconnect 15s → 60s ──────────
 const gsPath = '/usr/src/app/services/autobuy/dist/graduation-scanner.js';
 let gs = fs.readFileSync(gsPath, 'utf8');

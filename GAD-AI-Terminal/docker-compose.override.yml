@@ -23,3 +23,7 @@ services:
     volumes:
       - ./patches:/patches:ro
     command: ["/bin/sh", "/patches/autobuy-start.sh"]
+
+  polymarket-bot:
+    entrypoint: ["node"]
+    command: ["-r", "ts-node/register", "-r", "tsconfig-paths/register", "services/polymarket-bot/src/index.ts"]

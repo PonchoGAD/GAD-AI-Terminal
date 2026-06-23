@@ -19,6 +19,7 @@
 
 import { query } from '@lib/db';
 import axios from 'axios';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import { analyzeTrend }   from '@lib/trend';
 import { assessLiquidity } from '@lib/liqhealth';
 import { detectHype }     from '@lib/hype';
@@ -368,7 +369,7 @@ export function checkTokenAgeGate(
   if (ageSeconds < 0) return { passed: true }; // unknown age — allow, momentum filters will catch stale tokens
 
   const minAge = Number(process.env.RAYDIUM_MIN_AGE_SEC || '1800');
-  const maxAge = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(6 * 3600));
+  const maxAge = 43200; // 23.06.26: hardcoded 12h (env baked=6h)
 
   if (ageSeconds < minAge)
     return { passed: false, reason: `TOKEN_TOO_FRESH: ${ageSeconds}s < ${minAge}s` };
@@ -427,16 +428,18 @@ export async function getMarketRegime(): Promise<string> {
 const DEXSCREENER_BASE = 'https://api.dexscreener.com/latest/dex';
 const GECKO_BASE = 'https://api.geckoterminal.com/api/v2';
 const GECKO_HEADERS = { 'Accept': 'application/json;version=20230302' };
+const _proxyUrl = process.env.RESIDENTIAL_PROXY_URL;
+const _geckoAgent = _proxyUrl ? new HttpsProxyAgent(_proxyUrl) : undefined;
 
 // Min liquidity — raised to $30k based on 7-day audit (37 wins, 101 real buys).
 // Avg liq of winning trades = $34k. Tokens $12-25k cause stop-loss slippage of -16.7%
 // even with -8% programmatic stop (thin pool moves price on our own 0.02 SOL sell).
 // $30k floor = dev buy ~1.0+ SOL, real skin in the game, enough depth for exit.
-const RAYDIUM_MIN_LIQUIDITY_USD = Number(process.env.RAYDIUM_MIN_LIQUIDITY_USD || '30000');
+const RAYDIUM_MIN_LIQUIDITY_USD = 12000; // 23.06.26: hardcoded 12k (VPS intent; container baked 25k)
 // Max liquidity — avoid large-cap tokens (slow movers)
 // T2 ($80k+) has 0% win rate across 79-trade audit — default excludes T2/T3.
 // Override in .env: RAYDIUM_MAX_LIQUIDITY_USD=250000 to allow T2 after backtesting.
-const RAYDIUM_MAX_LIQUIDITY_USD = Number(process.env.RAYDIUM_MAX_LIQUIDITY_USD || '80000');
+const RAYDIUM_MAX_LIQUIDITY_USD = 120000; // 23.06.26: raised from 80k → 120k (GTAVI $106k had momentum)
 // No separate vol1h floor — Gate 4 vol/liq ratio check is the real stale-pool filter
 const RAYDIUM_MIN_VOLUME_H1_USD = Number(process.env.RAYDIUM_MIN_VOLUME_H1_USD || '0');
 // Min 1h price change — real pump.fun winners show 0.5-20% in 1h at optimal entry
@@ -446,7 +449,7 @@ const RAYDIUM_MAX_PC1H = Number(process.env.RAYDIUM_MAX_PC1H || '45');
 // Min 5m price change — require active momentum RIGHT NOW (key entry signal)
 const RAYDIUM_MIN_PC5M = Number(process.env.RAYDIUM_MIN_PC5M || '1.5');
 // Max token age — 48h: memecoins that haven't pumped in 2 days are usually dead
-const RAYDIUM_MAX_AGE_SEC = Number(process.env.RAYDIUM_MAX_AGE_SEC || String(2 * 24 * 3600));
+const RAYDIUM_MAX_AGE_SEC = 43200; // 23.06.26: hardcoded 12h (was 48h default; env baked 6h)
 // Min token age — 30min prevents buying in the first minutes of Raydium launch
 const RAYDIUM_MIN_AGE_SEC = Number(process.env.RAYDIUM_MIN_AGE_SEC || '1800');
 // Min vol/liq ratio — 8% hourly turnover (from analysis: winners avg vol/mcap=6.5x in 24h)
@@ -842,7 +845,7 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     for (let page = 1; page <= 3; page++) {
       const gR = await axios.get(
         `${GECKO_BASE}/networks/solana/new_pools?page=${page}`,
-        { headers: GECKO_HEADERS, timeout: 7_000 }
+        { headers: GECKO_HEADERS, timeout: 7_000, ..._geckoAgent ? { httpsAgent: _geckoAgent, proxy: false as const } : {} }
       );
       const pools: any[] = gR.data?.data ?? [];
       if (!pools.length) break;
@@ -929,9 +932,8 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     return;
   }
 
-  // In FEAR regime: require 10% 1h momentum — a 5% move is easily reversed against bearish market.
-  // Contrarian thesis only works if the token is actively BUCKING the fear, not just drifting up.
-  const minPc1hOverride = regime === 'FEAR' ? Math.max(RAYDIUM_MIN_PC1H, 10) : RAYDIUM_MIN_PC1H;
+  // No FEAR override — RAYDIUM_MIN_PC1H env var controls threshold in all regimes.
+  const minPc1hOverride = RAYDIUM_MIN_PC1H;
 
   const dailySpent = await getDailySpent();
   if (dailySpent >= DAILY_MAX_SOL) return;
