@@ -90,7 +90,25 @@ if (as.includes("|| '80000'")) {
 
 fs.writeFileSync(asPath, as);
 
-// ── PATCH 4: graduation-scanner.js — slow down reconnect 15s → 60s ──────────
+// ── PATCH 4: bonding-smart.js — disable social filter (default now env-driven) ─
+// BONDING_SMART_REQUIRE_SOCIAL is false by default in source, but old dist still
+// has hardcoded `if (!state.hasTwitter && !state.hasTelegram) return skip(...)`.
+// This patch makes it env-controlled so we don't need to rebuild.
+if (bs.includes("'no_socials: no Twitter/Telegram'")) {
+  bs = bs.replace(
+    /if\s*\(!state\.hasTwitter\s*&&\s*!state\.hasTelegram\)\s*return\s+skip\(['"](no_socials[^'"]*)['"]\)/,
+    function(m) {
+      return 'if ((process.env.BONDING_SMART_REQUIRE_SOCIAL === "true") && !state.hasTwitter && !state.hasTelegram) return skip("no_socials: no Twitter/Telegram")';
+    }
+  );
+  fs.writeFileSync(bsPath, bs);
+  patchCount++;
+  console.log('[patch] bonding-smart.js: social filter now env-controlled (BONDING_SMART_REQUIRE_SOCIAL)');
+} else {
+  console.log('[patch] bonding-smart.js: social filter already env-controlled or pattern changed');
+}
+
+// ── PATCH 6: graduation-scanner.js — slow down reconnect 15s → 60s ──────────
 const gsPath = '/usr/src/app/services/autobuy/dist/graduation-scanner.js';
 let gs = fs.readFileSync(gsPath, 'utf8');
 if (gs.includes('reconnecting in 15s')) {

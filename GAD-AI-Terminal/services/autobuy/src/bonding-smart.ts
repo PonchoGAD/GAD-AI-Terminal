@@ -77,16 +77,20 @@ const MIN_CURVE_PROGRESS = Number(process.env.BONDING_SMART_MIN_CURVE_PCT  || '2
 const MAX_CURVE_PROGRESS = Number(process.env.BONDING_SMART_MAX_CURVE_PCT  || '55');
 
 // Volume velocity: 6 SOL/60s (was 5)
-const MIN_VELOCITY_SOL_60S = Number(process.env.BONDING_SMART_MIN_VEL_SOL  || '6');
+const MIN_VELOCITY_SOL_60S = Number(process.env.BONDING_SMART_MIN_VEL_SOL  || '3'); // lowered 23.06.26: 6→3 SOL/60s
 
 // Unique buyers 5 min: 40 (was 30)
-const MIN_UNIQUE_BUYERS_5M = Number(process.env.BONDING_SMART_MIN_BUYERS   || '40');
+const MIN_UNIQUE_BUYERS_5M = Number(process.env.BONDING_SMART_MIN_BUYERS   || '20'); // lowered 23.06.26: 40→20
 
 // Dev max holding: 3% (was 5%)
 const MAX_DEV_HOLDING_PCT  = Number(process.env.BONDING_SMART_MAX_DEV_PCT   || '3');
 
 // Token age limit: 30 min
 const MAX_TOKEN_AGE_SEC    = Number(process.env.BONDING_SMART_MAX_AGE_SEC   || '1800');
+
+// Social filter: require Twitter/Telegram. Default OFF — most fresh tokens lack socials for first 1-2h.
+// Enabling cuts 95%+ of signals. Only turn on when volume is high enough to afford being selective.
+const REQUIRE_SOCIAL       = process.env.BONDING_SMART_REQUIRE_SOCIAL === 'true';
 
 // Stop-loss: 8% (was 10%)
 const STOP_PCT             = Number(process.env.BONDING_SMART_STOP_PCT      || '8') / 100;
@@ -191,10 +195,11 @@ function getConnection(): Connection {
 }
 
 function getKeypair(): Keypair | null {
-  // BONDING_SMART_USE_W2=true → use W2 (CFmHWpmQ / PUMPFUN_WALLET_PRIVATE_KEY_2)
-  // Default: W1 (WALLET_PRIVATE_KEY) for backwards compat
+  // BONDING_SMART_USE_W2=true → use W2/LAUNCH-2 (CFmHWpmQ / PUMPFUN_WALLET_PRIVATE_KEY)
+  // Default: W1/MASTER (WALLET_PRIVATE_KEY) for backwards compat
+  // NOTE: W3/LAUNCH-3 = PUMPFUN_WALLET_PRIVATE_KEY_2 — NEVER used for trading
   const useW2 = process.env.BONDING_SMART_USE_W2 === 'true';
-  const raw   = (useW2 ? process.env.PUMPFUN_WALLET_PRIVATE_KEY_2 : undefined)
+  const raw   = (useW2 ? process.env.PUMPFUN_WALLET_PRIVATE_KEY : undefined)
               ?? process.env.WALLET_PRIVATE_KEY;
   if (!raw) return null;
   try {
@@ -256,7 +261,7 @@ async function shouldBuy(state: TokenState): Promise<{ buy: boolean; reason: str
     return skip('bundle: dev bought >10% in creation TX');
 
   // ── Social check ──────────────────────────────────────────────────────────
-  if (!state.hasTwitter && !state.hasTelegram)
+  if (REQUIRE_SOCIAL && !state.hasTwitter && !state.hasTelegram)
     return skip('no_socials: no Twitter/Telegram');
 
   // ── Community activity (БЛОК 2): pump.fun reply count ────────────────────
@@ -535,6 +540,9 @@ async function handleCreate(ev: any): Promise<void> {
 
   tokenStates.set(mint, state);
 
+  // Subscribe to trade events for this specific token (PumpPortal WS)
+  if (wsGuard) wsGuard.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
+
   const flags = [
     bundleDetected             && '🚨bundle',
     !socials.hasTwitter && !socials.hasTelegram && '❌nosocial',
@@ -601,6 +609,24 @@ async function handleTrade(ev: any): Promise<void> {
 
   const decision = await shouldBuy(state);
   if (decision.buy) {
+    // Shadow mode: record WOULD-BUY before actual buy
+    try {
+      const vel60 = state.events
+        .filter(e => e.isBuy && Date.now() - e.ts <= 60_000)
+        .reduce((s, e) => s + e.solAmount, 0);
+      const buyers5m = new Set(
+        state.events.filter(e => e.isBuy && Date.now() - e.ts <= 300_000).map(e => e.buyer)
+      ).size;
+      const entryEst = state.vSol > 0 ? state.vSol / 800_000_000 : 1e-9;
+      await query(`INSERT INTO shadow_trades
+        (chain,strategy,symbol,contract_address,entry_price,entry_mcap_usd,entry_liq_usd,
+         entry_pc1h,filter_params,tp1_target,stop_pct)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`,
+        ['solana','bonding_smart',state.symbol,state.mint,entryEst,
+         state.vSol * 160, 0, 0,
+         JSON.stringify({ vel: vel60, buyers: buyers5m }),
+         entryEst * 1.5, 0.10]);
+    } catch (_se) {}
     await doBuy(state, decision.reason, decision.smBoost);
   }
 }

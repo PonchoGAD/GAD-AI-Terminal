@@ -70,4 +70,48 @@ if (mon.includes("|| '10000'")) {
   console.log('[patch] base-scanner monitor.js: already 3s');
 }
 
+// ── PATCH 3: scanner.js — impersonator guard for cbXRP/cbADA/cbBTC etc ──────
+const scannerPath = '/usr/src/app/services/base-scanner/dist/scanner.js';
+let sc = fs.readFileSync(scannerPath, 'utf8');
+if (!sc.includes('isChainImpersonator')) {
+  var guardCode = [
+    '// Chain impersonator guard (patched)',
+    "var _EXACT_BLOCK = new Set(['SOL','BNB','ADA','XRP','AVAX','MATIC','DOT','TRX','NEAR','SUI','ATOM','FTM','XLM','ALGO','EGLD','BTC','ETH','WBTC','BITCOIN','ETHEREUM','WSOL','WBNB','WXRP','WADA','WFTM','STETH','STSOL','CBETH','CBBTC','CBSOL','CHAINLINK','UNISWAP','AAVE','MAKER']);",
+    'function isChainImpersonator(symbol) {',
+    '  var up = (symbol || "").toUpperCase().trim();',
+    '  var cbPrefix = up.startsWith("CB") && up.length >= 4;',
+    '  var wPrefix  = up.startsWith("W")  && up.length >= 4 && up.length <= 7;',
+    '  return _EXACT_BLOCK.has(up) || cbPrefix || (wPrefix && _EXACT_BLOCK.has(up.slice(1)));',
+    '}',
+  ].join('\n');
+  // Inject before the filterToken function or at module top
+  var INJECT_AFTER = 'Object.defineProperty(exports, "__esModule", { value: true });';
+  if (sc.includes(INJECT_AFTER)) {
+    sc = sc.replace(INJECT_AFTER, INJECT_AFTER + '\n' + guardCode + '\n');
+  } else {
+    // Fallback: inject at top
+    sc = guardCode + '\n' + sc;
+  }
+  // Patch filterToken to reject impersonators early
+  // Find the filterToken function and add check after the function start
+  var FILTER_ENTRY = 'function filterToken(token)';
+  if (sc.includes(FILTER_ENTRY)) {
+    sc = sc.replace(FILTER_ENTRY, [
+      FILTER_ENTRY.replace('(token)', '(token) { /* patched entry */'),
+    ].join(''));
+    // Find first { after filterToken and inject
+    var filterIdx = sc.indexOf(FILTER_ENTRY);
+    var braceIdx  = sc.indexOf('{', filterIdx);
+    var injectLine = '\n    if (isChainImpersonator(token.symbol || "")) { return false; } // guard\n';
+    sc = sc.slice(0, braceIdx + 1) + injectLine + sc.slice(braceIdx + 1);
+    patchCount++;
+    console.log('[patch] base-scanner scanner.js: impersonator guard injected');
+  } else {
+    console.log('[patch] base-scanner scanner.js: filterToken not found — manual review needed');
+  }
+  fs.writeFileSync(scannerPath, sc);
+} else {
+  console.log('[patch] base-scanner scanner.js: impersonator guard already present');
+}
+
 console.log('[patch] done — ' + patchCount + ' change(s) applied');
