@@ -18,14 +18,10 @@ services:
     volumes:
       - ./patches:/patches:ro
     entrypoint: ["sh", "-c"]
-    command: >
-      node /patches/base-scanner.patch.js 2>&1 || true;
-      npm --workspace services/base-scanner start
+    command: "node /patches/base-scanner.patch.js 2>&1 || true; npm --workspace services/base-scanner start"
 
   autobuy:
     volumes:
       - ./patches:/patches:ro
     entrypoint: ["sh", "-c"]
-    command: >
-      node /patches/autobuy.patch.js 2>&1 || true;
-      npm --workspace services/autobuy start
+    command: "node /patches/autobuy.patch.js 2>&1 || true; npm --workspace services/autobuy start"
