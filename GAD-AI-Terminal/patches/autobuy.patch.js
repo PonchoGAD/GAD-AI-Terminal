@@ -65,16 +65,23 @@ fs.writeFileSync(bsPath, bs);
 const asPath = '/usr/src/app/services/autobuy/dist/auto-signal.js';
 let as = fs.readFileSync(asPath, 'utf8');
 
-// Fix FEAR liq floor: 35000 → 25000 (the $27-33k range is profitable per data)
-if (as.includes('liq < 35000')) {
-  as = as.replace(/liq < 35000/g, 'liq < 25000');
-  as = as.replace(/<\s*\$35k floor in FEAR/g, '< $25k floor in FEAR');
-  patchCount++;
-  console.log('[patch] auto-signal.js: FEAR liq floor 35k → 25k');
-} else if (as.includes('liq < 25000')) {
-  console.log('[patch] auto-signal.js: FEAR floor already 25k');
+// Fix FEAR liq floor → 15000 (T1 $12-80k in FEAR = 46.2% win rate per 79-trade audit)
+const FEAR_FLOOR_TARGET = 15000;
+if (as.includes('liq < ' + FEAR_FLOOR_TARGET)) {
+  console.log('[patch] auto-signal.js: FEAR floor already ' + FEAR_FLOOR_TARGET);
 } else {
-  console.log('[patch] auto-signal.js: FEAR floor pattern not found — check dist');
+  let _asTmp = as;
+  _asTmp = _asTmp.replace(/liq < 35000/g, 'liq < ' + FEAR_FLOOR_TARGET);
+  _asTmp = _asTmp.replace(/liq < 25000/g, 'liq < ' + FEAR_FLOOR_TARGET);
+  _asTmp = _asTmp.replace(/< \$35k floor in FEAR/g, '< $15k floor in FEAR');
+  _asTmp = _asTmp.replace(/< \$25k floor in FEAR/g, '< $15k floor in FEAR');
+  if (_asTmp !== as) {
+    as = _asTmp;
+    patchCount++;
+    console.log('[patch] auto-signal.js: FEAR liq floor → 15k');
+  } else {
+    console.log('[patch] auto-signal.js: FEAR floor pattern not found — check dist');
+  }
 }
 
 // Fix max liq default: 80000 → 120000 (WOJAK $107k was getting blocked by old 80k cap)
