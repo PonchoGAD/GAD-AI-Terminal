@@ -162,6 +162,46 @@ if (as.includes(GECKO_INJECT_MARKER) && !as.includes(GECKO_ALREADY_MARKER)) {
   console.log('[patch] auto-signal.js: Source 6 marker not found — check dist');
 }
 
+// ── PATCH 7: bonding-smart.js — inject HTTP proxy into WebSocket connections ─
+// The compiled dist creates ws without proxy. VPS Hetzner IP gets 403 from PumpPortal.
+// RESIDENTIAL_PROXY_URL=http://... enables HTTPS CONNECT tunnel (HttpsProxyAgent).
+const BS_WS_MARKER = 'ws = new ws_1.default(PUMPPORTAL_WS)';
+const BS_WS_PATCHED = 'ws = new ws_1.default(PUMPPORTAL_WS, _bsWsOpts)';
+let bsWsPatched = false;
+if (bs.includes(BS_WS_MARKER) && !bs.includes(BS_WS_PATCHED) && !bs.includes('_bsWsOpts')) {
+  // Inject proxy agent setup before the first connectWS function
+  var wsAgentSetup = [
+    '// Proxy agent for bonding-smart WebSocket (patched)',
+    'var _bsProxyUrl = process.env.RESIDENTIAL_PROXY_URL;',
+    'var _bsWsOpts = {};',
+    'if (_bsProxyUrl) {',
+    '  try {',
+    '    const { HttpsProxyAgent } = require("https-proxy-agent");',
+    '    _bsWsOpts = { agent: new HttpsProxyAgent(_bsProxyUrl) };',
+    '    console.info("[bonding-smart] WebSocket proxy: " + _bsProxyUrl.replace(/:[^@]+@/, ":***@"));',
+    '  } catch(_bpe) { console.warn("[bonding-smart] proxy-agent build failed: " + _bpe.message); }',
+    '}',
+  ].join('\n');
+  // Find a stable injection point: after PUMPPORTAL_WS const declaration
+  var WS_CONST = "const PUMPPORTAL_WS = 'wss://pumpportal.fun/api/data';";
+  if (bs.includes(WS_CONST)) {
+    bs = bs.replace(WS_CONST, WS_CONST + '\n' + wsAgentSetup);
+    bs = bs.replace(/ws = new ws_1\.default\(PUMPPORTAL_WS\)/g, 'ws = new ws_1.default(PUMPPORTAL_WS, _bsWsOpts)');
+    bsWsPatched = true;
+  }
+  if (bsWsPatched) {
+    fs.writeFileSync(bsPath, bs);
+    patchCount++;
+    console.log('[patch] bonding-smart.js: WebSocket proxy agent injected (HTTP CONNECT tunnel)');
+  } else {
+    console.log('[patch] bonding-smart.js: WS proxy — PUMPPORTAL_WS const not found');
+  }
+} else if (bs.includes('_bsWsOpts')) {
+  console.log('[patch] bonding-smart.js: WS proxy already patched');
+} else {
+  console.log('[patch] bonding-smart.js: WS proxy — ws marker not found in dist');
+}
+
 // ── PATCH 6: graduation-scanner.js — slow down reconnect 15s → 60s ──────────
 const gsPath = '/usr/src/app/services/autobuy/dist/graduation-scanner.js';
 let gs = fs.readFileSync(gsPath, 'utf8');
