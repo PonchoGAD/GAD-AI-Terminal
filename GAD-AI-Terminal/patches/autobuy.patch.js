@@ -60,4 +60,34 @@ if (bs.includes('reconnecting in 5s')) {
 }
 
 fs.writeFileSync(bsPath, bs);
+
+// ── PATCH 3: auto-signal.js — fix stale filter values ───────────────────────
+const asPath = '/usr/src/app/services/autobuy/dist/auto-signal.js';
+let as = fs.readFileSync(asPath, 'utf8');
+
+// Fix FEAR liq floor: 35000 → 25000 (the $27-33k range is profitable per data)
+if (as.includes('liq < 35000')) {
+  as = as.replace(/liq < 35000/g, 'liq < 25000');
+  as = as.replace(/<\s*\$35k floor in FEAR/g, '< $25k floor in FEAR');
+  patchCount++;
+  console.log('[patch] auto-signal.js: FEAR liq floor 35k → 25k');
+} else if (as.includes('liq < 25000')) {
+  console.log('[patch] auto-signal.js: FEAR floor already 25k');
+} else {
+  console.log('[patch] auto-signal.js: FEAR floor pattern not found — check dist');
+}
+
+// Fix max liq default: 80000 → 120000 (WOJAK $107k was getting blocked by old 80k cap)
+if (as.includes("|| '80000'")) {
+  as = as.replace("|| '80000'", "|| '120000'");
+  patchCount++;
+  console.log('[patch] auto-signal.js: max liq default 80k → 120k');
+} else if (as.includes("|| '120000'")) {
+  console.log('[patch] auto-signal.js: max liq already 120k');
+} else {
+  console.log('[patch] auto-signal.js: max liq pattern not found — may be using env override');
+}
+
+fs.writeFileSync(asPath, as);
+
 console.log('[patch] autobuy: ' + patchCount + ' patch(es) applied — starting service...');
