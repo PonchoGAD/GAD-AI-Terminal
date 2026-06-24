@@ -264,6 +264,35 @@ if (!bs.includes(SKIP_LOG_MARKER) && bs.includes(SKIP_LOG_ANCHOR)) {
   console.log('[patch] bonding-smart.js: shouldBuy anchor not found — check compiled dist');
 }
 
+// ── PATCH 10: bonding-smart.js — WS event counter (30s window, debug) ────────
+// Confirms whether buy/sell events are arriving at all from PumpPortal WS
+const WS_CTR_MARKER = 'bonding_smart_ws_counter_patched';
+const WS_CTR_ANCHOR = 'const ev = JSON.parse(raw.toString());';
+if (!bs.includes(WS_CTR_MARKER) && bs.includes(WS_CTR_ANCHOR)) {
+  var wsCounter = [
+    '            // PATCH 10: ' + WS_CTR_MARKER,
+    '            if (!global._bsWsCtr) {',
+    '                global._bsWsCtr = { create: 0, buy: 0, sell: 0, other: 0 };',
+    '                setInterval(function() {',
+    "                    console.info('[bonding-smart] WS 30s stats: create=' + global._bsWsCtr.create + ' buy=' + global._bsWsCtr.buy + ' sell=' + global._bsWsCtr.sell + ' other=' + global._bsWsCtr.other);",
+    '                    global._bsWsCtr = { create: 0, buy: 0, sell: 0, other: 0 };',
+    '                }, 30000);',
+    '            }',
+    "            if (ev.txType === 'create') global._bsWsCtr.create++;",
+    "            else if (ev.txType === 'buy') global._bsWsCtr.buy++;",
+    "            else if (ev.txType === 'sell') global._bsWsCtr.sell++;",
+    '            else global._bsWsCtr.other++;',
+  ].join('\n');
+  bs = bs.replace(WS_CTR_ANCHOR, wsCounter + '\n            ' + WS_CTR_ANCHOR);
+  fs.writeFileSync(bsPath, bs);
+  patchCount++;
+  console.log('[patch] bonding-smart.js: PATCH 10 — WS event counter added (30s interval)');
+} else if (bs.includes(WS_CTR_MARKER)) {
+  console.log('[patch] bonding-smart.js: WS counter already patched');
+} else {
+  console.log('[patch] bonding-smart.js: WS counter anchor not found — check compiled dist');
+}
+
 // ── PATCH 6: graduation-scanner.js — slow down reconnect 15s → 60s ──────────
 const gsPath = '/usr/src/app/services/autobuy/dist/graduation-scanner.js';
 let gs = fs.readFileSync(gsPath, 'utf8');
