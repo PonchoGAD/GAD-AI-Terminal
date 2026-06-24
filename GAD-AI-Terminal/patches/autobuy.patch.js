@@ -71,20 +71,22 @@ fs.writeFileSync(bsPath, bs);
 const asPath = '/usr/src/app/services/autobuy/dist/auto-signal.js';
 let as = fs.readFileSync(asPath, 'utf8');
 
-// Fix FEAR liq floor → 15000 (T1 $12-80k in FEAR = 46.2% win rate per 79-trade audit)
-const FEAR_FLOOR_TARGET = 15000;
+// Fix FEAR liq floor → 12000 (matches RAYDIUM_MIN_LIQUIDITY_USD=12000 on VPS; 46.2% win rate)
+const FEAR_FLOOR_TARGET = 12000;
 if (as.includes('liq < ' + FEAR_FLOOR_TARGET)) {
   console.log('[patch] auto-signal.js: FEAR floor already ' + FEAR_FLOOR_TARGET);
 } else {
   let _asTmp = as;
   _asTmp = _asTmp.replace(/liq < 35000/g, 'liq < ' + FEAR_FLOOR_TARGET);
   _asTmp = _asTmp.replace(/liq < 25000/g, 'liq < ' + FEAR_FLOOR_TARGET);
-  _asTmp = _asTmp.replace(/< \$35k floor in FEAR/g, '< $15k floor in FEAR');
-  _asTmp = _asTmp.replace(/< \$25k floor in FEAR/g, '< $15k floor in FEAR');
+  _asTmp = _asTmp.replace(/liq < 15000/g, 'liq < ' + FEAR_FLOOR_TARGET);
+  _asTmp = _asTmp.replace(/< \$35k floor in FEAR/g, '< $12k floor in FEAR');
+  _asTmp = _asTmp.replace(/< \$25k floor in FEAR/g, '< $12k floor in FEAR');
+  _asTmp = _asTmp.replace(/< \$15k floor in FEAR/g, '< $12k floor in FEAR');
   if (_asTmp !== as) {
     as = _asTmp;
     patchCount++;
-    console.log('[patch] auto-signal.js: FEAR liq floor → 15k');
+    console.log('[patch] auto-signal.js: FEAR liq floor → 12k');
   } else {
     console.log('[patch] auto-signal.js: FEAR floor pattern not found — check dist');
   }
