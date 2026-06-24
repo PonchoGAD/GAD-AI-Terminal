@@ -31,9 +31,15 @@ if (!bs.includes(SHADOW_MARKER) && bs.includes(DECISION_BUY)) {
     "            console.info('[bonding-smart] SHADOW would-buy: ' + state.symbol);",
     '        } catch(_se) {}',
   ].join('\n');
-  bs = bs.replace(DOBUY_CALL, shadowBlock + '\n        ' + DOBUY_CALL);
+  var dryRunSkip = [
+    '        if (process.env.BONDING_SMART_DRY_RUN === "true") {',
+    "            console.info('[bonding-smart] 🔲 DRY_RUN: would-buy ' + state.symbol + ' — skipping real buy');",
+    '            return;',
+    '        }',
+  ].join('\n');
+  bs = bs.replace(DOBUY_CALL, shadowBlock + '\n' + dryRunSkip + '\n        ' + DOBUY_CALL);
   patchCount++;
-  console.log('[patch] autobuy bonding-smart.js: shadow INSERT added');
+  console.log('[patch] autobuy bonding-smart.js: shadow INSERT + DRY_RUN skip added');
 } else if (bs.includes(SHADOW_MARKER)) {
   console.log('[patch] autobuy bonding-smart.js: shadow INSERT already present');
 } else {
