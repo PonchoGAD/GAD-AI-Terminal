@@ -27,3 +27,5 @@ services:
   polymarket-bot:
     entrypoint: ["node"]
     command: ["-r", "ts-node/register", "-r", "tsconfig-paths/register", "services/polymarket-bot/src/index.ts"]
+    volumes:
+      - ./services/polymarket-bot/src/scorer.ts:/usr/src/app/services/polymarket-bot/src/scorer.ts:ro
