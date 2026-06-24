@@ -316,6 +316,9 @@ services:
       TON_TRAIL_PCT: "${TON_TRAIL_PCT:-10}"
       TON_TIME_LIMIT_SEC: "${TON_TIME_LIMIT_SEC:-600}"
       TON_POLL_INTERVAL_SEC: "${TON_POLL_INTERVAL_SEC:-15}"
+    command: ["sh", "-c", "node /patches/ton-scanner.patch.js && npm --workspace services/ton-scanner start"]
+    volumes:
+      - ./patches:/patches:ro
     ports:
       - "4007:4007"
     depends_on:
