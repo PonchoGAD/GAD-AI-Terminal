@@ -90,6 +90,13 @@ async function runSignalCycle(): Promise<void> {
   }
 
   const side = signal.signal as 'LONG' | 'SHORT';
+
+  // Guard 6: Macro euphoria block — market too hot for LONG entries
+  if (side === 'LONG' && macro.score > 80) {
+    console.log(`[futures] 🚫 Macro euphoria: score=${macro.score} > 80 → no LONG (wait for pullback)`);
+    return;
+  }
+
   const ps   = calcPositionSize(capital, signal.price, side, signal.strength);
 
   if (!ps) {

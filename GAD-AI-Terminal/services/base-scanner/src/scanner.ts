@@ -30,7 +30,7 @@ const MAX_LIQ        = Number(process.env.BASE_MAX_LIQUIDITY_USD  || '200000');
 const MIN_MCAP       = Number(process.env.BASE_MIN_MCAP_USD       || '1000');    // skip dead/empty tokens
 const MAX_MCAP       = Number(process.env.BASE_MAX_MCAP_USD       || '2000000'); // $2M max — memes only
 const MIN_PC1H       = Number(process.env.BASE_MIN_PC1H           || '5');
-const MAX_PC1H       = Number(process.env.BASE_MAX_PC1H           || '100');
+const MAX_PC1H       = Number(process.env.BASE_MAX_PC1H           || '30'); // 23.06.26: 100→30 (B20: +55%→-47%)
 // Fresh launches (< 1h) routinely spike 100-400% in the first hour — don't cap them
 const MAX_PC1H_FRESH = Number(process.env.BASE_MAX_PC1H_FRESH     || '1000');
 const FRESH_AGE_SEC  = Number(process.env.BASE_FRESH_AGE_SEC      || '3600');

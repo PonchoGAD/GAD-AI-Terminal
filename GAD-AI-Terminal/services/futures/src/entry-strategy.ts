@@ -1,7 +1,14 @@
 import axios from 'axios';
+import { query } from '@lib/db';
 import { OHLCV, TechnicalSignal, Signal } from './types';
 
 const BINANCE_BASE = 'https://api.binance.com/api/v3';
+
+// ── New guard constants ───────────────────────────────────────────────────────
+const FUTURES_MIN_VOL_RATIO  = parseFloat(process.env.FUTURES_MIN_VOL_RATIO  || '0.60');
+const COOLDOWN_HOURS         = parseInt(process.env.FUTURES_SL_COOLDOWN_HOURS || '4', 10);
+const MAX_DAILY_SL_TRADES    = parseInt(process.env.FUTURES_MAX_DAILY_SL      || '2', 10);
+const MIN_ADX                = Number(process.env.FUTURES_MIN_ADX || '22');
 
 // ── Fetch SOL/USDT 15m candles ────────────────────────────────────────────────
 export async function fetchCandles(limit = 60): Promise<OHLCV[]> {
@@ -24,7 +31,6 @@ function ema(values: number[], period: number): number[] {
   if (values.length < period) return values.map(() => 0);
   const k      = 2 / (period + 1);
   const result = new Array(values.length).fill(0);
-  // seed with SMA
   result[period - 1] = values.slice(0, period).reduce((s, v) => s + v, 0) / period;
   for (let i = period; i < values.length; i++) {
     result[i] = values[i] * k + result[i - 1] * (1 - k);
@@ -52,14 +58,10 @@ function calcSR(candles: OHLCV[]): { support: number; resistance: number } {
   const last50 = candles.slice(-50);
   const highs   = last50.map(c => c.high).sort((a, b) => a - b);
   const lows    = last50.map(c => c.low).sort((a, b) => a - b);
-
-  // Top 20% = resistance cluster, bottom 20% = support cluster
   const topCluster    = highs.slice(-10);
   const bottomCluster = lows.slice(0, 10);
-
   const resistance = topCluster.reduce((s, v) => s + v, 0) / topCluster.length;
   const support    = bottomCluster.reduce((s, v) => s + v, 0) / bottomCluster.length;
-
   return { support, resistance };
 }
 
@@ -72,14 +74,10 @@ function volumeRatio(candles: OHLCV[]): number {
 }
 
 // ── ADX / DMI (Wilder smoothing, period=14) ───────────────────────────────────
-// Returns adx (trend strength 0-100), +DI, -DI for directional filter.
-// adx > 22: trend is meaningful; adx > 35: strong trend.
-// LONG valid when adx > 22 AND plusDI > minusDI.
-// SHORT valid when adx > 22 AND minusDI > plusDI.
 function calcADX(candles: OHLCV[], period = 14): { adx: number; plusDI: number; minusDI: number } {
   if (candles.length < period * 2) return { adx: 0, plusDI: 0, minusDI: 0 };
 
-  const trArr:    number[] = [];
+  const trArr:      number[] = [];
   const plusDMArr:  number[] = [];
   const minusDMArr: number[] = [];
 
@@ -96,7 +94,6 @@ function calcADX(candles: OHLCV[], period = 14): { adx: number; plusDI: number; 
     minusDMArr.push(minusDM);
   }
 
-  // Wilder smoothing: initial = sum of first `period` values; then += (next - prev/period)
   let smoothTR    = trArr.slice(0, period).reduce((s, v) => s + v, 0);
   let smoothPlus  = plusDMArr.slice(0, period).reduce((s, v) => s + v, 0);
   let smoothMinus = minusDMArr.slice(0, period).reduce((s, v) => s + v, 0);
@@ -107,14 +104,12 @@ function calcADX(candles: OHLCV[], period = 14): { adx: number; plusDI: number; 
     smoothTR    = smoothTR    - smoothTR / period    + trArr[i];
     smoothPlus  = smoothPlus  - smoothPlus / period  + plusDMArr[i];
     smoothMinus = smoothMinus - smoothMinus / period + minusDMArr[i];
-
     const pdi = smoothTR > 0 ? (smoothPlus  / smoothTR) * 100 : 0;
     const mdi = smoothTR > 0 ? (smoothMinus / smoothTR) * 100 : 0;
     const dx  = (pdi + mdi) > 0 ? (Math.abs(pdi - mdi) / (pdi + mdi)) * 100 : 0;
     dxArr.push(dx);
   }
 
-  // ADX = Wilder SMA of DX over `period`
   if (dxArr.length < period) return { adx: 0, plusDI: 0, minusDI: 0 };
 
   let adx = dxArr.slice(0, period).reduce((s, v) => s + v, 0) / period;
@@ -122,7 +117,6 @@ function calcADX(candles: OHLCV[], period = 14): { adx: number; plusDI: number; 
     adx = (adx * (period - 1) + dxArr[i]) / period;
   }
 
-  // Final +DI / -DI from last smoothed values
   const finalPlusDI  = smoothTR > 0 ? (smoothPlus  / smoothTR) * 100 : 0;
   const finalMinusDI = smoothTR > 0 ? (smoothMinus / smoothTR) * 100 : 0;
 
@@ -146,28 +140,21 @@ function buildSignal(
   let longPts  = 0;
   let shortPts = 0;
 
-  // EMA trend
   if (price > e21 && e21 > e50) longPts  += 30;
   if (price < e21 && e21 < e50) shortPts += 30;
 
-  // EMA21 momentum (crossover direction)
   if (e21 > e21Prev) longPts  += 15;
   else                shortPts += 15;
 
-  // RSI
-  if (rsi14 >= 50 && rsi14 <= 70) longPts  += 20; // bullish but not overbought
-  if (rsi14 <= 50 && rsi14 >= 30) shortPts += 20; // bearish but not oversold
-  if (rsi14 > 75)                  shortPts += 15; // overbought = take short
-  if (rsi14 < 25)                  longPts  += 15; // oversold = take long
+  if (rsi14 >= 50 && rsi14 <= 70) longPts  += 20;
+  if (rsi14 <= 50 && rsi14 >= 30) shortPts += 20;
+  if (rsi14 > 75)                  shortPts += 15;
+  if (rsi14 < 25)                  longPts  += 15;
 
-  // Volume confirmation
   if (volR >= 1.3) {
     if (longPts > shortPts)  longPts  += 15;
     else                     shortPts += 15;
   }
-
-  // Price vs S/R (price within 0.5% of support = long; near resistance = short)
-  // (applied in the caller after SR calc)
 
   if (longPts >= 50 && longPts > shortPts)  return { signal: 'LONG',  strength: Math.min(100, longPts)  };
   if (shortPts >= 50 && shortPts > longPts) return { signal: 'SHORT', strength: Math.min(100, shortPts) };
@@ -175,8 +162,6 @@ function buildSignal(
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
-
-const MIN_ADX = Number(process.env.FUTURES_MIN_ADX || '22');
 
 export async function getSignal(): Promise<TechnicalSignal> {
   const candles = await fetchCandles(60);
@@ -195,20 +180,71 @@ export async function getSignal(): Promise<TechnicalSignal> {
 
   let { signal, strength } = buildSignal(closes, ema21arr, ema50arr, rsi14, volR);
 
-  // ADX directional filter: require meaningful trend (adx > MIN_ADX=22)
-  // AND correct directional alignment (+DI > -DI for LONG; -DI > +DI for SHORT)
+  // ── Guard 1: Daily SL limit + cooldown after SL ──────────────────────────
+  if (signal !== 'FLAT') {
+    try {
+      const slRes = await query<any>(
+        `SELECT COUNT(*) as cnt, MAX(closed_at) as last_sl
+         FROM futures_positions
+         WHERE close_reason='SL'
+           AND closed_at > NOW() - INTERVAL '24 hours'`
+      );
+      const dailySlCount = parseInt(slRes.rows[0]?.cnt || '0', 10);
+      const lastSlAt     = slRes.rows[0]?.last_sl ? new Date(slRes.rows[0].last_sl) : null;
+
+      if (dailySlCount >= MAX_DAILY_SL_TRADES) {
+        console.log(`[futures] 🚫 Daily SL limit: ${dailySlCount} SLs in last 24h (max ${MAX_DAILY_SL_TRADES}) → FLAT`);
+        signal = 'FLAT'; strength = 0;
+      } else if (lastSlAt) {
+        const hoursSinceSl = (Date.now() - lastSlAt.getTime()) / (1000 * 60 * 60);
+        if (hoursSinceSl < COOLDOWN_HOURS) {
+          console.log(`[futures] 🚫 SL cooldown: last SL ${hoursSinceSl.toFixed(1)}h ago (need ${COOLDOWN_HOURS}h) → FLAT`);
+          signal = 'FLAT'; strength = 0;
+        }
+      }
+    } catch (err: any) {
+      console.warn('[futures] SL guard DB check failed:', err.message);
+    }
+  }
+
+  // ── Guard 2: EMA trend filter — block counter-trend entries ──────────────
+  if (signal !== 'FLAT') {
+    if (signal === 'LONG' && e21 < e50) {
+      console.log(`[futures] 📉 EMA trend: LONG blocked — EMA21(${e21.toFixed(2)}) < EMA50(${e50.toFixed(2)}) — downtrend → FLAT`);
+      signal = 'FLAT'; strength = 0;
+    } else if (signal === 'SHORT' && e21 > e50) {
+      console.log(`[futures] 📈 EMA trend: SHORT blocked — EMA21(${e21.toFixed(2)}) > EMA50(${e50.toFixed(2)}) — uptrend → FLAT`);
+      signal = 'FLAT'; strength = 0;
+    }
+  }
+
+  // ── Guard 3: Volume ratio — require momentum confirmation ────────────────
+  if (signal !== 'FLAT' && volR < FUTURES_MIN_VOL_RATIO) {
+    console.log(`[futures] 📉 Vol filter: ${volR.toFixed(2)}x < ${FUTURES_MIN_VOL_RATIO} min — no momentum → FLAT`);
+    signal = 'FLAT'; strength = 0;
+  }
+
+  // ── Guard 4: RSI gate — avoid extreme overbought/oversold entries ─────────
+  if (signal !== 'FLAT') {
+    if (signal === 'LONG' && rsi14 > 70) {
+      console.log(`[futures] 🔴 RSI gate: LONG blocked — RSI ${rsi14.toFixed(1)} > 70 (overbought) → FLAT`);
+      signal = 'FLAT'; strength = 0;
+    } else if (signal === 'SHORT' && rsi14 < 30) {
+      console.log(`[futures] 🟢 RSI gate: SHORT blocked — RSI ${rsi14.toFixed(1)} < 30 (oversold) → FLAT`);
+      signal = 'FLAT'; strength = 0;
+    }
+  }
+
+  // ── Guard 5: ADX directional filter — require meaningful trend ───────────
   if (signal !== 'FLAT' && adx < MIN_ADX) {
     console.log(`[futures] ADX filter: adx=${adx.toFixed(1)} < ${MIN_ADX} — weak/ranging market → FLAT`);
-    signal = 'FLAT';
-    strength = 0;
+    signal = 'FLAT'; strength = 0;
   } else if (signal === 'LONG' && plusDI <= minusDI) {
     console.log(`[futures] ADX filter: LONG blocked — +DI(${plusDI.toFixed(1)}) ≤ -DI(${minusDI.toFixed(1)}) — bearish pressure`);
-    signal = 'FLAT';
-    strength = 0;
+    signal = 'FLAT'; strength = 0;
   } else if (signal === 'SHORT' && minusDI <= plusDI) {
     console.log(`[futures] ADX filter: SHORT blocked — -DI(${minusDI.toFixed(1)}) ≤ +DI(${plusDI.toFixed(1)}) — bullish pressure`);
-    signal = 'FLAT';
-    strength = 0;
+    signal = 'FLAT'; strength = 0;
   }
 
   return {
@@ -231,7 +267,7 @@ export function formatSignalReport(s: TechnicalSignal): string {
   const arrow     = s.ema21 > s.ema50 ? '↑' : s.ema21 < s.ema50 ? '↓' : '→';
   const rsiEmoji  = s.rsi14 > 70 ? '🔴 OB' : s.rsi14 < 30 ? '🟢 OS' : s.rsi14 > 55 ? '🟡 Bull' : '🟡 Bear';
   const sigEmoji  = s.signal === 'LONG' ? '🟢 LONG' : s.signal === 'SHORT' ? '🔴 SHORT' : '⬜ FLAT';
-  const volBadge  = s.volRatio >= 1.5 ? '🔥HIGH' : s.volRatio >= 1.1 ? 'norm+' : 'low';
+  const volBadge  = s.volRatio >= 1.5 ? '🔥HIGH' : s.volRatio >= 1.1 ? 'norm+' : s.volRatio < 0.6 ? '❌LOW' : 'low';
 
   const adxLabel = (s.adx ?? 0) > 35 ? '🔥strong' : (s.adx ?? 0) > 22 ? 'trend' : '😴ranging';
   const diLabel  = (s.plusDI ?? 0) > (s.minusDI ?? 0) ? `+DI>${(s.plusDI??0).toFixed(1)} ↑` : `-DI>${(s.minusDI??0).toFixed(1)} ↓`;
