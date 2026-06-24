@@ -70,46 +70,6 @@ if (mon.includes("|| '10000'")) {
   console.log('[patch] base-scanner monitor.js: already 3s');
 }
 
-// ── PATCH 3: scanner.js — impersonator guard for cbXRP/cbADA/cbBTC etc ──────
-const scannerPath = '/usr/src/app/services/base-scanner/dist/scanner.js';
-let sc = fs.readFileSync(scannerPath, 'utf8');
-if (!sc.includes('_EXACT_BLOCK') && !sc.includes('chain_impersonator:')) {  // guard not yet injected
-  var guardCode = [
-    '// Chain impersonator guard (patched)',
-    "var _EXACT_BLOCK = new Set(['SOL','BNB','ADA','XRP','AVAX','MATIC','DOT','TRX','NEAR','SUI','ATOM','FTM','XLM','ALGO','EGLD','BTC','ETH','WBTC','BITCOIN','ETHEREUM','WSOL','WBNB','WXRP','WADA','WFTM','STETH','STSOL','CBETH','CBBTC','CBSOL','CHAINLINK','UNISWAP','AAVE','MAKER']);",
-    'function isChainImpersonator(symbol) {',
-    '  var up = (symbol || "").toUpperCase().trim();',
-    '  var cbPrefix = up.startsWith("CB") && up.length >= 4;',
-    '  var wPrefix  = up.startsWith("W")  && up.length >= 4 && up.length <= 7;',
-    '  return _EXACT_BLOCK.has(up) || cbPrefix || (wPrefix && _EXACT_BLOCK.has(up.slice(1)));',
-    '}',
-  ].join('\n');
-  // Inject before the filterToken function or at module top
-  var INJECT_AFTER = 'Object.defineProperty(exports, "__esModule", { value: true });';
-  if (sc.includes(INJECT_AFTER)) {
-    sc = sc.replace(INJECT_AFTER, INJECT_AFTER + '\n' + guardCode + '\n');
-  } else {
-    // Fallback: inject at top
-    sc = guardCode + '\n' + sc;
-  }
-  // Patch passesFilter to reject impersonators early (actual function name in dist)
-  var FILTER_ENTRY = 'function passesFilter(t)';
-  var FILTER_ENTRY_ALT = 'function filterToken(token)';
-  var filterFn = sc.includes(FILTER_ENTRY) ? FILTER_ENTRY : (sc.includes(FILTER_ENTRY_ALT) ? FILTER_ENTRY_ALT : null);
-  if (filterFn) {
-    var filterIdx = sc.indexOf(filterFn);
-    var braceIdx  = sc.indexOf('{', filterIdx);
-    var paramName = filterFn.includes('(t)') ? 't' : 'token';
-    var injectLine = '\n    if (isChainImpersonator((' + paramName + '.symbol || ""))) { return false; } // impersonator guard\n';
-    sc = sc.slice(0, braceIdx + 1) + injectLine + sc.slice(braceIdx + 1);
-    patchCount++;
-    console.log('[patch] base-scanner scanner.js: impersonator guard call injected into ' + filterFn);
-  } else {
-    console.log('[patch] base-scanner scanner.js: passesFilter/filterToken not found — guard injected at top but not called');
-  }
-  fs.writeFileSync(scannerPath, sc);
-} else {
-  console.log('[patch] base-scanner scanner.js: impersonator guard already present and called');
-}
+// NOTE: Impersonator guard (cbXRP/cbADA etc) is now compiled into source — no patch needed.
 
 console.log('[patch] done — ' + patchCount + ' change(s) applied');
