@@ -217,6 +217,33 @@ if (bs.includes(BS_WS_MARKER) && !bs.includes(BS_WS_PATCHED) && !bs.includes('_b
   console.log('[patch] bonding-smart.js: WS proxy — ws marker not found in dist');
 }
 
+// ── PATCH 8: bonding-smart.js — per-token subscribeTokenTrade in handleCreate ─
+// ROOT CAUSE of zero shadow trades: ws.send({method:'subscribeTokenTrade', keys:[]})
+// at WebSocket open delivers trade events for NO tokens (empty array = no subscriptions).
+// New tokens tracked in tokenStates never receive buy/sell events → evaluate() never
+// fires → decision.buy never true → zero shadow trades, zero real buys.
+// FIX: subscribe to each new token's trades right after tokenStates.set(mint, state).
+const PTRADE_MARKER = 'subscribeTokenTrade_per_token_patched';
+const PTRADE_ANCHOR = 'tokenStates.set(mint, state);';
+if (!bs.includes(PTRADE_MARKER) && bs.includes(PTRADE_ANCHOR)) {
+  var perTokenSub = [
+    '    // PATCH 8: per-token trade subscribe',
+    '    // subscribeTokenTrade: [] delivers no events — must subscribe per-mint',
+    '    // ' + PTRADE_MARKER,
+    '    if (ws && ws.readyState === 1) {',
+    "        ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));",
+    '    }',
+  ].join('\n');
+  bs = bs.replace(PTRADE_ANCHOR, PTRADE_ANCHOR + '\n' + perTokenSub);
+  fs.writeFileSync(bsPath, bs);
+  patchCount++;
+  console.log('[patch] bonding-smart.js: PATCH 8 — per-token subscribeTokenTrade in handleCreate (root cause of zero shadow trades FIXED)');
+} else if (bs.includes(PTRADE_MARKER)) {
+  console.log('[patch] bonding-smart.js: per-token subscribe already patched');
+} else {
+  console.log('[patch] bonding-smart.js: ANCHOR not found in compiled dist — check bonding-smart.js');
+}
+
 // ── PATCH 6: graduation-scanner.js — slow down reconnect 15s → 60s ──────────
 const gsPath = '/usr/src/app/services/autobuy/dist/graduation-scanner.js';
 let gs = fs.readFileSync(gsPath, 'utf8');
