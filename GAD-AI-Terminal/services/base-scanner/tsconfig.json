@@ -9,8 +9,13 @@
     "paths": {
       "@lib/db":   ["libs/db/src/index.d.ts"],
       "@lib/base": ["libs/base/src/index.d.ts"],
-      "@lib/evm":  ["libs/evm/src/index.ts"]
+      "@lib/evm":  ["libs/evm/src/index.d.ts"]
     }
   },
-  "include": ["src/**/*"]
+  "include": [
+    "src/**/*",
+    "../../libs/db/src/index.d.ts",
+    "../../libs/base/src/index.d.ts",
+    "../../libs/evm/src/index.d.ts"
+  ]
 }
