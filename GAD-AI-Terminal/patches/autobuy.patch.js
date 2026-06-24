@@ -244,6 +244,26 @@ if (!bs.includes(PTRADE_MARKER) && bs.includes(PTRADE_ANCHOR)) {
   console.log('[patch] bonding-smart.js: ANCHOR not found in compiled dist — check bonding-smart.js');
 }
 
+// ── PATCH 9: bonding-smart.js — skip reason debug log in handleTrade ─────────
+// Logs why each token was rejected, so we can tune thresholds from real data
+const SKIP_LOG_MARKER = 'bonding_smart_skip_debug_patched';
+const SKIP_LOG_ANCHOR = 'const decision = await shouldBuy(state);';
+if (!bs.includes(SKIP_LOG_MARKER) && bs.includes(SKIP_LOG_ANCHOR)) {
+  var skipLogInject = [
+    '    // PATCH 9: log skip reason for tuning',
+    '    // ' + SKIP_LOG_MARKER,
+    "    if (!decision.buy) console.debug('[bonding-smart] ❌ ' + state.symbol + ' skip: ' + decision.reason);",
+  ].join('\n');
+  bs = bs.replace(SKIP_LOG_ANCHOR, SKIP_LOG_ANCHOR + '\n' + skipLogInject);
+  fs.writeFileSync(bsPath, bs);
+  patchCount++;
+  console.log('[patch] bonding-smart.js: PATCH 9 — skip reason debug log added');
+} else if (bs.includes(SKIP_LOG_MARKER)) {
+  console.log('[patch] bonding-smart.js: skip reason log already present');
+} else {
+  console.log('[patch] bonding-smart.js: shouldBuy anchor not found — check compiled dist');
+}
+
 // ── PATCH 6: graduation-scanner.js — slow down reconnect 15s → 60s ──────────
 const gsPath = '/usr/src/app/services/autobuy/dist/graduation-scanner.js';
 let gs = fs.readFileSync(gsPath, 'utf8');
