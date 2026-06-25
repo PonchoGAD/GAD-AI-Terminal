@@ -25,7 +25,17 @@ import {
   Transaction, ComputeBudgetProgram, VersionedTransaction,
 } from '@solana/web3.js';
 import { query } from '@lib/db';
-import { cleanAndSlimTrendText } from '../utils/text-cleaner';
+
+function cleanAndSlimTrendText(raw: string, maxChars = 250): string {
+  return raw
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/@\w+/g, '')
+    .replace(/#(\w+)/g, '$1')
+    .replace(/[^\w\s,.!?'-]/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+    .slice(0, maxChars);
+}
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
