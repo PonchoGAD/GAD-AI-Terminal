@@ -20,7 +20,10 @@
 import axios from 'axios';
 import FormData from 'form-data';
 import bs58 from 'bs58';
-import { Keypair, Connection, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import {
+  Keypair, Connection, PublicKey, LAMPORTS_PER_SOL,
+  Transaction, ComputeBudgetProgram, VersionedTransaction,
+} from '@solana/web3.js';
 import { query } from '@lib/db';
 import { cleanAndSlimTrendText } from '../utils/text-cleaner';
 
@@ -223,8 +226,8 @@ async function getLastLaunchTimestamp(): Promise<number> {
   if (lastLaunchAt > 0) return lastLaunchAt;
   try {
     const { rows } = await query<{ created_at: string }>(`
-      SELECT created_at FROM coin_ideas
-      WHERE source = 'trend_auto_launch'
+      SELECT created_at FROM coin_launches
+      WHERE wallet_alias IN ('W2', 'W3')
       ORDER BY created_at DESC LIMIT 1
     `, []);
     if (rows[0]) return new Date(rows[0].created_at).getTime();
@@ -232,12 +235,11 @@ async function getLastLaunchTimestamp(): Promise<number> {
   return 0;
 }
 
-// ─── Wallet configs — each wallet creates its OWN token independently ────────
+// ─── Wallet configs — W2 + W3 only (W1 reserved for Raydium autobuy trading)
 // RULE: no wallet ever buys into a token created by a different wallet.
 const WALLET_CONFIGS = [
-  { envKey: 'WALLET_PRIVATE_KEY',           alias: 'W1', buySol: DEV_BUY_SOL },
-  { envKey: 'PUMPFUN_WALLET_PRIVATE_KEY',   alias: 'W2', buySol: 0.02 },
-  { envKey: 'PUMPFUN_WALLET_PRIVATE_KEY_2', alias: 'W3', buySol: 0.01 },
+  { envKey: 'PUMPFUN_WALLET_PRIVATE_KEY',   alias: 'W2', buySol: 0.04 },
+  { envKey: 'PUMPFUN_WALLET_PRIVATE_KEY_2', alias: 'W3', buySol: 0.02 },
 ];
 
 // ─── 24h theme dedup — prevents launching the same theme twice in one day ─────
@@ -311,12 +313,11 @@ async function recordLaunch(
 ): Promise<void> {
   await query(`UPDATE x_trend_signals SET action = $1 WHERE id = $2`, [`LAUNCHED:${mintAddr}`, signalId]).catch(() => {});
 
-  // source='trend_auto_launch' is critical — getLastLaunchTimestamp() queries by this field
   await query(`
-    INSERT INTO coin_ideas (ticker, name, description, score, status, source, created_at)
-    VALUES ($1, $2, $3, 0, 'launched', 'trend_auto_launch', now())
+    INSERT INTO coin_ideas (ticker, name, description, score, status, created_at)
+    VALUES ($1, $2, $3, 0, 'launched', now())
     ON CONFLICT DO NOTHING
-  `, [ticker, name, `Auto-launched [${walletAlias}] from X trend: ${tweetUrl}`]).catch(() => {});
+  `, [ticker, name, description]).catch(() => {});
 
   await query(`
     INSERT INTO coin_launches (mint_address, ticker, name, dev_buy_sol, create_tx, wallet_alias, wallet_address, created_at)
@@ -353,11 +354,18 @@ async function launchOneToken(
     const imageUrl = `https://ipfs.io/ipfs/${imageCid}`;
     console.info(`[trend-launch] ${walletAlias} Image → ${imageUrl}`);
 
+    // Description: AI concept + social links + source tweet
+    const shortDesc = concept.description.slice(0, 130).trim();
+    const sourceRef = trend.tweet_url ? `\n🔗 ${trend.tweet_url}` : '';
+    const fullDescription = `${shortDesc}${sourceRef}\n\n📱 t.me/gadfamilytg | 🌐 gadai.shop`;
+
     const metaCid = await pinataUploadJson({
-      name: concept.name, symbol: concept.ticker, description: concept.description,
+      name: concept.name, symbol: concept.ticker, description: fullDescription,
       image: imageUrl,
-      website: 'https://gadai.shop', twitter: trend.tweet_url || '',
-      telegram: 'https://t.me/gadfamilytg', showName: true, createdOn: 'https://pump.fun',
+      website: 'https://gadai.shop',
+      twitter: 'https://x.com/gadaisol',  // project X account
+      telegram: 'https://t.me/gadfamilytg',
+      showName: true, createdOn: 'https://pump.fun',
     }, `${concept.ticker}_metadata`);
     const metaUri = `${PINATA_GATEWAY}${metaCid}`;
     console.info(`[trend-launch] ${walletAlias} Meta → ${metaUri}`);
@@ -372,11 +380,8 @@ async function launchOneToken(
     }
     // ────────────────────────────────────────────────────────────────────────────
 
-    // SDK STATUS (20.06.2026): pumpdotfun-sdk@1.4.2 is BROKEN — pump.fun added
-    // global_volume_accumulator + user_volume_accumulator + bonding_curve_v2 accounts
-    // (indexes 12-16) to buy instruction since Feb 2026. SDK not updated on npm (latest=1.4.2).
-    // FIX: switch to `pumpdotfun-sdk-repumped` (github.com/D3AD-E/pumpdotfun-sdk-repumped)
-    // when disk space allows: npm uninstall pumpdotfun-sdk && npm install pumpdotfun-sdk-repumped
+    // pumpdotfun-sdk@1.4.2 createAndBuy is broken (pump.fun added new accounts to buy IX in Feb 2026).
+    // Workaround: use SDK only for CREATE instruction, then PumpPortal for the dev buy.
     const conn = new Connection(SOLANA_RPC, 'confirmed');
     const { PumpFunSDK }    = await import('pumpdotfun-sdk');
     const { AnchorProvider } = await import('@coral-xyz/anchor');
@@ -387,25 +392,43 @@ async function launchOneToken(
     const mintKp   = Keypair.generate();
     const mintAddr = mintKp.publicKey.toBase58();
 
-    const imageBlob = (() => { const ab = new ArrayBuffer(logoBuffer.length); new Uint8Array(ab).set(logoBuffer); return new Blob([ab], { type: 'image/png' }); })();
-
-    // Dev buy amount in lamports — included directly in createAndBuy (same TX as creation).
-    // PumpPortal separate buy fails on fresh curves (Custom:1=SlippageExceeded).
-    // metadataUri = Pinata URI (bypasses pump.fun/api/ipfs which returns 403 from VPS).
-    const devBuyLamports = BigInt(Math.round(buySol * 1e9));
-    const createResult = await sdk.createAndBuy(
-      kp, mintKp,
-      {
-        name: concept.name, symbol: concept.ticker, description: concept.description,
-        file: imageBlob, twitter: trend.tweet_url || '',
-        telegram: 'https://t.me/gadfamilytg', website: 'https://gadai.shop',
-        metadataUri: metaUri,
-      } as any,
-      devBuyLamports, 500n, { unitLimit: 250000, unitPrice: 250000 }
+    // Step 1: CREATE token via SDK (create IX is not broken, only buy IX is)
+    const createIx = await (sdk as any).getCreateInstructions(
+      kp.publicKey, concept.name, concept.ticker, metaUri, mintKp
     );
+    const cuIx    = ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 });
+    const cuPrice = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 250_000 });
+    const createTxObj = new Transaction().add(cuIx, cuPrice);
+    if (createIx instanceof Transaction) {
+      createIx.instructions.forEach((ix: any) => createTxObj.add(ix));
+    } else {
+      createTxObj.add(createIx);
+    }
+    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
+    createTxObj.recentBlockhash = blockhash;
+    createTxObj.feePayer = kp.publicKey;
+    createTxObj.sign(kp, mintKp);
+    const createSig = await conn.sendRawTransaction(createTxObj.serialize(), { skipPreflight: false, maxRetries: 3 });
+    await conn.confirmTransaction({ signature: createSig, blockhash, lastValidBlockHeight }, 'confirmed');
+    console.info(`[trend-launch] ${walletAlias} ✅ Token created: ${mintAddr} TX: ${createSig}`);
 
-    if (!createResult.success) throw new Error('pumpdotfun-sdk createAndBuy returned success=false');
-    console.info(`[trend-launch] ${walletAlias} ✅ Created+bought: ${mintAddr} (${buySol} SOL dev buy)`);
+    // Step 2: DEV BUY via PumpPortal (wait for bonding curve to be indexed)
+    await new Promise(r => setTimeout(r, 4000));
+    const buyResp = await axios.post(
+      'https://pumpportal.fun/api/trade-local',
+      {
+        publicKey: kp.publicKey.toBase58(), action: 'buy', mint: mintAddr,
+        amount: buySol, denominatedInSol: 'true', slippage: 30,
+        priorityFee: 0.003, pool: 'pump',
+      },
+      { responseType: 'arraybuffer', timeout: 25000 }
+    );
+    const buyBytes = new Uint8Array(buyResp.data as ArrayBuffer);
+    const buyTx    = VersionedTransaction.deserialize(buyBytes);
+    buyTx.sign([kp]);
+    const buySig = await conn.sendTransaction(buyTx, { skipPreflight: true, maxRetries: 3 });
+    await conn.confirmTransaction(buySig, 'confirmed');
+    console.info(`[trend-launch] ${walletAlias} ✅ Dev buy: ${buySol} SOL TX: ${buySig}`);
 
     // Verify tokens landed — createAndBuy is atomic so success=true means tokens should be there
     const tokenAmt = await verifyTokensReceived(conn, kp, mintAddr);
@@ -416,7 +439,7 @@ async function launchOneToken(
       await tgNotifyPrivate(`⚠️ *${walletAlias} 0 tokens after create*\n$${concept.ticker} \`${mintAddr}\``);
     }
 
-    await recordLaunch(trend.id, concept.ticker, concept.name, concept.description,
+    await recordLaunch(trend.id, concept.ticker, concept.name, fullDescription,
       mintAddr, trend.tweet_url, walletAlias, kp.publicKey.toBase58());
 
     const pumpUrl = `https://pump.fun/coin/${mintAddr}`;
@@ -424,8 +447,9 @@ async function launchOneToken(
       `🚀 *AUTO-LAUNCHED* \\$${concept.ticker} [${walletAlias}]\n` +
       `Name: *${concept.name}*\n` +
       `Theme: *${trend.theme}* (engagement: ${trend.engagement})\n\n` +
-      `${concept.description}\n\n` +
-      `[pump\\.fun](${pumpUrl}) — CA: \`${mintAddr}\`\n` +
+      `${shortDesc}\n\n` +
+      `[pump\\.fun](${pumpUrl})\n` +
+      `CA: \`${mintAddr}\`\n` +
       (trend.tweet_url ? `[Source tweet](${trend.tweet_url})` : '')
     );
 

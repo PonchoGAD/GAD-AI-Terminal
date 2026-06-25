@@ -78,12 +78,6 @@ async function runSignalCycle(): Promise<void> {
     `ema21=${signal.ema21.toFixed(2)} rsi=${signal.rsi14.toFixed(1)}`
   );
 
-  // Gate: macro must be ok AND signal must be strong enough
-  if (!macro.ok || macro.score < MIN_MACRO_SCORE) {
-    console.log(`[futures] ⚠️ Macro not favorable (score=${macro.score}) — skip`);
-    return;
-  }
-
   if (signal.signal === 'FLAT' || signal.strength < MIN_SIGNAL_STR) {
     console.log(`[futures] ⚠️ Signal too weak (${signal.signal}/${signal.strength}) — skip`);
     return;
@@ -91,10 +85,24 @@ async function runSignalCycle(): Promise<void> {
 
   const side = signal.signal as 'LONG' | 'SHORT';
 
-  // Guard 6: Macro euphoria block — market too hot for LONG entries
-  if (side === 'LONG' && macro.score > 80) {
-    console.log(`[futures] 🚫 Macro euphoria: score=${macro.score} > 80 → no LONG (wait for pullback)`);
-    return;
+  // Direction-aware macro gate:
+  // LONG needs bullish macro (score >= 40, BTC not crashing, F&G not extreme fear)
+  // SHORT needs bearish macro (score <= 55) — a LOW macro score is GOOD for shorting
+  if (side === 'LONG') {
+    if (!macro.ok || macro.score < MIN_MACRO_SCORE) {
+      console.log(`[futures] ⚠️ Macro not favorable for LONG (score=${macro.score}) — skip`);
+      return;
+    }
+    if (macro.score > 80) {
+      console.log(`[futures] 🚫 Macro euphoria: score=${macro.score} > 80 → no LONG (wait for pullback)`);
+      return;
+    }
+  } else {
+    // SHORT: bearish macro (low score, BTC falling, fear) = good conditions
+    if (macro.score > 55) {
+      console.log(`[futures] 🚫 Macro too bullish for SHORT (score=${macro.score} > 55) — skip`);
+      return;
+    }
   }
 
   const ps   = calcPositionSize(capital, signal.price, side, signal.strength);
