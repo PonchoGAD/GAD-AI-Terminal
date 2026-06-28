@@ -146,12 +146,23 @@ async function pumpBuy(conn: Connection, wallet: Keypair, mintAddr: string, amou
   tx.sign([wallet]);
   const sig = await conn.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 });
   await conn.confirmTransaction(sig, 'confirmed');
+  // confirmTransaction only checks the TX was processed — not whether it succeeded on-chain.
+  // A failed TX (Custom error 1=BondingCurveNotFound, 6022=SlippageExceeded) still gets "confirmed".
+  const result = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0 });
+  if (result?.meta?.err) {
+    throw new Error(`TX confirmed but failed on-chain: ${JSON.stringify(result.meta.err)}`);
+  }
   return sig;
 }
 
 // ─── PumpPortal sell (all tokens) ─────────────────────────────────────────────
 
 async function pumpSellAll(conn: Connection, wallet: Keypair, mintAddr: string): Promise<string> {
+  // Check wallet has enough SOL for priority fee before attempting sell
+  const balance = await conn.getBalance(wallet.publicKey);
+  if (balance < 5_000_000) { // 0.005 SOL minimum
+    throw new Error(`Insufficient SOL for fees: ${(balance / 1e9).toFixed(4)} SOL (need ≥0.005)`);
+  }
   const r = await axios.post(
     'https://pumpportal.fun/api/trade-local',
     {
@@ -240,8 +251,8 @@ async function createSingleToken(
     // Step 2: dev buy via PumpPortal trade-local (server builds correct 18-account TX)
     if (cfg.devBuySol > 0) {
       try {
-        // Wait a few seconds for the bonding curve to be indexed
-        await new Promise(r => setTimeout(r, 4000));
+        // Wait for PumpPortal to index the bonding curve — 4s caused Custom error 1 (BondingCurveNotFound)
+        await new Promise(r => setTimeout(r, 15000));
         const buySig = await pumpBuy(conn, wallet, mintAddr, cfg.devBuySol);
         console.info(`[launcher] ✅ ${walletAlias} dev buy TX: ${buySig}`);
       } catch (buyErr: any) {
@@ -275,9 +286,9 @@ export async function launchTriple(cfg: TripleLaunchConfig): Promise<TripleLaunc
   const w3 = loadKp('PUMPFUN_WALLET_PRIVATE_KEY_2');
 
   const wallets: Array<{ wallet: Keypair; alias: string; sol: number }> = [];
-  if (w1) wallets.push({ wallet: w1, alias: 'W1', sol: cfg.devBuySol });
-  if (w2) wallets.push({ wallet: w2, alias: 'W2', sol: cfg.w2BuySol });
-  if (w3) wallets.push({ wallet: w3, alias: 'W3', sol: cfg.w3BuySol });
+  if (w1 && cfg.devBuySol > 0) wallets.push({ wallet: w1, alias: 'W1', sol: cfg.devBuySol });
+  if (w2 && cfg.w2BuySol > 0) wallets.push({ wallet: w2, alias: 'W2', sol: cfg.w2BuySol });
+  if (w3 && cfg.w3BuySol > 0) wallets.push({ wallet: w3, alias: 'W3', sol: cfg.w3BuySol });
 
   if (!wallets.length) return { imageUrl: '', metaUri: '', results: [{ ok: false, walletAlias: 'all', error: 'No wallets configured' }] };
 
@@ -476,19 +487,13 @@ async function checkHolderCount(mintAddr: string): Promise<number> {
 
 // ─── Multi-tier holder maintenance — sell launched tokens with no traction ────
 //
-// Tiers (checked every hour):
-//   2-4h:   < 3 holders  → nobody bought, completely dead
-//   4-8h:   < 6 holders  → no early traction
-//   8-14h:  < 10 holders → losing momentum
-//   22-30h: < 15 holders → final cleanup (original logic with raised bar)
-//
-// "sold_low_holders" tag written to meta_uri to prevent re-selling in later tiers.
+// First sell check at 12h — gives the token a full half-day to get organic discovery.
+// If only the dev holds at 12h (holders < 2), the token is dead → sell dev position.
+// Final cleanup at 20-30h.
 
 const MAINT_TIERS = [
-  { minH: 2,  maxH: 4,  minHolders: 3  },
-  { minH: 4,  maxH: 8,  minHolders: 6  },
-  { minH: 8,  maxH: 14, minHolders: 10 },
-  { minH: 22, maxH: 30, minHolders: 15 },
+  { minH: 12, maxH: 16, minHolders: 2 },  // 12-16h: sell if ≤1 holder (only dev = no buyers)
+  { minH: 20, maxH: 30, minHolders: 3 },  // 20-30h: final cleanup
 ];
 
 export async function runLaunchedCoinMaintenance(): Promise<void> {
@@ -501,6 +506,7 @@ export async function runLaunchedCoinMaintenance(): Promise<void> {
         FROM coin_launches
         WHERE created_at BETWEEN now() - interval '${tier.maxH} hours' AND now() - interval '${tier.minH} hours'
           AND wallet_alias IS NOT NULL
+          AND COALESCE(dev_buy_sol, 0) > 0
           AND (meta_uri IS NULL OR meta_uri NOT LIKE '%[SOLD_LOW_HOLDERS%')
         ORDER BY created_at ASC
         LIMIT 20
@@ -549,77 +555,191 @@ export async function runLaunchedCoinMaintenance(): Promise<void> {
   }
 }
 
-// ─── Auto-launch scheduler — 5 coins/day from approved coin_ideas ─────────────
+// ─── Fresh trend helpers for auto-launch ──────────────────────────────────────
+
+interface TrendInfo { theme: string; headline: string; source: string; }
+interface AutoCoinIdea { name: string; ticker: string; description: string; }
+
+async function pickFreshTrend(): Promise<TrendInfo | null> {
+  // 1. x_trend_signals — last 30 min (populated every 15 min by social-monitor)
+  //    Only top-tier influencer posts (engagement >= 10000 = Tier1 synthetic = truly viral)
+  try {
+    const { rows } = await query<any>(`
+      SELECT theme, keywords, engagement
+      FROM x_trend_signals
+      WHERE created_at > now() - interval '30 minutes'
+        AND engagement >= 10000
+      ORDER BY engagement DESC
+      LIMIT 1
+    `);
+    if (rows.length) {
+      const kw = rows[0].keywords;
+      const headline = Array.isArray(kw) ? kw.join(' ') : String(kw ?? 'trending crypto');
+      return { theme: String(rows[0].theme ?? 'CRYPTO'), headline, source: 'x_trends' };
+    }
+  } catch { /* fall through */ }
+
+  // 2. GDELT trend_clusters — last 2h, raised score threshold
+  try {
+    const { rows } = await query<any>(`
+      SELECT main_title, final_score
+      FROM trend_clusters
+      WHERE created_at > now() - interval '2 hours'
+        AND final_score >= 65
+      ORDER BY final_score DESC
+      LIMIT 1
+    `);
+    if (rows.length) {
+      return { theme: 'GLOBAL', headline: rows[0].main_title, source: 'gdelt' };
+    }
+  } catch { /* fall through */ }
+
+  // 3. CoinGecko trending — always fresh, direct API call
+  try {
+    const r = await axios.get('https://api.coingecko.com/api/v3/search/trending', { timeout: 8000 });
+    const coins: any[] = r.data?.coins ?? [];
+    if (coins.length) {
+      const top = coins[0].item;
+      return {
+        theme: 'CRYPTO',
+        headline: `${top.name} (${top.symbol.toUpperCase()}) is the #1 trending crypto globally`,
+        source: 'coingecko',
+      };
+    }
+  } catch { /* fall through */ }
+
+  return null;
+}
+
+async function generateCoinIdeaFromTrend(trend: TrendInfo): Promise<AutoCoinIdea> {
+  const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+  if (ANTHROPIC_KEY) {
+    try {
+      const r = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 150,
+        messages: [{
+          role: 'user',
+          content: `Viral trend: "${trend.headline}"\n\nCreate a meme coin idea inspired by this. Reply ONLY with valid JSON:\n{"name":"Full Token Name","ticker":"3-5 UPPERCASE","description":"One catchy sentence tying it to the trend."}`,
+        }],
+      }, {
+        headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+        timeout: 15000,
+      });
+      const text: string = r.data?.content?.[0]?.text ?? '';
+      const m = text.match(/\{[\s\S]*?\}/);
+      if (m) {
+        const parsed = JSON.parse(m[0]);
+        if (parsed?.name && parsed?.ticker && parsed?.description) return parsed as AutoCoinIdea;
+      }
+    } catch { /* fall through to template */ }
+  }
+
+  // Template fallback — works even without API key
+  const words = String(trend.headline).replace(/[^a-zA-Z0-9 ]/g, ' ').split(/\s+/).filter(Boolean);
+  const base = (words.find(w => w.length >= 3) ?? 'MEME').toUpperCase().slice(0, 5);
+  const name = words.slice(0, 2).map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ') + ' Coin';
+  return {
+    name,
+    ticker: base,
+    description: `The meme coin born from the viral moment: ${trend.headline.slice(0, 80)}.`,
+  };
+}
+
+// ─── Auto-launch scheduler — W2 only, 1 coin per 12h from live fresh trends ──
+//
+// Flow: check W2 balance → fetch fresh trend RIGHT NOW → generate coin idea
+//       via Claude → generate logo → upload Pinata → createSingleToken(W2)
+// Sell at 12h if no external buyers (maintenance handles this).
 
 export async function runAutoLaunchCycle(): Promise<void> {
   try {
-    // Count launches today
+    // === 1. Daily limit check ===
     const { rows: countRows } = await query<{ cnt: string }>(`
       SELECT COUNT(*) as cnt FROM coin_launches
-      WHERE created_at >= CURRENT_DATE
-        AND wallet_alias IS NOT NULL
+      WHERE created_at >= CURRENT_DATE AND wallet_alias = 'W2'
     `);
     const launchedToday = Number(countRows[0]?.cnt ?? 0);
-
-    // coin_launches stores one row per wallet per launch batch, so divide by 3
-    const batchesToday = Math.floor(launchedToday / 3);
-    if (batchesToday >= DAILY_LAUNCH_LIMIT) {
-      console.info(`[auto-launch] Daily limit reached (${batchesToday}/${DAILY_LAUNCH_LIMIT} batches)`);
+    const dailyLimit = Number(process.env.DAILY_LAUNCH_LIMIT || '2');
+    if (launchedToday >= dailyLimit) {
+      console.info(`[auto-launch] Daily limit reached (${launchedToday}/${dailyLimit}) — skipping`);
       return;
     }
 
-    // Find next approved idea with image_url
-    const { rows: ideas } = await query<any>(`
-      SELECT id, ticker, name, description, image_url, score
-      FROM coin_ideas
-      WHERE status IN ('approved')
-        AND image_url IS NOT NULL
-        AND auto_launch_at IS NULL
-      ORDER BY score DESC, created_at ASC
-      LIMIT 1
-    `);
-
-    if (!ideas.length) {
-      console.info('[auto-launch] No approved ideas with image_url ready — skipping');
+    // === 2. Check W2 balance ===
+    const w2 = loadKp('PUMPFUN_WALLET_PRIVATE_KEY');
+    if (!w2) {
+      console.warn('[auto-launch] PUMPFUN_WALLET_PRIVATE_KEY not set — skipping');
+      return;
+    }
+    const conn = new Connection(SOLANA_RPC, 'confirmed');
+    const w2Balance = await conn.getBalance(w2.publicKey);
+    const MIN_LAUNCH_SOL = 0.025; // create rent ~0.020 + priority fees ~0.003 + buffer
+    if (w2Balance < MIN_LAUNCH_SOL * 1e9) {
+      console.warn(`[auto-launch] W2 (CFmHWpmQ) balance too low: ${(w2Balance / 1e9).toFixed(4)} SOL — need ≥${MIN_LAUNCH_SOL} SOL. Top up wallet to resume.`);
       return;
     }
 
-    const idea = ideas[0];
-    console.info(`[auto-launch] 🚀 Auto-launching ${idea.ticker} — ${idea.name} (score: ${idea.score})`);
+    // === 3. Fetch FRESH trend right now (not stale DB cache) ===
+    console.info('[auto-launch] Fetching fresh viral trend...');
+    const trend = await pickFreshTrend();
+    if (!trend) {
+      console.warn('[auto-launch] No viral trend found — skipping this cycle');
+      return;
+    }
+    console.info(`[auto-launch] Trend [${trend.source}/${trend.theme}]: ${trend.headline}`);
 
-    // Download image
+    // === 4. Generate coin idea from trend via Claude ===
+    const coinIdea = await generateCoinIdeaFromTrend(trend);
+    console.info(`[auto-launch] Coin: ${coinIdea.ticker} — ${coinIdea.name}`);
+
+    // === 5. Generate logo via Pollinations.ai ===
+    const prompt = `cute cartoon meme coin mascot, ${coinIdea.name} theme, ${trend.theme.toLowerCase()} vibes, vibrant colors, crypto logo style, white background, flat illustration`;
+    const seed = Math.floor(Math.random() * 999999);
+    const pollinationsUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=500&height=500&nologo=true&seed=${seed}`;
     let imageBuffer: Buffer;
     try {
-      imageBuffer = await downloadImageUrl(idea.image_url);
+      const imgRes = await axios.get(pollinationsUrl, { responseType: 'arraybuffer', timeout: 30000 });
+      imageBuffer = Buffer.from(imgRes.data);
     } catch (err: any) {
-      console.warn(`[auto-launch] Failed to download image for ${idea.ticker}: ${err.message}`);
+      console.warn(`[auto-launch] Logo generation failed: ${err.message} — skipping`);
       return;
     }
 
-    // Mark as launching immediately to prevent duplicate launches
-    await query(`UPDATE coin_ideas SET auto_launch_at=now(), updated_at=now() WHERE id=$1`, [idea.id]).catch(() => {});
+    // === 6. Upload to Pinata ===
+    const imageCid = await pinataUploadBuffer(imageBuffer, `${coinIdea.ticker}_logo.png`, 'image/png');
+    const imageUrl = `https://ipfs.io/ipfs/${imageCid}`;
+    const meta = {
+      name: coinIdea.name, symbol: coinIdea.ticker, description: coinIdea.description,
+      image: imageUrl, website: 'https://gadai.shop',
+      twitter: 'https://x.com/gadaisol', telegram: 'https://t.me/gadfamilytg',
+      showName: true, createdOn: 'https://pump.fun',
+    };
+    const metaCid = await pinataUploadJson(meta, `${coinIdea.ticker}_metadata`);
+    const metaUri = `${PINATA_GATEWAY}${metaCid}`;
+    console.info(`[auto-launch] Image: ${imageUrl}`);
 
-    const result = await launchTriple({
-      name:        idea.name,
-      ticker:      idea.ticker,
-      description: idea.description ?? `${idea.name} — the meme that moves markets.`,
-      imageBuffer,
-      imageType:   'image/png',
-      website:     'https://gadai.shop',
-      twitter:     'https://x.com/gadaisol',
-      telegram:    'https://t.me/gadfamilytg',
-      devBuySol:   0.08,
-      w2BuySol:    0.04,
-      w3BuySol:    0.02,
-      coinIdeaId:  idea.id,
-    });
+    // === 7. Launch with W2 ONLY — tiny dev buy if balance allows ===
+    const devBuySol = w2Balance >= 0.035 * 1e9 ? 0.003 : 0;
+    console.info(`[auto-launch] Launching ${coinIdea.ticker} via W2 (devBuy: ${devBuySol} SOL)...`);
 
-    const successCount = result.results.filter(r => r.ok).length;
-    console.info(`[auto-launch] ${idea.ticker} launched: ${successCount}/${result.results.length} wallets succeeded`);
+    const result = await createSingleToken(
+      w2, 'W2',
+      {
+        name: coinIdea.name, ticker: coinIdea.ticker, description: coinIdea.description,
+        website: 'https://gadai.shop', twitter: 'https://x.com/gadaisol',
+        telegram: 'https://t.me/gadfamilytg', devBuySol,
+      },
+      imageCid, imageUrl, metaUri,
+    );
 
-    for (const r of result.results) {
-      if (r.ok) console.info(`[auto-launch]   ${r.walletAlias}: ${r.mintAddr}`);
-      else      console.warn(`[auto-launch]   ${r.walletAlias}: FAILED — ${r.error}`);
+    if (result.ok) {
+      console.info(`[auto-launch] ✅ ${coinIdea.ticker} launched! CA: ${result.mintAddr}`);
+      console.info(`[auto-launch] pump.fun: https://pump.fun/coin/${result.mintAddr}`);
+      console.info(`[auto-launch] TX: ${result.createTx}`);
+      console.info(`[auto-launch] Maintenance will check at 12h — sell if no buyers (holders < 2)`);
+    } else {
+      console.warn(`[auto-launch] ❌ ${coinIdea.ticker} FAILED: ${result.error}`);
     }
   } catch (err: any) {
     console.warn('[auto-launch] Cycle error:', err.message);

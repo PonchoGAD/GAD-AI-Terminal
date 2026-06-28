@@ -199,13 +199,18 @@ bot.onText(/\/start/, async (msg) => {
 bot.onText(/\/help/, (msg) => {
   send(msg.chat.id,
     `*GAD AI Terminal — Command Guide*\n\n` +
+    `💳 *Plans & Pricing:*\n` +
+    `🧪 1-Day Trial — $5 USDT | 219 ⭐\n` +
+    `⚡ 3-Day Access — $10 USDT | 437 ⭐\n` +
+    `💎 Monthly PRO — $100 USDT | 4,367 ⭐\n` +
+    `Pay at gadai.shop/pay or /subscribe for Stars\n\n` +
     `🆓 *FREE (no subscription):*\n` +
     `/start — main menu\n` +
     `/subscribe — view plans & pay\n` +
     `/status — subscription status\n` +
     `/wallet <address> — link Solana wallet\n` +
     `/help — this guide\n\n` +
-    `⚡ *ANY PLAN (0.05 SOL trial / 0.1 SOL 3d / 1 SOL monthly):*\n` +
+    `⚡ *STARTER & PRO — analytics:*\n` +
     `*Solana Scanner:*\n` +
     `/trending — hot tokens right now\n` +
     `/new — freshly listed tokens\n` +
@@ -220,33 +225,31 @@ bot.onText(/\/help/, (msg) => {
     `/journal — your personal trade log\n` +
     `/riskpassport — risk DNA profile\n` +
     `*Trends & Intelligence:*\n` +
-    `/marketdata — macro market context\n` +
     `/trends — GDELT + News meme engine\n` +
     `/ideas — AI-generated coin concepts\n` +
-    `/trend_launches — last launched trend tokens\n` +
+    `/trend_launches — last auto-launched trend tokens\n` +
     `/xtrends — X/Twitter trend signals\n` +
-    `/xsignal — latest X trend + coin\n` +
-    `*Futures:*\n` +
-    `/macro — BTC/SP500/F&G macro score\n` +
-    `/signal — SOL futures entry signal\n` +
+    `/xsignal — latest X trend + coin find\n` +
+    `*BTC Futures (paper trading):*\n` +
+    `/macro — BTC/SP500/Fear&Greed score\n` +
+    `/signal — SOL-PERP entry signal\n` +
     `/futures — full futures dashboard\n` +
     `*Base Network (EVM):*\n` +
     `/basestatus — Base scanner status\n` +
     `/basepositions — open ETH positions\n` +
     `/basetokens — discovered Base tokens\n` +
     `/basetrades — Base trade history\n\n` +
-    `*BSC / Four.meme (PRO):*\n` +
-    `/bscstatus — BSC scanner status\n` +
+    `*TON Network:*\n` +
     `/tonstatus — TON / STON.fi scanner\n` +
     `/tonpositions — open TON positions\n` +
     `/tontrades — TON trade history\n` +
     `/tonpnl — TON PnL summary\n\n` +
-    `/bscpositions — open BNB positions\n` +
-    `/bsctokens — discovered BSC tokens\n` +
-    `/bsctrades — BSC trade history\n\n` +
-    `💎 *PRO (1 SOL / 30 days) — extra:*\n` +
-    `/bot — Solana bot PnL & status\n` +
-    `/autobuy list|add|stop — manage bot\n` +
+    `*Polymarket (prediction market):*\n` +
+    `/polystatus — bot status & win rate\n` +
+    `/polymarkets — top markets by signal\n\n` +
+    `💎 *PRO ($100/mo) — extra:*\n` +
+    `/bot — Solana bot PnL & open positions\n` +
+    `/autobuy list|add|stop — manage autobuy\n` +
     `/portfolio — full portfolio view\n` +
     `/watchlist — token watchlist\n` +
     `/mycoins — your deployed tokens\n` +
@@ -254,12 +257,14 @@ bot.onText(/\/help/, (msg) => {
     `/position — futures position\n` +
     `/capital — futures capital manager\n` +
     `/ftrades — futures trade log\n` +
-    `/fclose — close futures position\n\n` +
+    `/fclose — close futures position\n` +
+    `/polysignals — prediction market signals\n\n` +
     `🔑 *Admin only:*\n` +
-    `/auto_launch — launch token on pump.fun 24/7\n` +
+    `/auto_launch — launch token on pump.fun\n` +
     `/approve_idea <id> — approve AI coin idea\n\n` +
-    `📈 *Networks:* Solana · Base (EVM)\n` +
-    `📡 *Sources:* DexScreener · Birdeye · Helius · GDELT · X/Twitter · Binance`
+    `📈 *Networks:* Solana · Base · TON · BTC Futures\n` +
+    `📡 *Sources:* DexScreener · Birdeye · Helius · GDELT · X/Twitter · Binance · Polymarket\n` +
+    `🤖 *AI:* Claude (concepts, scoring, signals)`
   );
 });
 
@@ -1653,7 +1658,7 @@ bot.onText(/^\/xsignal(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
 
 // ─── Auto Launch (ADMIN ONLY) ─────────────────────────────────────────────────
 
-import { launchToken, downloadTgPhoto, getPendingIdeas, LaunchConfig } from './launcher';
+import { launchToken, downloadTgPhoto, getPendingIdeas, LaunchConfig, runAutoLaunchCycle, runLaunchedCoinMaintenance } from './launcher';
 
 // In-memory launch session per admin chat
 const launchSessions = new Map<number, {
@@ -2331,4 +2336,20 @@ if (ADMIN_ID) {
     setInterval(sendHeartbeat, 12 * 60 * 60 * 1000);
   }, 12 * 60 * 60 * 1000);
 }
+
+// ─── Auto-launch scheduler ───────────────────────────────────────────────────
+// First run after 5 min (let bot fully init), then every 12h (W2 single wallet, fresh trends)
+setTimeout(() => {
+  console.info('[auto-launch] Starting first cycle (W2 single-wallet, 12h interval)...');
+  runAutoLaunchCycle().catch((e: any) => console.warn('[auto-launch] Cycle error:', e.message));
+  setInterval(() => {
+    runAutoLaunchCycle().catch((e: any) => console.warn('[auto-launch] Cycle error:', e.message));
+  }, 12 * 60 * 60 * 1000);
+}, 5 * 60 * 1000);
+
+// ─── Launched coin maintenance ───────────────────────────────────────────────
+// Check launched coins hourly: sell if holders < threshold at 2/4/8/22h tiers
+setInterval(() => {
+  runLaunchedCoinMaintenance().catch((e: any) => console.warn('[launcher-maint] Error:', e.message));
+}, 60 * 60 * 1000);
 
