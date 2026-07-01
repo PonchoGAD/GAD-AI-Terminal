@@ -201,17 +201,25 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
   }
 
   // Virtual Swap Simulator: simulate buy→sell round-trip via V2 router getAmountsOut
-  // Catches tax honeypots that pass static API checks (can buy but >15% loss on sell)
+  // Catches tax honeypots that pass static API checks (can buy but >10% loss on sell)
+  // IMPORTANT: only block on confirmed tax/honeypot — NOT on routing errors.
+  // Tokens with V3-only pools (Clanker) have no V2 path → SIMULATION_ERROR/ZERO_BUY_SIMULATION.
+  // Blocking those would permanently blacklist all Clanker tokens (false positive).
   const swapSim = await simulateEvmSwap(
     getProvider(), token.contract_address, 8453,
     ethers.parseEther(BUY_ETH.toString()), // simulate with actual trade size, not default 0.001
   ).catch(() => null);
   if (swapSim && !swapSim.canSwap) {
-    buyFailBlacklist.set(token.contract_address, Date.now() + BUY_FAIL_COOLDOWN_MS);
-    console.warn(`[base-scanner] 🔬 SWAP_SIM blocked ${token.symbol}: ${swapSim.reason}`);
-    return;
+    const isTaxHoneypot = swapSim.reason?.startsWith('HIGH_TAX') || swapSim.reason?.startsWith('SELL_REVERT');
+    if (isTaxHoneypot) {
+      buyFailBlacklist.set(token.contract_address, Date.now() + BUY_FAIL_COOLDOWN_MS);
+      console.warn(`[base-scanner] 🔬 SWAP_SIM blocked ${token.symbol}: ${swapSim.reason}`);
+      return;
+    }
+    // V2 routing unavailable (V3-only pool / Clanker token) — fail-open, let honeypot.is handle it
+    console.debug(`[base-scanner] 🔬 SwapSim ${token.symbol}: V2 route unavailable (${swapSim.reason?.slice(0, 40)}) — proceeding`);
   }
-  if (swapSim) {
+  if (swapSim?.canSwap) {
     console.debug(`[base-scanner] 🔬 SwapSim ${token.symbol}: loss=${swapSim.totalLossPct.toFixed(1)}% OK`);
   }
 

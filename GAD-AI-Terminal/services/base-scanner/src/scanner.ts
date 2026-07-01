@@ -340,10 +340,14 @@ async function fetchClankerApi(): Promise<BaseToken[]> {
     if (!recent.length) return [];
     console.debug(`[base-scan] Clanker: ${recent.length}/${items.length} tokens within 48h`);
 
-    for (const item of recent.slice(0, 10)) { // max 10 DexScreener calls per cycle
+    // Parallelize DexScreener enrichment — sequential would block scan cycle for up to 50s (10×5s)
+    const toFetch = recent.slice(0, 10).filter((item: any) => {
       const ca = (item.contract_address ?? item.tokenAddress ?? item.address)?.toLowerCase();
-      if (!ca || recentScanned.has(ca)) continue;
+      return ca && !recentScanned.has(ca);
+    });
 
+    const results = await Promise.allSettled(toFetch.map(async (item: any) => {
+      const ca = (item.contract_address ?? item.tokenAddress ?? item.address)?.toLowerCase();
       let token: BaseToken | null = null;
 
       // Prefer pool endpoint — fetches the exact pair (avoids USDC pair ambiguity)
@@ -360,16 +364,19 @@ async function fetchClankerApi(): Promise<BaseToken[]> {
       }
 
       // Fallback: token endpoint with ETH pair preference
-      if (!token) token = await fetchPairData(ca);
-      if (!token) continue;
+      if (!token) token = await fetchPairData(ca!);
+      if (!token) return null;
 
       // DexScreener may not know the pair age yet for very new launches.
       // Use Clanker's created_at as authoritative age source in that case.
       if (token.age_sec >= 999999 && item.created_at) {
         token.age_sec = Math.max(0, (Date.now() - new Date(item.created_at).getTime()) / 1000);
       }
+      return token;
+    }));
 
-      tokens.push(token);
+    for (const r of results) {
+      if (r.status === 'fulfilled' && r.value) tokens.push(r.value);
     }
     if (tokens.length > 0) console.debug(`[base-scan] Clanker enriched: ${tokens.length} tokens`);
   } catch (e: any) {

@@ -80,13 +80,16 @@ async function _run(address: string, chainId: number, ageSec?: number): Promise<
 
     if (!report) {
       // GoPlus returned nothing — two cases:
-      // 1. Token is brand-new (< 1h) — GoPlus hasn't indexed it yet.
-      //    Fail-CLOSED: scam tokens flood the first hour before GoPlus sees them.
+      // 1. Token is brand-new (< 20 min) — GoPlus hasn't indexed it yet.
+      //    Fail-CLOSED: very new tokens have high honeypot risk before GoPlus indexes them.
+      //    20 min threshold: gives sniper-dump window time to pass while catching most scams.
+      //    For 20min+ tokens: swap simulator (next check) provides runtime honeypot detection.
       // 2. API outage on an older token — fail-open (don't block legitimate tokens).
-      const isNew = ageSec !== undefined && ageSec < 3600;
+      const GOPLUS_MIN_AGE_SEC = Number(process.env.BASE_GOPLUS_MIN_AGE_SEC ?? '1200'); // 20 min default
+      const isNew = ageSec !== undefined && ageSec < GOPLUS_MIN_AGE_SEC;
       if (isNew) {
-        console.debug(`[evm-shield] ⚠ GoPlus no data + token <1h old (${Math.round((ageSec ?? 0) / 60)}min) — BLOCKING ${address.slice(0,10)}`);
-        return { isSafe: false, reason: 'GOPLUS_NO_DATA_NEW_TOKEN_UNDER_1H' };
+        console.debug(`[evm-shield] ⚠ GoPlus no data + token <${GOPLUS_MIN_AGE_SEC/60}min old (${Math.round((ageSec ?? 0) / 60)}min) — BLOCKING ${address.slice(0,10)}`);
+        return { isSafe: false, reason: 'GOPLUS_NO_DATA_NEW_TOKEN_UNDER_20MIN' };
       }
       console.debug(`[evm-shield] ⚠ GoPlus no data for ${address.slice(0,10)} (age unknown/old) — proceeding`);
       return { isSafe: true };
