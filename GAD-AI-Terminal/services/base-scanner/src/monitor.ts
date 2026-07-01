@@ -38,12 +38,35 @@ async function getEthPriceUsd(): Promise<number> {
   } catch { return _ethUsdCache.price; } // return last known on error
 }
 
-// TP levels — Raydium-style: capture most profit early, trail the rest
-// Conservative targets fit current FEAR market (F&G=20)
-const BASE_TPS = [
-  { mult: 1.25, sellPct: 80 },   // lock 80% at +25% — Raydium FEAR mode equivalent
-  { mult: 2.00, sellPct: 20 },   // close rest at 2x
-];
+// TP levels — dynamic based on F&G regime (mirrors Raydium auto-signal.ts logic)
+let _fgCache: { fg: number; ts: number } = { fg: 50, ts: 0 };
+async function getFgCached(): Promise<number> {
+  if (Date.now() - _fgCache.ts < 30 * 60 * 1000) return _fgCache.fg;
+  try {
+    const r = await axios.get('https://api.alternative.me/fng/?limit=1', { timeout: 5_000 });
+    const fg = Number(r.data?.data?.[0]?.value ?? 50);
+    _fgCache = { fg, ts: Date.now() };
+    return fg;
+  } catch { return _fgCache.fg; }
+}
+
+async function getBaseTps(): Promise<Array<{ mult: number; sellPct: number }>> {
+  const fg = await getFgCached();
+  if (fg < 10) {
+    // EXTREME_FEAR: micro-scalp, quick exit
+    return [{ mult: 1.08, sellPct: 90 }, { mult: 1.20, sellPct: 10 }];
+  }
+  if (fg < 20) {
+    // DEEP_FEAR: tight TPs
+    return [{ mult: 1.10, sellPct: 85 }, { mult: 1.30, sellPct: 15 }];
+  }
+  if (fg < 45) {
+    // FEAR: conservative (original)
+    return [{ mult: 1.25, sellPct: 80 }, { mult: 2.00, sellPct: 20 }];
+  }
+  // NEUTRAL/BULL/EUPHORIA
+  return [{ mult: 1.40, sellPct: 70 }, { mult: 2.50, sellPct: 30 }];
+}
 
 interface Position {
   id:              string;
@@ -77,9 +100,15 @@ async function getCurrentPriceEth(contractAddress: string): Promise<number> {
       `https://api.dexscreener.com/latest/dex/tokens/${contractAddress}`,
       { timeout: 5000 }
     );
-    const pairs: any[] = (r.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
-    if (!pairs.length) return 0;
-    return Number(pairs[0].priceNative ?? 0);
+    const allPairs: any[] = (r.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
+    if (!allPairs.length) return 0;
+    // Prefer ETH/WETH-quoted pairs — USDC pairs return USD price in priceNative,
+    // which creates a ~60000x false multiplier vs ETH-denominated entry_price_eth.
+    const ethPairs = allPairs.filter((p: any) =>
+      ['ETH', 'WETH'].includes((p.quoteToken?.symbol ?? '').toUpperCase())
+    );
+    const pair = ethPairs.length > 0 ? ethPairs[0] : allPairs[0];
+    return Number(pair.priceNative ?? 0);
   } catch { return 0; }
 }
 
@@ -107,8 +136,6 @@ async function sellPosition(pos: Position, reason: string, sellPct: number, slip
   const amountToSell = sellPct >= 100
     ? tokenBalance
     : (tokenBalance * BigInt(sellPct)) / 100n;
-
-  const ethBalBefore = await getEthBalance();
 
   // VULN 1: V3 Tick Liquidity Starvation guard.
   // If token price fell below the LP range lower bound, V3 active liquidity = 0.
@@ -140,8 +167,8 @@ async function sellPosition(pos: Position, reason: string, sellPct: number, slip
     return;
   }
 
-  const ethBalAfter = await getEthBalance();
-  const ethReceived = Math.max(0, ethBalAfter - ethBalBefore);
+  // Use amount_out from swap receipt (WETH Withdrawal event) — avoids RPC sync timing issues with balance diff
+  const ethReceived = Number(result.amount_out ?? '0');
   const isFull = sellPct >= 100 || (tokenBalance - amountToSell) < 100n;
 
   const ethUsd  = await getEthPriceUsd();
@@ -255,10 +282,11 @@ async function pollPosition(pos: Position): Promise<void> {
     console.info(`[base-monitor] 🌕 ${pos.symbol} MOONBAG ${mult.toFixed(2)}x — time limit lifted, trail widened to ${activeTrailPct}%`);
   }
 
-  // TP levels — use 3% slippage protection against MEV sandwiches
-  const nextTp = BASE_TPS[pos.tp_index];
+  // TP levels — dynamic per F&G regime; 3% slippage tolerance vs MEV sandwiches
+  const tps = await getBaseTps();
+  const nextTp = tps[pos.tp_index];
   if (nextTp && mult >= nextTp.mult) {
-    const isLast = pos.tp_index >= BASE_TPS.length - 1;
+    const isLast = pos.tp_index >= tps.length - 1;
     await sellPosition(pos, `TP${pos.tp_index + 1}@${nextTp.mult}x`, isLast ? 100 : nextTp.sellPct, 3);
     if (!isLast) console.info(`[base-monitor] ${pos.symbol} TP${pos.tp_index + 1} hit — holding ${100 - nextTp.sellPct}% with ${TRAIL_PCT}% trail`);
   }
@@ -289,12 +317,13 @@ async function monitorLoop(): Promise<void> {
   }
 }
 
-export function startMonitor(): void {
+export async function startMonitor(): Promise<void> {
+  const initTps = await getBaseTps();
   console.info(
     `[base-monitor] Starting — poll:${POLL_INTERVAL_MS / 1000}s | ` +
     `stop:${STOP_LOSS_PCT}% | trail:${TRAIL_PCT}% (early@+${EARLY_TRAIL_PCT}%) | ` +
     `moonbag@${MOONBAG_MULT}x→trail:${MOONBAG_TRAIL}% | ` +
-    `TP:${BASE_TPS.map(t => `${t.mult}x→${t.sellPct}%`).join('/')} | time:${TIME_LIMIT_SEC / 3600}h`
+    `TP:${initTps.map(t => `${t.mult}x→${t.sellPct}%`).join('/')} (dynamic/F&G) | time:${TIME_LIMIT_SEC / 3600}h`
   );
   setInterval(() => monitorLoop().catch(console.error), POLL_INTERVAL_MS);
 }

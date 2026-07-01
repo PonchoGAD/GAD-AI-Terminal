@@ -37,7 +37,7 @@ const FRESH_AGE_SEC  = Number(process.env.BASE_FRESH_AGE_SEC      || '3600');
 const MIN_PC5M       = Number(process.env.BASE_MIN_PC5M           || '1');
 const MIN_VOL_LIQ    = Number(process.env.BASE_MIN_VOL_LIQ_RATIO  || '0.10');
 const MAX_BS_RATIO   = Number(process.env.BASE_MAX_BUY_SELL_RATIO  || '4.0');
-const MAX_AGE_SEC    = Number(process.env.BASE_MAX_AGE_SEC        || '14400'); // 4h — Base memes move fast
+const MAX_AGE_SEC    = Number(process.env.BASE_MAX_AGE_SEC        || '172800'); // 48h default — mcap cap ($2M) prevents old token buys
 const MIN_AGE_SEC    = Number(process.env.BASE_MIN_AGE_SEC        || '120');   // 2min min — avoid honeypot traps
 const MIN_SAFE_SCORE = Number(process.env.BASE_MIN_SAFE_SCORE     || '30');
 const MIN_BUYS_H1    = Number(process.env.BASE_MIN_BUYS_H1        || '5');
@@ -77,6 +77,27 @@ export interface BaseToken {
 async function fetchDexScreener(): Promise<BaseToken[]> {
   const tokens: BaseToken[] = [];
 
+  // Source 0: DexScreener token-profiles/latest — newly listed tokens (freshest)
+  try {
+    const r = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 8000 });
+    const profiles: any[] = r.data ?? [];
+    const baseProfiles = profiles.filter((p: any) => p.chainId === 'base');
+    for (const profile of baseProfiles) {
+      if (!profile.tokenAddress) continue;
+      try {
+        const pr = await axios.get(
+          `https://api.dexscreener.com/latest/dex/tokens/${profile.tokenAddress}`,
+          { timeout: 5000 },
+        );
+        const pairs: any[] = (pr.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
+        for (const p of pairs) {
+          const token = mapDexPair(p);
+          if (token) tokens.push(token);
+        }
+      } catch { }
+    }
+  } catch { }
+
   // Source 1: DexScreener trending Base pairs — small cap, high momentum memes
   try {
     const r = await axios.get(
@@ -93,7 +114,7 @@ async function fetchDexScreener(): Promise<BaseToken[]> {
   } catch { }
 
   // Source 2: Keyword searches for Base meme launches
-  const searches = ['base pepe', 'base doge', 'base frog', 'base ai', 'base pump'];
+  const searches = ['base meme launch', 'base pump fun', 'base coin new', 'base pepe', 'base ai agent', 'clanker new'];
   for (const q of searches) {
     try {
       const r = await axios.get(
@@ -129,15 +150,31 @@ async function fetchDexScreener(): Promise<BaseToken[]> {
     }
   } catch { }
 
+  // Source 5: DexScreener /latest/dex/pairs/base/new — freshest Base pairs (real-time new listings)
+  // This endpoint returns the newest pools on Base regardless of keyword — catches meme launches
+  // that don't appear in search results yet (too new, no trading history)
+  try {
+    const r = await axios.get('https://api.dexscreener.com/latest/dex/pairs/base/new', { timeout: 8000 });
+    const pairs: any[] = (r.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
+    for (const p of pairs) {
+      const token = mapDexPair(p);
+      if (token) tokens.push(token);
+    }
+  } catch { }
+
   return dedupeByAddress(tokens);
 }
 
 async function fetchPairData(tokenAddress: string): Promise<BaseToken | null> {
   try {
     const r = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 5000 });
-    const pairs: any[] = (r.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
-    if (!pairs.length) return null;
-    return mapDexPair(pairs[0]);
+    const allPairs: any[] = (r.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
+    if (!allPairs.length) return null;
+    // Prefer ETH/WETH-quoted pairs to keep price_eth in ETH units (not USD from USDC pairs)
+    const ethPairs = allPairs.filter((p: any) =>
+      ['ETH', 'WETH'].includes((p.quoteToken?.symbol ?? '').toUpperCase())
+    );
+    return mapDexPair(ethPairs.length > 0 ? ethPairs[0] : allPairs[0]);
   } catch { return null; }
 }
 
@@ -205,21 +242,29 @@ function mapGeckoPool(pool: any, dexOverride?: string): BaseToken | null {
   };
 }
 
+// GeckoTerminal is rate-limited on shared VPS IPs. Call it at most once per 5 minutes.
+let _geckoLastCallMs = 0;
+const GECKO_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes between GeckoTerminal calls
+
 async function fetchGeckoTerminal(): Promise<BaseToken[]> {
+  const now = Date.now();
+  if (now - _geckoLastCallMs < GECKO_COOLDOWN_MS) return []; // skip if too recent
+  _geckoLastCallMs = now;
+
   const tokens: BaseToken[] = [];
   const GECKO_HEADERS = { Accept: 'application/json;version=20230302' };
 
-  // DEX-specific endpoints — these return ONLY V3 or Aerodrome pools (tradeable by our router)
+  // Prioritise new_pools — this returns truly fresh pools sorted by creation time
   const dexEndpoints: Array<{ url: string; dexId: string }> = [
-    { url: 'https://api.geckoterminal.com/api/v2/networks/base/dexes/uniswap-v3/pools?page=1', dexId: 'uniswap-v3' },
-    { url: 'https://api.geckoterminal.com/api/v2/networks/base/dexes/uniswap-v3/pools?page=2', dexId: 'uniswap-v3' },
-    { url: 'https://api.geckoterminal.com/api/v2/networks/base/dexes/aerodrome-v2/pools?page=1', dexId: 'aerodrome-v2' },
     { url: 'https://api.geckoterminal.com/api/v2/networks/base/new_pools?page=1', dexId: '' },
+    { url: 'https://api.geckoterminal.com/api/v2/networks/base/dexes/uniswap-v3/pools?page=1', dexId: 'uniswap-v3' },
+    { url: 'https://api.geckoterminal.com/api/v2/networks/base/dexes/aerodrome-v2/pools?page=1', dexId: 'aerodrome-v2' },
   ];
 
   for (const endpoint of dexEndpoints) {
     try {
-      const r = await axios.get(endpoint.url, { timeout: 8_000, headers: GECKO_HEADERS });
+      const r = await axios.get(endpoint.url, { timeout: 10_000, headers: GECKO_HEADERS });
+      if (r.status === 429) { _geckoLastCallMs = now + GECKO_COOLDOWN_MS * 2; break; } // extend backoff on 429
       const pools: any[] = r.data?.data ?? [];
       for (const pool of pools) {
         const t = mapGeckoPool(pool, endpoint.dexId || undefined);
@@ -228,6 +273,39 @@ async function fetchGeckoTerminal(): Promise<BaseToken[]> {
     } catch { }
   }
 
+  if (tokens.length > 0) console.debug(`[base-scan] GeckoTerminal: ${tokens.length} pools`);
+  return tokens;
+}
+
+// ─── Extra DexScreener sources for fresh Base meme tokens ────────────────────
+// Called less frequently (every 5 min) to avoid rate limits on expensive searches
+let _dexFreshLastCallMs = 0;
+const DEX_FRESH_COOLDOWN_MS = 5 * 60 * 1000;
+
+async function fetchDexScreenerFresh(): Promise<BaseToken[]> {
+  const now = Date.now();
+  if (now - _dexFreshLastCallMs < DEX_FRESH_COOLDOWN_MS) return [];
+  _dexFreshLastCallMs = now;
+
+  const tokens: BaseToken[] = [];
+  // Searches specifically targeting fresh launches (not popular/established tokens)
+  const freshSearches = [
+    'base launch today', 'base meme 2026', 'base coin just launched',
+    'believe.app base', 'clanker launch',
+  ];
+  for (const q of freshSearches) {
+    try {
+      const r = await axios.get(
+        `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(q)}`,
+        { timeout: 6000 },
+      );
+      const pairs: any[] = (r.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
+      for (const p of pairs) {
+        const token = mapDexPair(p);
+        if (token) tokens.push(token);
+      }
+    } catch { }
+  }
   return tokens;
 }
 
@@ -284,10 +362,12 @@ export async function loadBaseRecentBuys(): Promise<void> {
 }
 
 export async function runScanCycle(): Promise<BaseToken[]> {
-  const [dex, gecko] = await Promise.all([fetchDexScreener(), fetchGeckoTerminal()]);
-  const all = dedupeByAddress([...dex, ...gecko]);
+  const [dex, gecko, fresh] = await Promise.all([fetchDexScreener(), fetchGeckoTerminal(), fetchDexScreenerFresh()]);
+  const all = dedupeByAddress([...dex, ...gecko, ...fresh]);
 
-  console.info(`[base-scan] ${all.length} candidates from ${dex.length} DexScreener + ${gecko.length} Gecko`);
+  const geckoNote = gecko.length > 0 ? ` + ${gecko.length} Gecko` : '';
+  const freshNote = fresh.length > 0 ? ` + ${fresh.length} DexFresh` : '';
+  console.info(`[base-scan] ${all.length} candidates from ${dex.length} DexScreener${geckoNote}${freshNote}`);
 
   const passed: BaseToken[] = [];
 
