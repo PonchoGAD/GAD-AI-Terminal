@@ -962,8 +962,14 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     console.info(`[raydium-scan] 🎯 DEEP_FEAR micro-scalp mode (F&G=${cachedFearGreed} 10-20) — buying with tight TP 10%, trail 2%.`);
   }
 
-  // No FEAR override — RAYDIUM_MIN_PC1H env var controls threshold in all regimes.
-  const minPc1hOverride = RAYDIUM_MIN_PC1H;
+  // FEAR/DEEP_FEAR: require stronger 1h momentum — tokens bucking the bearish trend need to prove it.
+  // DEEP_FEAR (F&G 10-20): 8% floor (weaker market, real movers still show 8%+)
+  // FEAR (F&G 20-45): 10% floor (contrarian thesis only valid with clear upside)
+  const minPc1hOverride = regime === 'DEEP_FEAR'
+    ? Math.max(RAYDIUM_MIN_PC1H, 8)
+    : regime === 'FEAR'
+      ? Math.max(RAYDIUM_MIN_PC1H, 10)
+      : RAYDIUM_MIN_PC1H;
 
   const dailySpent = await getDailySpent();
   if (dailySpent >= DAILY_MAX_SOL) return;
@@ -1025,10 +1031,17 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       console.debug(`[raydium-scan] ✗liq  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
       skipped.liq++; continue;
     }
-    // FEAR liquidity floor: require $25k in FEAR (was $35k — too high, blocked $27-33k range).
-    // Data: T1 liq ($12-80k) FEAR win rate = 46.2% — the $27-35k zone is profitable.
-    if (regime === 'FEAR' && liq < 25000) {
-      console.debug(`[raydium-scan] ✗fear  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} < $25k floor in FEAR`);
+    // Liquidity floors by regime — lower in DEEP_FEAR, bypass with strong 5m momentum.
+    // vol5m > $12k = real buying pressure RIGHT NOW → override liq floor (anomaly signal).
+    // DEEP_FEAR (F&G 10-20): $18k floor — micro-scalp opportunities still exist at lower liq.
+    // FEAR (F&G 20-45): $22k floor — contrarian zone, need some depth for exit.
+    const VOL5M_LIQ_BYPASS = Number(process.env.RAYDIUM_VOL5M_BYPASS_USD || '12000');
+    if (regime === 'DEEP_FEAR' && liq < 18000 && vol5m < VOL5M_LIQ_BYPASS) {
+      console.debug(`[raydium-scan] ✗deep  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} < $18k | vol5m:$${vol5m.toFixed(0)} < $${VOL5M_LIQ_BYPASS} (no bypass)`);
+      skipped.liq++; continue;
+    }
+    if (regime === 'FEAR' && liq < 22000 && vol5m < VOL5M_LIQ_BYPASS) {
+      console.debug(`[raydium-scan] ✗fear  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} < $22k | vol5m:$${vol5m.toFixed(0)} < $${VOL5M_LIQ_BYPASS} (no bypass)`);
       skipped.liq++; continue;
     }
 

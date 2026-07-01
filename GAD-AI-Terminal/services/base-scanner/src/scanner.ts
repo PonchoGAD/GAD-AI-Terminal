@@ -396,12 +396,30 @@ const TRADEABLE_DEX_IDS = new Set([
   'aerodrome-v2', 'aerodrome',
 ]);
 
+// ─── Tier 2: High-volume launch (mcap $300k–$2.5M with strong momentum) ──────
+// Catches Clanker-style launches that spike past $300k quickly but have real volume.
+// Requires: vol1h/liq > 2x AND liq > $25k AND age < 12h AND 80+ buyers in 1h.
+const TIER2_MAX_MCAP = Number(process.env.BASE_TIER2_MAX_MCAP_USD  || '2500000');
+const TIER2_MIN_LIQ  = Number(process.env.BASE_TIER2_MIN_LIQ_USD   || '25000');
+const TIER2_VOL_LIQ  = Number(process.env.BASE_TIER2_VOL_LIQ_RATIO || '2.0');
+const TIER2_MAX_AGE  = Number(process.env.BASE_TIER2_MAX_AGE_SEC   || '43200'); // 12h
+const TIER2_MIN_BUYS = Number(process.env.BASE_TIER2_MIN_BUYS_H1   || '80');
+
 // ─── Filter ──────────────────────────────────────────────────────────────────
 function passesFilter(t: BaseToken): string | null {
   // PRIMARY GUARD: mcap cap — the only reliable way to exclude all established tokens.
-  // SOL=$80B, ADA=$15B, cbXRP scams=$100M+. Real meme launches: $1k-$2M.
-  // This one check prevents buying any L1/L2 token or their impersonators.
-  if (t.mcap_usd > 0 && t.mcap_usd > MAX_MCAP)  return `mcap:$${(t.mcap_usd/1e6).toFixed(1)}M > $${(MAX_MCAP/1e6).toFixed(1)}M`;
+  // SOL=$80B, ADA=$15B, cbXRP scams=$100M+. Real meme launches: $1k-$2.5M.
+  // Tier 1: mcap ≤ MAX_MCAP (default $350k) — standard meme entry.
+  // Tier 2: mcap $350k–$2.5M but must have vol1h/liq > 2x + liq $25k+ + age < 12h + 80+ buys/h.
+  if (t.mcap_usd > 0 && t.mcap_usd > MAX_MCAP) {
+    const isTier2 = t.mcap_usd <= TIER2_MAX_MCAP &&
+                    t.liquidity_usd >= TIER2_MIN_LIQ &&
+                    t.volume_1h / Math.max(1, t.liquidity_usd) >= TIER2_VOL_LIQ &&
+                    t.age_sec <= TIER2_MAX_AGE &&
+                    t.txns_h1_buys >= TIER2_MIN_BUYS;
+    if (!isTier2) return `mcap:$${(t.mcap_usd/1e6).toFixed(1)}M > $${(MAX_MCAP/1e6).toFixed(1)}M`;
+    console.info(`[base-scan] 🔥T2 ${t.symbol}: mcap $${(t.mcap_usd/1e3).toFixed(0)}k liq $${(t.liquidity_usd/1e3).toFixed(0)}k vol/liq ${(t.volume_1h/t.liquidity_usd).toFixed(1)}x buys1h:${t.txns_h1_buys}`);
+  }
   if (t.mcap_usd > 0 && t.mcap_usd < MIN_MCAP)  return `mcap:$${t.mcap_usd.toFixed(0)} < $${MIN_MCAP} (dead)`;
   // Age: unknown creation date = established token (pairCreatedAt missing = age 999999)
   if (t.age_sec > MAX_AGE_SEC) return `age:${(t.age_sec / 3600).toFixed(1)}h > ${MAX_AGE_SEC / 3600}h`;

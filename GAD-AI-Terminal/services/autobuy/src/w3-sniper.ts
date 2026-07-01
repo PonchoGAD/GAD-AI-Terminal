@@ -215,6 +215,17 @@ async function openPosition(msg: any): Promise<void> {
     return;
   }
 
+  // Socials required: tokens with X/Telegram have community = less likely to die at 45s.
+  // Controlled by W3_SNIPER_REQUIRE_SOCIALS=false to disable in tests.
+  const REQUIRE_SOCIALS = process.env.W3_SNIPER_REQUIRE_SOCIALS !== 'false';
+  if (REQUIRE_SOCIALS) {
+    const hasSocials = !!(msg.twitter || msg.telegram || msg.website);
+    if (!hasSocials) {
+      console.debug(`[w3-sniper] Skip ${symbol}: no socials (X/TG required — set W3_SNIPER_REQUIRE_SOCIALS=false to disable)`);
+      return;
+    }
+  }
+
   if (isLikelyRug(name, symbol)) {
     console.debug(`[w3-sniper] Skip ${symbol}: rug keywords`);
     return;
@@ -224,9 +235,12 @@ async function openPosition(msg: any): Promise<void> {
   const vTok = Number(msg.vTokensInBondingCurve ?? VIRTUAL_TOKEN_RESERVES);
   if (vSol <= 0 || vTok <= 0) return;
 
-  // Anti-bundle: if vSol > 30.30 at create, bundlers already sniped this in same block
-  if (vSol > 30.30) {
-    console.info(`[w3-sniper] 🚨 Skip ${symbol}: bundle trap (vSol ${vSol.toFixed(2)} > 30.30)`);
+  // Anti-bundle: detect if OTHER wallets (not dev) bought in the same block.
+  // Genesis vSol=30. After dev buy: vSol = 30 + devSol. Extra = what bundlers added.
+  // Old check (vSol>30.30) was WRONG: blocked devs buying ≥0.31 SOL (the good ones).
+  const extraSol = vSol - devSol - VIRTUAL_SOL_RESERVES;
+  if (extraSol > 0.15) {
+    console.info(`[w3-sniper] 🚨 Skip ${symbol}: bundle trap (other wallets +${extraSol.toFixed(2)} SOL in same block)`);
     return;
   }
 
@@ -533,9 +547,13 @@ async function checkFGHistorySafe(): Promise<boolean> {
     const r = await fetch('https://api.alternative.me/fng/?limit=5');
     const j = await (r as any).json();
     const values = j?.data?.map((d: any) => Number(d.value)) ?? [];
-    const allBull = values.length >= 5 && values.every((v: number) => v > 45);
+    // Live gate: require 5 consecutive days F&G > threshold.
+    // Default 25 (FEAR zone bottom) — allows micro-live in stable FEAR, blocks DEEP_FEAR/EXTREME_FEAR.
+    // Raise to 45 in .env (W3_SNIPER_FG_LIVE_MIN=45) for stricter BULL-only live mode.
+    const FG_LIVE_MIN = Number(process.env.W3_SNIPER_FG_LIVE_MIN || '25');
+    const allBull = values.length >= 5 && values.every((v: number) => v > FG_LIVE_MIN);
     if (!allBull) {
-      console.info(`[w3-sniper] 🔒 F&G guard: BLOCKED (need 5 days F&G>45, got: ${values.slice(0,5).join(',')})`);
+      console.info(`[w3-sniper] 🔒 F&G guard: BLOCKED (need 5 days F&G>${FG_LIVE_MIN}, got: ${values.slice(0,5).join(',')})`);
     }
     return allBull;
   } catch {
