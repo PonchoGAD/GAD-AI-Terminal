@@ -386,8 +386,8 @@ export function checkTokenAgeGate(
 
 // ─── Market Regime Auto-Detection ────────────────────────────────────────────
 // Fear & Greed index from Alternative.me. Cached 30 min.
-// EXTREME_FEAR (<13): PAUSE all buys — true capitulation/black swan only
-// FEAR (13-45):       STRICT mode — require strong pc1h, small positions (contrarian buy zone)
+// EXTREME_FEAR (<10): PAUSE all buys — true capitulation/black swan only
+// FEAR (10-45):       STRICT mode — require strong pc1h, small positions (contrarian buy zone)
 // NEUTRAL (45-60):    NORMAL mode — standard filters
 // GREED (60-80):      BULL mode — lower TP targets, larger positions allowed
 // EXTREME_GREED(>80): CAUTION — euphoria = top risk, tighten stops
@@ -408,14 +408,17 @@ export async function getFearGreed(): Promise<number> {
 }
 
 // Returns market regime string based on F&G + manual override
+// DEEP_FEAR (10-20): micro-scalping mode — tight TP 10-12%, fast trail 2%
+// FEAR      (20-45): contrarian buy zone — TP 22%, early trail 3.5%
 export async function getMarketRegime(): Promise<string> {
   const override = (process.env.MARKET_REGIME ?? '').toUpperCase();
   if (override && override !== 'AUTO') return override;
   const fg = await getFearGreed();
-  if (fg < 13) return 'EXTREME_FEAR';
-  if (fg < 45) return 'FEAR';
-  if (fg < 60) return 'NEUTRAL';
-  if (fg < 80) return 'BULL';
+  if (fg < 10)  return 'EXTREME_FEAR';
+  if (fg < 20)  return 'DEEP_FEAR';   // micro-scalping: TP 10-12%, trail 2%
+  if (fg < 45)  return 'FEAR';
+  if (fg < 60)  return 'NEUTRAL';
+  if (fg < 80)  return 'BULL';
   return 'EUPHORIA';
 }
 
@@ -439,21 +442,21 @@ const RAYDIUM_MIN_LIQUIDITY_USD = 12000; // 23.06.26: hardcoded 12k (VPS intent;
 // Max liquidity — avoid large-cap tokens (slow movers)
 // T2 ($80k+) has 0% win rate across 79-trade audit — default excludes T2/T3.
 // Override in .env: RAYDIUM_MAX_LIQUIDITY_USD=250000 to allow T2 after backtesting.
-const RAYDIUM_MAX_LIQUIDITY_USD = 120000; // 23.06.26: raised from 80k → 120k (GTAVI $106k had momentum)
+const RAYDIUM_MAX_LIQUIDITY_USD = Number(process.env.RAYDIUM_MAX_LIQUIDITY_USD || '60000'); // 01.07.26: T2 0% WR → $60k cap
 // No separate vol1h floor — Gate 4 vol/liq ratio check is the real stale-pool filter
 const RAYDIUM_MIN_VOLUME_H1_USD = Number(process.env.RAYDIUM_MIN_VOLUME_H1_USD || '0');
-// Min 1h price change — real pump.fun winners show 0.5-20% in 1h at optimal entry
-const RAYDIUM_MIN_PC1H = Number(process.env.RAYDIUM_MIN_PC1H || '1');
+// Min 1h price change — organic growth signal
+const RAYDIUM_MIN_PC1H = Number(process.env.RAYDIUM_MIN_PC1H || '3');   // 01.07.26: 1→3
 // Max 1h price change — tokens up >45% in 1h are near blow-off top, late entry
 const RAYDIUM_MAX_PC1H = Number(process.env.RAYDIUM_MAX_PC1H || '45');
 // Min 5m price change — require active momentum RIGHT NOW (key entry signal)
-const RAYDIUM_MIN_PC5M = Number(process.env.RAYDIUM_MIN_PC5M || '1.5');
-// Max token age — 48h: memecoins that haven't pumped in 2 days are usually dead
-const RAYDIUM_MAX_AGE_SEC = 43200; // 23.06.26: hardcoded 12h (was 48h default; env baked 6h)
+const RAYDIUM_MIN_PC5M = Number(process.env.RAYDIUM_MIN_PC5M || '2');   // 01.07.26: 1.5→2
+// Max token age — memecoins older than 6h rarely pump again (01.07.26: 12h→6h)
+const RAYDIUM_MAX_AGE_SEC = Number(process.env.RAYDIUM_MAX_AGE_SEC || '21600'); // 6 hours
 // Min token age — 30min prevents buying in the first minutes of Raydium launch
 const RAYDIUM_MIN_AGE_SEC = Number(process.env.RAYDIUM_MIN_AGE_SEC || '1800');
-// Min vol/liq ratio — 8% hourly turnover (from analysis: winners avg vol/mcap=6.5x in 24h)
-const RAYDIUM_MIN_VOL_LIQ_RATIO = Number(process.env.RAYDIUM_MIN_VOL_LIQ_RATIO || '0.08');
+// Min vol/liq ratio — 25% hourly turnover = active pool (01.07.26: 8%→25% — volume divergence guard)
+const RAYDIUM_MIN_VOL_LIQ_RATIO = Number(process.env.RAYDIUM_MIN_VOL_LIQ_RATIO || '0.25');
 // Max buy/sell ratio — >3.5x = likely wash trading or pump already completed.
 // From analysis: Gaejuki 5.82x B/S + price -76% = pump&dump. RESERVE 5.7x → distribution next hour.
 // Healthy accumulation: 1.2-1.8x (Merlin 1.26x +899%, trelon 1.23x +871%, Trilly 1.49x +559%).
@@ -486,61 +489,56 @@ export function getLiqTier(liqUsd: number, regime = 'NEUTRAL'): LiqTier {
   // Breakeven stop: fires in scheduler when sell_stage_reached >= 1 (stop moved to entry)
   // earlyTrailPct: fires BEFORE TP1 when peak drops earlyTrailPct% AND trail > entry × 1.04
   const r = regime.toUpperCase();
-  const isFear = r === 'FEAR' || r === 'EXTREME_FEAR';
+  const isDeepFear = r === 'DEEP_FEAR';  // F&G 10-20: micro-scalping mode
+  const isFear = r === 'FEAR' || r === 'DEEP_FEAR';
   const isBull = r === 'BULL' || r === 'EUPHORIA';
 
   // T1: pump.fun graduates ($12k–$80k liq) — volatile, fast movers
-  // FEAR: 3-stage — TP1 takes 60% at +15% to lock majority. After TP1 stop→entry (breakeven).
-  //   TP1: 60% at 1.15x → lock big win immediately
-  //   TP2: 50% of remaining (=20% original) at 1.45x → bonus
-  //   TP3: 100% of remaining (=20% original) at 2.00x → moon bag
+  // DEEP_FEAR: micro-scalping — TP1 at 10% (grab micro-impulse), trail 2% from peak
+  // FEAR: 3-stage — TP1 takes 60% at +22% to lock majority.
   if (liqUsd <= 80000) return {
     tier: 1, label: 't1',
     timeLimitSec: 0,
-    stopPct: isFear ? 0.08 : 0.07,
-    trailPct: isFear ? 0.15 : 0.18,
-    earlyTrailPct: isFear ? 0.035 : 0.045,
+    stopPct: isDeepFear ? 0.07 : isFear ? 0.08 : 0.07,
+    trailPct: isDeepFear ? 0.10 : isFear ? 0.15 : 0.18,
+    earlyTrailPct: isDeepFear ? 0.02 : isFear ? 0.035 : 0.045,
     sellStages: [
-      // FEAR TP1 raised 1.15→1.22: avg win on T1 FEAR = 1.22x, 1.15 fires too early on noise
-      { stage: 1, multiplier: isBull ? 1.15 : isFear ? 1.22 : 1.12, sellPct: isFear ? 60 : 20 },
-      { stage: 2, multiplier: isBull ? 1.35 : isFear ? 1.48 : 1.28, sellPct: isFear ? 50 : 25 },
-      { stage: 3, multiplier: isBull ? 1.65 : isFear ? 2.00 : 1.55, sellPct: isFear ? 100 : 33 },
-      { stage: 4, multiplier: isBull ? 2.30 : isFear ? 999  : 2.00, sellPct: 50 },
+      { stage: 1, multiplier: isBull ? 1.15 : isDeepFear ? 1.10 : isFear ? 1.22 : 1.12, sellPct: isFear ? 60 : 20 },
+      { stage: 2, multiplier: isBull ? 1.35 : isDeepFear ? 1.22 : isFear ? 1.48 : 1.28, sellPct: isFear ? 50 : 25 },
+      { stage: 3, multiplier: isBull ? 1.65 : isDeepFear ? 1.50 : isFear ? 2.00 : 1.55, sellPct: isFear ? 100 : 33 },
+      { stage: 4, multiplier: isBull ? 2.30 : isFear ? 999 : 2.00, sellPct: 50 },
       { stage: 5, multiplier: 999, sellPct: 100 },
     ],
   };
 
-  // T2: small-cap memecoins ($80k–$250k liq) — steadier movers
-  // FEAR: same 3-stage approach with tighter targets (higher liq = harder to pump)
+  // T2: small-cap memecoins ($80k–$250k liq) — steadier movers (disabled: 0% win rate)
   if (liqUsd <= 250000) return {
     tier: 2, label: 't2',
     timeLimitSec: 0,
-    stopPct: isFear ? 0.07 : 0.06,
+    stopPct: isDeepFear ? 0.06 : isFear ? 0.07 : 0.06,
     trailPct: 0.15,
-    earlyTrailPct: isFear ? 0.03 : 0.04,
+    earlyTrailPct: isDeepFear ? 0.02 : isFear ? 0.03 : 0.04,
     sellStages: [
-      // FEAR TP1 raised 1.12→1.20: T2 avg win = 1.25x (when profitable), 1.12 fired too soon
-      { stage: 1, multiplier: isBull ? 1.12 : isFear ? 1.20 : 1.10, sellPct: isFear ? 60 : 20 },
-      { stage: 2, multiplier: isBull ? 1.30 : isFear ? 1.38 : 1.23, sellPct: isFear ? 50 : 25 },
-      { stage: 3, multiplier: isBull ? 1.55 : isFear ? 1.65 : 1.46, sellPct: isFear ? 100 : 33 },
-      { stage: 4, multiplier: isBull ? 2.10 : isFear ? 999  : 1.85, sellPct: 50 },
+      { stage: 1, multiplier: isBull ? 1.12 : isDeepFear ? 1.08 : isFear ? 1.20 : 1.10, sellPct: isFear ? 60 : 20 },
+      { stage: 2, multiplier: isBull ? 1.30 : isDeepFear ? 1.18 : isFear ? 1.38 : 1.23, sellPct: isFear ? 50 : 25 },
+      { stage: 3, multiplier: isBull ? 1.55 : isDeepFear ? 1.40 : isFear ? 1.65 : 1.46, sellPct: isFear ? 100 : 33 },
+      { stage: 4, multiplier: isBull ? 2.10 : isFear ? 999 : 1.85, sellPct: 50 },
       { stage: 5, multiplier: 999, sellPct: 100 },
     ],
   };
 
   // T3: mid-cap tokens ($250k+ liq) — slower, more predictable
-  // FEAR: 3-stage with conservative targets
   return {
     tier: 3, label: 't3',
     timeLimitSec: 0,
     stopPct: isFear ? 0.06 : 0.05,
     trailPct: 0.12,
-    earlyTrailPct: isFear ? 0.025 : 0.035,
+    earlyTrailPct: isDeepFear ? 0.02 : isFear ? 0.025 : 0.035,
     sellStages: [
-      { stage: 1, multiplier: isBull ? 1.10 : isFear ? 1.10 : 1.08, sellPct: isFear ? 60 : 20 },
-      { stage: 2, multiplier: isBull ? 1.22 : isFear ? 1.25 : 1.18, sellPct: isFear ? 50 : 25 },
-      { stage: 3, multiplier: isBull ? 1.40 : isFear ? 1.50 : 1.33, sellPct: isFear ? 100 : 33 },
-      { stage: 4, multiplier: isBull ? 1.80 : isFear ? 999  : 1.65, sellPct: 50 },
+      { stage: 1, multiplier: isBull ? 1.10 : isDeepFear ? 1.08 : isFear ? 1.10 : 1.08, sellPct: isFear ? 60 : 20 },
+      { stage: 2, multiplier: isBull ? 1.22 : isDeepFear ? 1.15 : isFear ? 1.25 : 1.18, sellPct: isFear ? 50 : 25 },
+      { stage: 3, multiplier: isBull ? 1.40 : isDeepFear ? 1.35 : isFear ? 1.50 : 1.33, sellPct: isFear ? 100 : 33 },
+      { stage: 4, multiplier: isBull ? 1.80 : isFear ? 999 : 1.65, sellPct: 50 },
       { stage: 5, multiplier: 999, sellPct: 100 },
     ],
   };
@@ -614,6 +612,7 @@ const RAYDIUM_SCAN_INTERVAL_MS = 120_000;
 // Birdeye Source 5 backoff — skip for 60min after 3 consecutive API errors (quota/400)
 let birdeyeFailCount = 0;
 let birdeyeBackoffUntil = 0;
+let _geckoLastCallMs = 0;
 
 // ─── Fetch pairs from multiple sources ────────────────────────────────────────
 // Sources ordered by signal quality (most actionable first):
@@ -757,7 +756,7 @@ async function fetchRaydiumPairs(): Promise<any[]> {
   // Source 4: DexScreener search queries — fresh active Solana tokens right now
   // PumpSwap and graduation-focused queries to catch recently graduated pump.fun tokens.
   // Avoid narrative keywords (dog/cat/pepe) — those return ancient established tokens.
-  const SEARCH_QUERIES = ['pumpswap sol', 'pump graduate', 'new raydium sol', 'sol gem new', 'raydium launch', 'sol meme new', 'pumpswap new', 'sol new token'];
+  const SEARCH_QUERIES = ['pumpswap sol', 'pump graduate', 'new raydium sol', 'sol gem new', 'raydium launch', 'sol meme new', 'pumpswap new', 'sol new token', 'meteora sol new', 'orca new sol'];
   for (const q of SEARCH_QUERIES) {
     try {
       const sr = await axios.get(
@@ -911,6 +910,33 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     console.debug(`[raydium-scan] DS new-pairs Source7 error: ${e.message?.slice(0, 40)}`);
   }
 
+  // Source 8: GeckoTerminal trending_pools — currently viral Solana pools.
+  // No proxy needed (unlike Source 6 new_pools). Returns pools gaining momentum NOW.
+  // Cooldown: shared with Source 6 gecko timer — at most once per 5 min.
+  if (Date.now() - _geckoLastCallMs > 5 * 60_000) {
+    _geckoLastCallMs = Date.now();
+    try {
+      const trendR = await axios.get(
+        `${GECKO_BASE}/networks/solana/trending_pools`,
+        { headers: GECKO_HEADERS, timeout: 7_000 }
+      );
+      const trendPools: any[] = trendR.data?.data ?? [];
+      let gTrendAdded = 0;
+      for (const pool of trendPools) {
+        const pair = geckoPoolToPair(pool);
+        if (!pair) continue;
+        const mint = pair.baseToken?.address;
+        if (!mint || seen.has(mint)) continue;
+        seen.add(mint);
+        results.push(pair);
+        gTrendAdded++;
+      }
+      if (gTrendAdded > 0) console.debug(`[raydium-scan] GeckoTerminal trending_pools: ${gTrendAdded} viral Solana pairs`);
+    } catch (e: any) {
+      console.debug(`[raydium-scan] GeckoTerminal trending error: ${e.message?.slice(0, 40)}`);
+    }
+  }
+
   const dxCount = results.length - raydiumDexCount;
   console.debug(`[raydium-scan] total: ${results.length} unique candidates (${raydiumDexCount} raydium-dex + ${dxCount} dx)`);
   return results;
@@ -924,12 +950,16 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
   lastRaydiumScan = now;
 
   // ── Market Regime Gate ──────────────────────────────────────────────────────
-  // EXTREME_FEAR (F&G < 13): true capitulation/black swan — pause all buys.
-  // F&G 13-45 = FEAR = contrarian buy zone (user strategy: buy on fear).
+  // EXTREME_FEAR (F&G < 10): true capitulation/black swan — pause all buys.
+  // DEEP_FEAR   (F&G 10-20): micro-scalping mode — tight TP 10%, trail 2%.
+  // FEAR        (F&G 20-45): contrarian buy zone — TP 22%, trail 3.5%.
   const regime = await getMarketRegime();
   if (regime === 'EXTREME_FEAR') {
-    console.info(`[raydium-scan] 🚫 EXTREME_FEAR market (F&G=${cachedFearGreed} < 13) — pausing buys. Existing positions monitored.`);
+    console.info(`[raydium-scan] 🚫 EXTREME_FEAR market (F&G=${cachedFearGreed} < 10) — pausing buys. Existing positions monitored.`);
     return;
+  }
+  if (regime === 'DEEP_FEAR') {
+    console.info(`[raydium-scan] 🎯 DEEP_FEAR micro-scalp mode (F&G=${cachedFearGreed} 10-20) — buying with tight TP 10%, trail 2%.`);
   }
 
   // No FEAR override — RAYDIUM_MIN_PC1H env var controls threshold in all regimes.

@@ -261,11 +261,18 @@ async function parseTransactionDebounced(signature: string, mint: string, isBuy:
   const state = tokenStates.get(mint);
   if (!state) return;
   try {
-    const connection = new Connection(HELIUS_RPC, 'confirmed');
-    const tx = await connection.getParsedTransaction(signature, {
-      maxSupportedTransactionVersion: 0,
-      commitment: 'confirmed',
-    });
+    // RPC fallback chain: Helius primary → Shyft backup (SHYFT_RPC_KEY in .env)
+    const rpcList = [HELIUS_RPC];
+    const shyftKey = process.env.SHYFT_RPC_KEY;
+    if (shyftKey) rpcList.push(`https://rpc.shyft.to?api_key=${shyftKey}`);
+    let tx: Awaited<ReturnType<Connection['getParsedTransaction']>> = null;
+    for (const rpcUrl of rpcList) {
+      try {
+        const conn = new Connection(rpcUrl, 'confirmed');
+        tx = await conn.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
+        if (tx?.meta) break;
+      } catch { /* try next RPC */ }
+    }
     if (!tx?.meta) return;
     const buyer = (tx.transaction.message as any).accountKeys?.[0]?.pubkey?.toBase58?.() as string | undefined;
     if (!buyer) return;
@@ -285,6 +292,43 @@ async function parseTransactionDebounced(signature: string, mint: string, isBuy:
       console.debug(`[bonding-smart] 👁️ Trade: ${state.symbol} | ${isBuy ? 'BUY' : 'SELL'} ${solAmount.toFixed(3)} SOL | ${buyer.slice(0, 6)}`);
     }
   } catch { /* rate limit / network error — fail silently */ }
+}
+
+// ─── Auto SM wallet collector (v10) ──────────────────────────────────────────
+// Called at TP1. Saves early buyers of winning tokens to smart_money_wallets.
+// Self-bootstrapping: each win grows the SM list automatically.
+async function collectWinnersAsSmartMoney(mint: string, symbol: string): Promise<void> {
+  const state = tokenStates.get(mint);
+  const pos = activePositions.get(mint);
+  if (!state || !pos || state.events.length === 0) return;
+  // Early buyers in first 5 min after our entry = smart money by definition
+  const earlyWindow = pos.boughtAt + 5 * 60_000;
+  const earlyBuyers = [...new Set(
+    state.events
+      .filter(e => e.isBuy && e.buyer && e.buyer !== 'curve' && e.ts <= earlyWindow)
+      .map(e => e.buyer),
+  )];
+  if (earlyBuyers.length === 0) {
+    console.debug(`[bonding-smart] 🧠 Auto-SM: no early buyers for ${symbol} (Anchor decoder active?)`);
+    return;
+  }
+  let added = 0;
+  const notes = `${symbol} TP1 ${new Date().toISOString().slice(0, 10)}`;
+  for (const wallet of earlyBuyers) {
+    try {
+      await query(
+        `INSERT INTO smart_money_wallets (wallet_address, chain, network, label, source, active, notes)
+         VALUES ($1, 'SOLANA', 'solana', 'auto_winner', 'bonding_smart_tp1', true, $2)
+         ON CONFLICT (chain, wallet_address) DO UPDATE SET
+           reliability_weight = COALESCE(reliability_weight, 1.0) + 0.2,
+           active = true,
+           notes = COALESCE(smart_money_wallets.notes || ', ', '') || $2`,
+        [wallet, notes],
+      );
+      if (!smartMoneySet.has(wallet)) { smartMoneySet.add(wallet); added++; }
+    } catch { /* column not exist yet — silent */ }
+  }
+  console.info(`[bonding-smart] 🧠 Auto-SM: ${symbol} TP1 → ${added} new SM wallets (total: ${smartMoneySet.size})`);
 }
 
 // ─── Helius WS connection ─────────────────────────────────────────────────────
@@ -512,6 +556,15 @@ async function doBuy(state: TokenState, context: string): Promise<void> {
         stage1Done: false, stage2Done: false, lastVolumeSol: 0, pool: 'pump', dryRun: true,
       });
       dailySpent += BUY_SOL;
+      // Save to shadow_trades for WR tracking (v10b)
+      query(
+        `INSERT INTO shadow_trades
+           (chain, strategy, symbol, contract_address, entry_price, entry_mcap_usd,
+            filter_params, tp1_target, stop_pct, status)
+         VALUES ('SOLANA','bonding-smart',$1,$2,$3,$4,$5,$6,$7,'open')`,
+        [state.symbol, state.mint, entryPrice, state.vSol * 2,
+         JSON.stringify({ context, devBuy: state.devSolInvested, vSol: state.vSol }), 1.25, 8],
+      ).catch(() => {});
       subscribeBondingCurve(state.mint);
       subscribeTokenLogs(state.mint);
       return;
@@ -553,7 +606,22 @@ async function doSell(mint: string, symbol: string, pct: number, reason: string,
   if (pos?.dryRun) {
     const mult = pos.peakPrice > 0 ? (pos.peakPrice / pos.entryPrice) : 1;
     console.info(`[bonding-smart] 🔵 DRY SELL ${pct}% ${symbol} — ${reason} (peak ${mult.toFixed(2)}x)`);
-    if (pct === 100) { unsubscribeBondingCurve(mint); unsubscribeTokenLogs(mint); }
+    // Auto-collect early buyers of winning tokens as SM candidates (v10)
+    if (pct === 50 && mult >= 1.20) {
+      collectWinnersAsSmartMoney(mint, symbol).catch(() => {});
+    }
+    if (pct === 100) {
+      // Update shadow_trades on full close (v10b)
+      const isWin = mult >= 1.20;
+      query(
+        `UPDATE shadow_trades SET
+           status = $1, outcome_pct = $2, outcome_price = entry_price * $3, outcome_at = NOW()
+         WHERE contract_address = $4 AND strategy = 'bonding-smart' AND status = 'open'`,
+        [isWin ? 'win' : 'stopped', ((mult - 1) * 100).toFixed(4), mult, mint],
+      ).catch(() => {});
+      unsubscribeBondingCurve(mint);
+      unsubscribeTokenLogs(mint);
+    }
     return;
   }
   const walletPk = process.env.WALLET_PRIVATE_KEY;
