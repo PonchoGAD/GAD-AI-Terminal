@@ -309,6 +309,75 @@ async function fetchDexScreenerFresh(): Promise<BaseToken[]> {
   return tokens;
 }
 
+// ─── Clanker API ─────────────────────────────────────────────────────────────
+// Clanker is the dominant Farcaster-based meme launchpad on Base.
+// Their public API returns new launches earlier than DexScreener (5-15 min head start).
+// We fetch CAs, then enrich with DexScreener pair data (price/liq/volume).
+let _clankerLastMs = 0;
+const CLANKER_COOLDOWN_MS = 2 * 60 * 1000; // 2 min between Clanker API calls
+
+async function fetchClankerApi(): Promise<BaseToken[]> {
+  const now = Date.now();
+  if (now - _clankerLastMs < CLANKER_COOLDOWN_MS) return [];
+  _clankerLastMs = now;
+
+  const tokens: BaseToken[] = [];
+  try {
+    const r = await axios.get(
+      'https://www.clanker.world/api/tokens?sort=desc&page=1&limit=20',
+      { timeout: 8000, headers: { 'Accept': 'application/json' } },
+    );
+    const items: any[] = Array.isArray(r.data?.data) ? r.data.data
+                        : Array.isArray(r.data)      ? r.data : [];
+    if (!items.length) return [];
+
+    // Only look at last 48h to avoid re-processing established Clanker tokens
+    const cutoffMs = Date.now() - 48 * 60 * 60 * 1000;
+    const recent = items.filter((t: any) => {
+      const ts = t.created_at ? new Date(t.created_at).getTime() : Date.now();
+      return ts > cutoffMs;
+    });
+    if (!recent.length) return [];
+    console.debug(`[base-scan] Clanker: ${recent.length}/${items.length} tokens within 48h`);
+
+    for (const item of recent.slice(0, 10)) { // max 10 DexScreener calls per cycle
+      const ca = (item.contract_address ?? item.tokenAddress ?? item.address)?.toLowerCase();
+      if (!ca || recentScanned.has(ca)) continue;
+
+      let token: BaseToken | null = null;
+
+      // Prefer pool endpoint — fetches the exact pair (avoids USDC pair ambiguity)
+      const poolAddr = item.pool_address ?? item.poolAddress ?? item.pair_address;
+      if (poolAddr) {
+        try {
+          const pr = await axios.get(
+            `https://api.dexscreener.com/latest/dex/pairs/base/${poolAddr}`,
+            { timeout: 5000 },
+          );
+          const pair = pr.data?.pair ?? pr.data?.pairs?.[0];
+          if (pair) token = mapDexPair(pair);
+        } catch { }
+      }
+
+      // Fallback: token endpoint with ETH pair preference
+      if (!token) token = await fetchPairData(ca);
+      if (!token) continue;
+
+      // DexScreener may not know the pair age yet for very new launches.
+      // Use Clanker's created_at as authoritative age source in that case.
+      if (token.age_sec >= 999999 && item.created_at) {
+        token.age_sec = Math.max(0, (Date.now() - new Date(item.created_at).getTime()) / 1000);
+      }
+
+      tokens.push(token);
+    }
+    if (tokens.length > 0) console.debug(`[base-scan] Clanker enriched: ${tokens.length} tokens`);
+  } catch (e: any) {
+    console.warn(`[base-scan] Clanker API error: ${(e as any).message?.slice(0, 60)}`);
+  }
+  return tokens;
+}
+
 // DEX IDs we can actually trade on Base.
 // V4: tokens listed as 'uniswap-v4-base' can be bought via Aerodrome fallback
 // (quotes.ts tries V3 → V2 → Aerodrome; Aerodrome handles V4 tokens without native pool)
@@ -362,12 +431,15 @@ export async function loadBaseRecentBuys(): Promise<void> {
 }
 
 export async function runScanCycle(): Promise<BaseToken[]> {
-  const [dex, gecko, fresh] = await Promise.all([fetchDexScreener(), fetchGeckoTerminal(), fetchDexScreenerFresh()]);
-  const all = dedupeByAddress([...dex, ...gecko, ...fresh]);
+  const [dex, gecko, fresh, clanker] = await Promise.all([
+    fetchDexScreener(), fetchGeckoTerminal(), fetchDexScreenerFresh(), fetchClankerApi(),
+  ]);
+  const all = dedupeByAddress([...dex, ...gecko, ...fresh, ...clanker]);
 
-  const geckoNote = gecko.length > 0 ? ` + ${gecko.length} Gecko` : '';
-  const freshNote = fresh.length > 0 ? ` + ${fresh.length} DexFresh` : '';
-  console.info(`[base-scan] ${all.length} candidates from ${dex.length} DexScreener${geckoNote}${freshNote}`);
+  const geckoNote   = gecko.length   > 0 ? ` + ${gecko.length} Gecko`   : '';
+  const freshNote   = fresh.length   > 0 ? ` + ${fresh.length} DexFresh` : '';
+  const clankerNote = clanker.length > 0 ? ` + ${clanker.length} Clanker` : '';
+  console.info(`[base-scan] ${all.length} candidates from ${dex.length} DexScreener${geckoNote}${freshNote}${clankerNote}`);
 
   const passed: BaseToken[] = [];
 

@@ -1,4 +1,5 @@
 import express from 'express';
+import { ethers } from 'ethers';
 import { query } from '@lib/db';
 import { getEthBalance, buyToken, getTokenBalance } from '@lib/base';
 import { runScanCycle, loadBaseRecentBuys, BaseToken } from './scanner';
@@ -201,7 +202,10 @@ export async function handleNewToken(token: BaseToken): Promise<void> {
 
   // Virtual Swap Simulator: simulate buy→sell round-trip via V2 router getAmountsOut
   // Catches tax honeypots that pass static API checks (can buy but >15% loss on sell)
-  const swapSim = await simulateEvmSwap(getProvider(), token.contract_address, 8453).catch(() => null);
+  const swapSim = await simulateEvmSwap(
+    getProvider(), token.contract_address, 8453,
+    ethers.parseEther(BUY_ETH.toString()), // simulate with actual trade size, not default 0.001
+  ).catch(() => null);
   if (swapSim && !swapSim.canSwap) {
     buyFailBlacklist.set(token.contract_address, Date.now() + BUY_FAIL_COOLDOWN_MS);
     console.warn(`[base-scanner] 🔬 SWAP_SIM blocked ${token.symbol}: ${swapSim.reason}`);

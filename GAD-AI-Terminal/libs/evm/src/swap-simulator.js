@@ -19,13 +19,13 @@ exports.simulateEvmSwap = simulateEvmSwap;
  *   Base: Uniswap V2 router (0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24)
  *   BSC:  PancakeSwap V2   (0x10ED43C718714eb63d5aA57B78B54704E256024E)
  *
- * Max total round-trip tax allowed: MAX_TOTAL_TAX_PCT (default 15%)
+ * Max total round-trip tax allowed: MAX_TOTAL_TAX_PCT (default 10%)
  */
 const ethers_1 = require("ethers");
 const V2_ROUTER_ABI = [
     'function getAmountsOut(uint amountIn, address[] path) public view returns (uint[] memory amounts)',
 ];
-const MAX_TOTAL_TAX_PCT = 15.0;
+const MAX_TOTAL_TAX_PCT = 10.0; // 15→10: catches hidden 10-15% taxes before GoPlus indexes them
 // Network presets — set routerAddress + wethAddress for each chain
 exports.CHAIN_CONFIG = {
     // Base mainnet
