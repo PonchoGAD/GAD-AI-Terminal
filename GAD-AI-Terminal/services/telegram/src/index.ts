@@ -247,6 +247,8 @@ bot.onText(/\/help/, (msg) => {
     `*Polymarket (prediction market):*\n` +
     `/polystatus — bot status & win rate\n` +
     `/polymarkets — top markets by signal\n\n` +
+    `*W3 PumpFun Sniper:*\n` +
+    `/w3stats — 12h shadow-mode results\n\n` +
     `💎 *PRO ($100/mo) — extra:*\n` +
     `/bot — Solana bot PnL & open positions\n` +
     `/autobuy list|add|stop — manage autobuy\n` +
@@ -1002,30 +1004,36 @@ bot.onText(/^\/alerts(@\w+)?$/, (msg) => guard(msg.chat.id, async () => {
 
 // Trend engine background worker (every 15 min)
 let trendWorkerRunning = false;
+let lastTrendAlertAt = 0; // cooldown: max 1 admin alert per 6h
 const TREND_INTERVAL_MS = 15 * 60 * 1000;
+const TREND_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 setInterval(async () => {
   if (trendWorkerRunning) return;
   trendWorkerRunning = true;
   try {
     const clusters = await runTrendCycle(false); // don't auto-generate ideas
-    // Send alert to admin if top cluster score > 75
+    // Send alert to admin if top cluster score > 75 — but at most once per 6h to avoid spam
     if (ADMIN_ID && clusters.length && clusters[0].final_score >= 75) {
-      const c = clusters[0];
-      const text =
-        `🔥 *New Meme Opportunity*\n\n` +
-        `*Trend:* ${c.main_title}\n\n` +
-        `*Score:* Trend: ${c.trend_score.toFixed(0)}/100 | Meme: ${c.meme_score.toFixed(0)}/100 | Risk: ${c.risk_score.toFixed(0)}/100\n\n` +
-        `*Sources:* ${(c.sources ?? []).join(', ')}\n` +
-        `*Mentions:* ${c.total_mentions}\n\n` +
-        `_Use /idea ${c.id} to generate coin ideas_`;
-      bot.sendMessage(Number(ADMIN_ID), text, {
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [[
-            { text: '🧠 Generate Ideas', callback_data: `gen_ideas:${c.id}` },
-          ]],
-        },
-      }).catch(() => {});
+      const now = Date.now();
+      if (now - lastTrendAlertAt >= TREND_ALERT_COOLDOWN_MS) {
+        lastTrendAlertAt = now;
+        const c = clusters[0];
+        const text =
+          `🔥 *New Meme Opportunity*\n\n` +
+          `*Trend:* ${c.main_title}\n\n` +
+          `*Score:* Trend: ${c.trend_score.toFixed(0)}/100 | Meme: ${c.meme_score.toFixed(0)}/100 | Risk: ${c.risk_score.toFixed(0)}/100\n\n` +
+          `*Sources:* ${(c.sources ?? []).join(', ')}\n` +
+          `*Mentions:* ${c.total_mentions}\n\n` +
+          `_Use /idea ${c.id} to generate coin ideas_`;
+        bot.sendMessage(Number(ADMIN_ID), text, {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '🧠 Generate Ideas', callback_data: `gen_ideas:${c.id}` },
+            ]],
+          },
+        }).catch(() => {});
+      }
     }
   } catch (e: any) {
     log('error', '[trend-worker]', e.message);
@@ -2110,6 +2118,69 @@ bot.onText(/\/polymarkets/, async (msg) => {
     send(msg.chat.id, `🔮 *Top Polymarket Markets:*\n\n${lines.join('\n\n')}`);
   } catch(e: any) {
     send(msg.chat.id, `❌ ${e.message}`);
+  }
+});
+
+// /w3stats — Admin: W3 PumpFun sniper shadow-mode statistics
+bot.onText(/^\/w3stats(@\w+)?(\s+(\d+))?$/, async (msg, match) => {
+  if (String(msg.chat.id) !== String(ADMIN_ID)) return;
+  const hours = Number(match?.[3] ?? 12);
+  try {
+    const rows = await query<any>(
+      `SELECT outcome_pct, status, symbol, created_at, outcome_at,
+              filter_params->>'dev_buy_sol' AS dev_sol,
+              filter_params->>'buy_sol' AS buy_sol
+       FROM shadow_trades
+       WHERE strategy='w3-sniper'
+         AND created_at > NOW() - ($1 || ' hours')::INTERVAL
+       ORDER BY created_at DESC`,
+      [hours]
+    );
+    const all    = rows.rows;
+    const closed = all.filter((r: any) => r.status !== 'open');
+    const open   = all.filter((r: any) => r.status === 'open');
+    const wins   = closed.filter((r: any) => Number(r.outcome_pct ?? 0) >= 10);
+    const losses = closed.filter((r: any) => Number(r.outcome_pct ?? 0) < 0);
+    const flats  = closed.filter((r: any) => { const p = Number(r.outcome_pct ?? 0); return p >= 0 && p < 10; });
+
+    if (all.length === 0) {
+      send(msg.chat.id, `📊 W3 Sniper (${hours}h): no trades yet — shadow mode collecting data`);
+      return;
+    }
+
+    const avgWin  = wins.length  ? wins.reduce((s: number, r: any)  => s + Number(r.outcome_pct), 0) / wins.length  : 0;
+    const avgLoss = losses.length ? losses.reduce((s: number, r: any) => s + Number(r.outcome_pct), 0) / losses.length : 0;
+    const wr      = closed.length ? wins.length / closed.length * 100 : 0;
+    const buySol  = Number(all[0]?.buy_sol ?? 0.02);
+    const ev      = wr / 100 * avgWin + (1 - wr / 100) * avgLoss;
+    const evSol   = ev / 100 * buySol;
+
+    const best  = closed.length ? closed.reduce((a: any, b: any) => Number(a.outcome_pct ?? -999) > Number(b.outcome_pct ?? -999) ? a : b) : null;
+    const worst = closed.length ? closed.reduce((a: any, b: any) => Number(a.outcome_pct ?? 999)  < Number(b.outcome_pct ?? 999)  ? a : b) : null;
+
+    const recent = closed.slice(0, 6).map((r: any) => {
+      const p = Number(r.outcome_pct ?? 0);
+      return `${p >= 10 ? '✅' : p >= 0 ? '➡️' : '❌'} ${r.symbol} ${p >= 0 ? '+' : ''}${p.toFixed(1)}%`;
+    });
+
+    const lines = [
+      `📊 *W3 Sniper — ${hours}h Shadow Report*`,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `Total: ${all.length} | Open: ${open.length} | Closed: ${closed.length}`,
+      `Wins (≥+10%): ${wins.length} | Flat: ${flats.length} | Loss: ${losses.length}`,
+      `Win rate: *${wr.toFixed(1)}%*`,
+      `Avg win: +${avgWin.toFixed(1)}% | Avg loss: ${avgLoss.toFixed(1)}%`,
+      `EV/trade: ${ev >= 0 ? '+' : ''}${ev.toFixed(1)}% (${evSol >= 0 ? '+' : ''}${evSol.toFixed(5)} SOL) ${ev > 0 ? '✅' : '❌'}`,
+      best  ? `Best:  ${best.symbol} +${Number(best.outcome_pct).toFixed(1)}%`  : '',
+      worst ? `Worst: ${worst.symbol} ${Number(worst.outcome_pct).toFixed(1)}%` : '',
+      recent.length ? `\n*Recent exits:*\n${recent.join('\n')}` : '',
+      open.length ? `\n*Open now:* ${open.map((r: any) => r.symbol).join(', ')}` : '',
+      `\n_Use /w3stats 24 for last 24h_`,
+    ].filter(Boolean);
+
+    send(msg.chat.id, lines.join('\n'));
+  } catch (e: any) {
+    send(msg.chat.id, `❌ W3 stats error: ${e.message}`);
   }
 });
 

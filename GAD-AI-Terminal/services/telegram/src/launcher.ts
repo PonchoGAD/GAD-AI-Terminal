@@ -30,8 +30,23 @@ const SOLANA_RPC     = process.env.SOLANA_RPC   ?? 'https://api.mainnet-beta.sol
 const PINATA_JWT     = process.env.PINATA_JWT    ?? '';
 const PINATA_GATEWAY = process.env.PINATA_GATEWAY ?? 'https://gateway.pinata.cloud/ipfs/';
 const BOT_TOKEN      = process.env.TELEGRAM_BOT_TOKEN ?? '';
+const CHANNEL_ID     = process.env.TELEGRAM_CHANNEL_ID ?? '@gadfamilytg';
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY ?? '';
 const HELIUS_API_KEY  = process.env.HELIUS_API_KEY ?? '';
+
+async function postLaunchToChannel(ticker: string, name: string, mintAddr: string, description: string): Promise<void> {
+  if (!BOT_TOKEN) return;
+  const msg =
+    `🚀 *$${ticker} — ${name}*\n\n` +
+    `${description.slice(0, 120)}${description.length > 120 ? '…' : ''}\n\n` +
+    `📌 CA: \`${mintAddr}\`\n` +
+    `🔗 [pump.fun](https://pump.fun/coin/${mintAddr})\n\n` +
+    `🤖 [@gadai\\_sol\\_bot](https://t.me/gadai_sol_bot) — /tokenscore for AI analysis\n` +
+    `💳 [gadai.shop](https://gadai.shop) — get access`;
+  await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+    chat_id: CHANNEL_ID, text: msg, parse_mode: 'Markdown', disable_web_page_preview: true,
+  }, { timeout: 5000 }).catch(() => {});
+}
 
 // Min holders threshold below which we auto-sell the dev position after 24h
 const MIN_HOLDERS_24H = Number(process.env.LAUNCH_MIN_HOLDERS_24H || '10');
@@ -738,6 +753,7 @@ export async function runAutoLaunchCycle(): Promise<void> {
       console.info(`[auto-launch] pump.fun: https://pump.fun/coin/${result.mintAddr}`);
       console.info(`[auto-launch] TX: ${result.createTx}`);
       console.info(`[auto-launch] Maintenance will check at 12h — sell if no buyers (holders < 2)`);
+      await postLaunchToChannel(coinIdea.ticker, coinIdea.name, result.mintAddr!, coinIdea.description);
     } else {
       console.warn(`[auto-launch] ❌ ${coinIdea.ticker} FAILED: ${result.error}`);
     }
