@@ -525,6 +525,21 @@ export async function runScanCycle(): Promise<BaseToken[]> {
       continue;
     }
 
+    // ⛽ Gas Reserve Safeguard — block buy if B1 ETH < buy_amount + 0.002 reserve for sells
+    const BASE_ETH_RESERVE = Number(process.env.BASE_ETH_RESERVE || '0.002');
+    const _ethWallet = process.env.BASE_WALLET_ADDRESS;
+    if (_ethWallet) {
+      try {
+        const { getProvider } = await import('@lib/base/src/provider');
+        const _ethRaw = await getProvider().getBalance(_ethWallet).catch(() => BigInt(Number.MAX_SAFE_INTEGER));
+        const _ethBal = Number(_ethRaw) / 1e18;
+        if (_ethBal - BUY_ETH < BASE_ETH_RESERVE) {
+          console.warn(`[base-scan] ⛽ GAS_RESERVE: ${_ethBal.toFixed(5)} ETH — need buy ${BUY_ETH}+reserve ${BASE_ETH_RESERVE}. Pausing scan.`);
+          return passed;
+        }
+      } catch { /* fail-open */ }
+    }
+
     // Shadow Mode: if BASE_AUTO_BUY=false, record what we would buy for P&L analysis
     const autoBuyEnabled = process.env.BASE_AUTO_BUY === 'true';
     if (!autoBuyEnabled) {

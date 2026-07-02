@@ -1259,6 +1259,18 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
         continue;
       }
 
+      // ⛽ Gas Reserve Safeguard — block buy if W1 SOL balance < buy + 0.005 reserve for sells
+      const SOL_GAS_RESERVE = Number(process.env.SOL_GAS_RESERVE || '0.005');
+      try {
+        const { PublicKey } = await import('@solana/web3.js');
+        const _lamports = await getConnection().getBalance(new PublicKey(walletAddress)).catch(() => Infinity);
+        const _walletSol = _lamports / 1e9;
+        if (_walletSol - AUTO_BUY_SOL < SOL_GAS_RESERVE) {
+          console.warn(`[raydium-scan] ⛽ GAS_RESERVE: wallet ${_walletSol.toFixed(4)} SOL — need >${(AUTO_BUY_SOL + SOL_GAS_RESERVE).toFixed(3)} SOL (buy+reserve). Halting buys.`);
+          break;
+        }
+      } catch { /* fail-open: proceed if balance check errors */ }
+
       await query(
         `INSERT INTO autobuy_jobs
            (mint_address, label, amount_sol, slippage_bps, interval_seconds,

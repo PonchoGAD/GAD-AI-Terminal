@@ -1,3 +1,4 @@
+import axios from 'axios';
 import { query } from '@lib/db';
 import { discoverTonTokens, checkJettonSafety, buyJetton, getTonBalance, getWalletAddress, TonToken, checkTonSmartMoney, checkTonHolderConcentration } from '@lib/ton';
 
@@ -106,7 +107,22 @@ export async function runTonScanCycle(): Promise<void> {
       const smTag = smWeight >= TON_SM_MIN_WEIGHT ? ` 🔥SM(w${smWeight})` : '';
 
       if (!AUTO_BUY) {
-        console.info(`${label} 📡 ${t.symbol} liq:$${t.liquidity_usd.toFixed(0)} pc1h:${t.price_change_1h.toFixed(1)}%${smTag} (dry-run — TON_AUTO_BUY=false)`);
+        console.info(`${label} 📡 ${t.symbol} liq:$${t.liquidity_usd.toFixed(0)} pc1h:${t.price_change_1h.toFixed(1)}%${smTag} (shadow — TON_AUTO_BUY=false)`);
+        // Record shadow trade for statistics — lets us evaluate strategy without real money
+        try {
+          await query(
+            `INSERT INTO shadow_trades
+               (chain, strategy, symbol, contract_address, entry_price, entry_mcap_usd, filter_params, tp1_target, stop_pct)
+             VALUES ('ton','ton_scan',$1,$2,$3,$4,$5,$6,$7)
+             ON CONFLICT DO NOTHING`,
+            [
+              t.symbol, addr,
+              t.price_ton, t.mcap_usd,
+              JSON.stringify({ liq: t.liquidity_usd, pc1h: t.price_change_1h, pc5m: t.price_change_5m, age_h: +(t.age_sec/3600).toFixed(1), sm: smWeight }),
+              35, 10,  // tp1_target=35% (=1.35x), stop_pct=10%
+            ]
+          );
+        } catch { /* non-fatal */ }
         continue;
       }
 
@@ -178,8 +194,79 @@ export async function runTonScanCycle(): Promise<void> {
   }
 }
 
+// ─── Shadow Trade Monitor ─────────────────────────────────────────────────────
+// TON shadow trades are INSERTED during scan but never CLOSED — bug fix.
+// DexScreener chainId for TON = 'ton'; priceNative = price in TON per token.
+async function monitorTonShadowTrades(): Promise<void> {
+  try {
+    const { rows: openTrades } = await query<{
+      id: number; symbol: string; contract_address: string;
+      entry_price: number; tp1_target: number; stop_pct: number; created_at: string;
+    }>(
+      `SELECT id, symbol, contract_address, entry_price, tp1_target, stop_pct, created_at
+       FROM shadow_trades
+       WHERE strategy = 'ton_scan' AND status = 'open'`
+    );
+    if (!openTrades.length) return;
+
+    for (const trade of openTrades) {
+      try {
+        const ageHours = (Date.now() - new Date(trade.created_at).getTime()) / 3_600_000;
+
+        // Time limit: 24h — close with last known price
+        if (ageHours >= 24) {
+          await query(
+            `UPDATE shadow_trades SET status='stopped', outcome_pct=0 WHERE id=$1`,
+            [trade.id]
+          );
+          console.info(`[ton-shadow] TIME_LIMIT ${trade.symbol} (24h)`);
+          continue;
+        }
+
+        // Fetch current TON price via DexScreener
+        const r = await axios.get(
+          `https://api.dexscreener.com/latest/dex/tokens/${trade.contract_address}`,
+          { timeout: 5_000 }
+        );
+        const tonPairs: any[] = (r.data?.pairs ?? []).filter((p: any) => p.chainId === 'ton');
+        if (!tonPairs.length) continue;
+
+        const bestPair = tonPairs.sort((a: any, b: any) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
+        const currentPrice = Number(bestPair.priceNative ?? 0);
+        if (!currentPrice || !trade.entry_price) continue;
+
+        const mult = currentPrice / trade.entry_price;
+        const outcomePct = (mult - 1) * 100;
+        const tpMult  = 1 + (trade.tp1_target  / 100);  // e.g. tp1_target=35 → 1.35x
+        const slMult  = 1 - (trade.stop_pct    / 100);  // e.g. stop_pct=10  → 0.90x
+
+        if (mult >= tpMult) {
+          await query(
+            `UPDATE shadow_trades SET status='tp1_hit', outcome_price=$1, outcome_pct=$2 WHERE id=$3`,
+            [currentPrice, outcomePct, trade.id]
+          );
+          console.info(`[ton-shadow] TP1 ${trade.symbol} +${outcomePct.toFixed(1)}% (${mult.toFixed(3)}x)`);
+        } else if (mult <= slMult) {
+          await query(
+            `UPDATE shadow_trades SET status='stopped', outcome_pct=$1 WHERE id=$2`,
+            [outcomePct, trade.id]
+          );
+          console.info(`[ton-shadow] SL ${trade.symbol} ${outcomePct.toFixed(1)}% (${mult.toFixed(3)}x)`);
+        }
+      } catch { /* fail-open per trade — skip and retry next cycle */ }
+    }
+  } catch (e: any) {
+    console.debug(`[ton-shadow] monitor error: ${e.message?.slice(0, 60)}`);
+  }
+}
+
 export function startTonScanner(): void {
   console.info(`[ton-scan] starting — AUTO_BUY:${AUTO_BUY} BUY:${BUY_TON}TON interval:${SCAN_INTERVAL/1000}s min_liq:$${MIN_LIQ} min_pc1h:${MIN_PC1H}%`);
   runTonScanCycle();
   setInterval(runTonScanCycle, SCAN_INTERVAL);
+  // Monitor shadow trades every 5 min — close TP/SL/TIME_LIMIT positions
+  setTimeout(() => {
+    monitorTonShadowTrades();
+    setInterval(monitorTonShadowTrades, 5 * 60 * 1000);
+  }, 30_000); // 30s delay on startup
 }

@@ -45,7 +45,7 @@ const SHADOW         = process.env.W3_SNIPER_SHADOW  !== 'false'; // DEFAULT: sh
 const BUY_SOL        = Number(process.env.W3_SNIPER_BUY_SOL        || '0.015');
 const MAX_POSITIONS  = Number(process.env.W3_SNIPER_MAX_POSITIONS   || '3');
 const DAILY_LIMIT    = Number(process.env.W3_SNIPER_DAILY_LIMIT     || '15');
-const MIN_DEV_SOL    = Number(process.env.W3_SNIPER_MIN_DEV_SOL     || '0.20');  // ↑ was 0.15
+const MIN_DEV_SOL    = Number(process.env.W3_SNIPER_MIN_DEV_SOL     || '0.30');  // ↑ was 0.20 (sliding scale: 0.3+socials OR 2.0+ bypass)
 const MIN_DEV_SCORE  = Number(process.env.W3_SNIPER_MIN_DEV_SCORE   || '40');   // dev reputation threshold
 const TIME_LIMIT_SEC = Number(process.env.W3_SNIPER_TIME_LIMIT_SEC  || '900');   // 15 min
 const STAGNATION_SEC = Number(process.env.W3_SNIPER_STAGNATION_SEC  || '180');   // final stagnation check
@@ -216,13 +216,20 @@ async function openPosition(msg: any): Promise<void> {
   }
 
   // Socials required: tokens with X/Telegram have community = less likely to die at 45s.
-  // Controlled by W3_SNIPER_REQUIRE_SOCIALS=false to disable in tests.
+  // Sliding scale: dev≥2.0 SOL → bypass socials (stealth launch — founder has real skin in game).
+  //                dev 0.3-2.0 SOL → socials required.
+  // Controlled by W3_SNIPER_REQUIRE_SOCIALS=false to disable entirely in tests.
   const REQUIRE_SOCIALS = process.env.W3_SNIPER_REQUIRE_SOCIALS !== 'false';
+  const HIGH_DEV_BYPASS_SOL = Number(process.env.W3_SNIPER_HIGH_DEV_BYPASS_SOL || '2.0');
   if (REQUIRE_SOCIALS) {
     const hasSocials = !!(msg.twitter || msg.telegram || msg.website);
-    if (!hasSocials) {
-      console.debug(`[w3-sniper] Skip ${symbol}: no socials (X/TG required — set W3_SNIPER_REQUIRE_SOCIALS=false to disable)`);
+    const highDevBypass = devSol >= HIGH_DEV_BYPASS_SOL;
+    if (!hasSocials && !highDevBypass) {
+      console.debug(`[w3-sniper] Skip ${symbol}: no socials & dev:${devSol.toFixed(2)}SOL < ${HIGH_DEV_BYPASS_SOL}SOL`);
       return;
+    }
+    if (!hasSocials && highDevBypass) {
+      console.info(`[w3-sniper] No socials BUT high-dev ${devSol.toFixed(2)} SOL — stealth launch`);
     }
   }
 

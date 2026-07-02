@@ -1,7 +1,7 @@
 # Base Network Scanner — Настройка и Состояние
 
 > Документ описывает текущую конфигурацию Base network автоботa.
-> Обновлено: **01.07.2026** — Price-unit fix, Clanker API, tax 15→10%, GoPlus JS fix
+> Обновлено: **02.07.2026** — Gas Reserve Safeguard (ETH 0.002 reserve), BASE_WALLET_ADDRESS env
 
 ---
 
@@ -29,7 +29,7 @@
 | `BASE_MAX_POSITIONS` | `2` (было 3) |
 | Сервис | `gad-ai-base-scanner`, port 4005 |
 | Статус | Работает 24/7, сканирует каждые 30с |
-| Gas reserve | `0.0004 ETH` (~$1.10) — фиксированный резерв на 2 TX |
+| Gas reserve | `0.002 ETH` — **Gas Reserve Safeguard** (02.07): покупка блокируется если баланс - buy < 0.002 ETH |
 
 ---
 
@@ -81,6 +81,10 @@ BASE_GOPLUS_MIN_AGE_SEC=1200  # GoPlus block для токенов < 20 мин �
 # Scan interval
 BASE_SCAN_INTERVAL_SEC=30     # сканирование каждые 30 секунд
 BASE_POLL_INTERVAL_MS=3000    # мониторинг позиций каждые 3 секунды
+
+# Gas Reserve Safeguard (02.07.2026)
+BASE_WALLET_ADDRESS=0x88704Df21Ac8bFb017ef37b42FC3BA7Ce80F61Bd  # B1 публичный адрес для balance check
+BASE_ETH_RESERVE=0.002        # минимум ETH для gas на продажу (покупка блокируется если баланс - buy < резерва)
 ```
 
 ---
