@@ -87,7 +87,7 @@ export async function runTonScanCycle(): Promise<void> {
       // Holder concentration check — rejects rug-setup wallets (top-5 > 45% supply)
       const holderCheck = await checkTonHolderConcentration(addr).catch(() => ({ ok: true, topHoldersShare: 0 }));
       if (!holderCheck.ok) {
-        console.info(`${label} 🚨 SKIP ${t.symbol} ${holderCheck.reason} (top5:${holderCheck.topHoldersShare.toFixed(1)}%)`);
+        console.info(`${label} 🚨 SKIP ${t.symbol} ${(holderCheck as any).reason ?? ''} (top5:${holderCheck.topHoldersShare.toFixed(1)}%)`);
         skipped.rug++;
         continue;
       }
@@ -108,20 +108,27 @@ export async function runTonScanCycle(): Promise<void> {
 
       if (!AUTO_BUY) {
         console.info(`${label} 📡 ${t.symbol} liq:$${t.liquidity_usd.toFixed(0)} pc1h:${t.price_change_1h.toFixed(1)}%${smTag} (shadow — TON_AUTO_BUY=false)`);
-        // Record shadow trade for statistics — lets us evaluate strategy without real money
+        // Record shadow trade for statistics — lets us evaluate strategy without real money.
+        // UNIT FIX (02.07.26): entry_price is now ALWAYS USD per readable token.
+        // Old mixed-unit rows (GT=TON, DS=quote-token) produced +622536% anomalies.
+        // price_unit marker lets the monitor reject legacy rows instead of computing garbage.
         try {
-          await query(
-            `INSERT INTO shadow_trades
-               (chain, strategy, symbol, contract_address, entry_price, entry_mcap_usd, filter_params, tp1_target, stop_pct)
-             VALUES ('ton','ton_scan',$1,$2,$3,$4,$5,$6,$7)
-             ON CONFLICT DO NOTHING`,
-            [
-              t.symbol, addr,
-              t.price_ton, t.mcap_usd,
-              JSON.stringify({ liq: t.liquidity_usd, pc1h: t.price_change_1h, pc5m: t.price_change_5m, age_h: +(t.age_sec/3600).toFixed(1), sm: smWeight }),
-              35, 10,  // tp1_target=35% (=1.35x), stop_pct=10%
-            ]
-          );
+          if (t.price_usd > 0) {
+            await query(
+              `INSERT INTO shadow_trades
+                 (chain, strategy, symbol, contract_address, entry_price, entry_mcap_usd, filter_params, tp1_target, stop_pct)
+               VALUES ('ton','ton_scan',$1,$2,$3,$4,$5,$6,$7)
+               ON CONFLICT DO NOTHING`,
+              [
+                t.symbol, addr,
+                t.price_usd, t.mcap_usd,
+                JSON.stringify({ liq: t.liquidity_usd, pc1h: t.price_change_1h, pc5m: t.price_change_5m, age_h: +(t.age_sec/3600).toFixed(1), sm: smWeight, price_unit: 'usd' }),
+                35, 10,  // tp1_target=35% (=1.35x), stop_pct=10%
+              ]
+            );
+          } else {
+            console.debug(`${label} shadow skip ${t.symbol} — no USD price from source`);
+          }
         } catch { /* non-fatal */ }
         continue;
       }
@@ -202,8 +209,9 @@ async function monitorTonShadowTrades(): Promise<void> {
     const { rows: openTrades } = await query<{
       id: number; symbol: string; contract_address: string;
       entry_price: number; tp1_target: number; stop_pct: number; created_at: string;
+      filter_params: any;
     }>(
-      `SELECT id, symbol, contract_address, entry_price, tp1_target, stop_pct, created_at
+      `SELECT id, symbol, contract_address, entry_price, tp1_target, stop_pct, created_at, filter_params
        FROM shadow_trades
        WHERE strategy = 'ton_scan' AND status = 'open'`
     );
@@ -211,6 +219,18 @@ async function monitorTonShadowTrades(): Promise<void> {
 
     for (const trade of openTrades) {
       try {
+        // UNIT GUARD (02.07.26): only rows marked price_unit='usd' have a trustworthy
+        // entry price. Legacy rows mixed TON/quote-token units → close as 'invalid'
+        // so they stop polluting win-rate statistics.
+        const fp = typeof trade.filter_params === 'string'
+          ? JSON.parse(trade.filter_params || '{}')
+          : (trade.filter_params ?? {});
+        if (fp.price_unit !== 'usd') {
+          await query(`UPDATE shadow_trades SET status='invalid', outcome_pct=NULL WHERE id=$1`, [trade.id]);
+          console.info(`[ton-shadow] INVALID ${trade.symbol} — legacy mixed-unit entry price, excluded from stats`);
+          continue;
+        }
+
         const ageHours = (Date.now() - new Date(trade.created_at).getTime()) / 3_600_000;
 
         // Time limit: 24h — close with last known price
@@ -232,10 +252,19 @@ async function monitorTonShadowTrades(): Promise<void> {
         if (!tonPairs.length) continue;
 
         const bestPair = tonPairs.sort((a: any, b: any) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
-        const currentPrice = Number(bestPair.priceNative ?? 0);
+        // priceUsd — same unit as entry_price (USD per readable token). Never priceNative:
+        // it's denominated in the pair's QUOTE token and caused the +622536% anomalies.
+        const currentPrice = Number(bestPair.priceUsd ?? 0);
         if (!currentPrice || !trade.entry_price) continue;
 
         const mult = currentPrice / trade.entry_price;
+        // Anomaly guard: >20x in <24h on TON = data error, not a real trade we'd catch.
+        // Real winners exit at TP1 (1.35x) anyway — a 20x cap can't hide legitimate wins.
+        if (mult > 20 || mult <= 0) {
+          await query(`UPDATE shadow_trades SET status='invalid', outcome_pct=NULL WHERE id=$1`, [trade.id]);
+          console.warn(`[ton-shadow] INVALID ${trade.symbol} — mult ${mult.toFixed(1)}x is a data anomaly`);
+          continue;
+        }
         const outcomePct = (mult - 1) * 100;
         const tpMult  = 1 + (trade.tp1_target  / 100);  // e.g. tp1_target=35 → 1.35x
         const slMult  = 1 - (trade.stop_pct    / 100);  // e.g. stop_pct=10  → 0.90x
