@@ -103,6 +103,8 @@ interface W3Position {
 const positions = new Map<string, W3Position>();
 let ws: WebSocket | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
+let heartbeatTimer: NodeJS.Timeout | null = null;
+let lastMessageTime = Date.now();
 let dailyBuyCount = 0;
 let lastDayReset  = new Date().toDateString();
 
@@ -339,8 +341,14 @@ async function checkPositions(): Promise<void> {
     const peakMult = pos.peak_price    / pos.entry_price_sol;
     let exitReason: string | null = null;
 
-    // ─── Stop loss -8% ───────────────────────────────────────────────────────
-    if (mult <= 1 - STOP_PCT) {
+    // ─── Rapid dump guard: if -3% within first 15s → exit at tiny loss ─────
+    // Catches rug-pulls and dev dumps before they compound into full stop-loss
+    if (ageSec < 15 && mult < 0.97) {
+      exitReason = `RAPID_DUMP_${((1 - mult) * 100).toFixed(1)}pct_${Math.round(ageSec)}s`;
+    }
+
+    // ─── Stop loss ───────────────────────────────────────────────────────────
+    else if (mult <= 1 - STOP_PCT) {
       exitReason = `STOP_LOSS_${((1 - mult) * 100).toFixed(1)}pct`;
     }
 
@@ -455,11 +463,28 @@ function connect(): void {
   conn.on('open', () => {
     console.info('[w3-sniper] ✅ PumpPortal WS connected — subscribeNewToken only (free tier)');
     conn.send(JSON.stringify({ method: 'subscribeNewToken' }));
+    lastMessageTime = Date.now();
     // NOTE: subscribeTokenTrade REMOVED — requires paid API key (was causing 0% price feed)
     // Price tracking now via Helius accountSubscribe on bonding curve PDA (free, real-time)
+
+    // Heartbeat: PumpPortal can enter zombie state (TCP alive, no data) without triggering onclose.
+    // If no message for 3 minutes → force reconnect.
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(() => {
+      const silentMs = Date.now() - lastMessageTime;
+      if (silentMs > 3 * 60 * 1000) {
+        console.warn(`[w3-sniper] ⚡ No PumpPortal message for ${Math.round(silentMs / 1000)}s — zombie connection, forcing reconnect`);
+        if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+        try { conn.terminate(); } catch {}
+        ws = null;
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, 2000);
+      }
+    }, 30_000);
   });
 
   conn.on('message', async (data: Buffer) => {
+    lastMessageTime = Date.now();
     try {
       const msg = JSON.parse(data.toString());
       if (!msg.txType) return;
@@ -474,9 +499,10 @@ function connect(): void {
 
   conn.on('close', (code) => {
     ws = null;
-    console.warn(`[w3-sniper] WS closed (${code}) — reconnecting in 15s`);
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    console.warn(`[w3-sniper] WS closed (${code}) — reconnecting in 5s`);
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connect, 15_000);
+    reconnectTimer = setTimeout(connect, 5_000);
   });
 }
 
