@@ -341,9 +341,11 @@ async function checkPositions(): Promise<void> {
     const peakMult = pos.peak_price    / pos.entry_price_sol;
     let exitReason: string | null = null;
 
-    // ─── Rapid dump guard: if -3% within first 15s → exit at tiny loss ─────
-    // Catches rug-pulls and dev dumps before they compound into full stop-loss
-    if (ageSec < 15 && mult < 0.97) {
+    // ─── Rapid dump guard: -5% between 5-20s → exit before full stop hits ──
+    // Min 5s: allows price to settle after buy confirmation (avoids slippage false triggers)
+    // Threshold -5%: accounts for ±2% natural volatility on fresh bonding curve tokens
+    // Window 5-20s: real dev dumps happen in this exact window before chart loads
+    if (ageSec >= 5 && ageSec < 20 && mult < 0.95) {
       exitReason = `RAPID_DUMP_${((1 - mult) * 100).toFixed(1)}pct_${Math.round(ageSec)}s`;
     }
 
@@ -519,7 +521,8 @@ export async function getW3SniperStats(hours = 12): Promise<string> {
        ORDER BY created_at DESC`,
     );
     const all    = rows.rows;
-    const closed = all.filter(r => r.status !== 'open');
+    const EXCLUDE = ['open', 'stopped_restart', 'stopped_timeout'];
+    const closed = all.filter(r => !EXCLUDE.includes(r.status));
     const open   = all.filter(r => r.status === 'open');
     const wins   = closed.filter(r => Number(r.outcome_pct ?? 0) >= 10);
     const losses = closed.filter(r => Number(r.outcome_pct ?? 0) < 0);
@@ -557,19 +560,35 @@ export async function getW3SniperStats(hours = 12): Promise<string> {
 // ─── Startup cleanup ──────────────────────────────────────────────────────────
 
 async function cleanupStalePositions(): Promise<void> {
+  // State Recovery: never wipe open positions with outcome_pct=0 — it poisons analytics.
+  // Classify by age:
+  //   < TIME_LIMIT_SEC: position was alive at restart → stopped_restart (excluded from WR)
+  //   ≥ TIME_LIMIT_SEC: position timed out anyway → stopped_timeout (also excluded from WR)
+  // Neither gets outcome_pct=0. NULL = unknown exit, not a loss.
   try {
-    const res = await query<{ id: string; symbol: string }>(
+    const restartRes = await query<{ id: string; symbol: string }>(
       `UPDATE shadow_trades
-         SET status='stopped', outcome_pct=0, outcome_at=NOW()
+         SET status='stopped_restart', outcome_at=NOW()
        WHERE strategy='w3-sniper' AND status='open'
+         AND created_at > NOW() - INTERVAL '${TIME_LIMIT_SEC} seconds'
        RETURNING id, symbol`,
       []
     );
-    if (res.rows.length > 0) {
-      console.info(`[w3-sniper] 🧹 Closed ${res.rows.length} pre-restart positions: ${res.rows.map(r => r.symbol).join(', ')}`);
+    const timeoutRes = await query<{ id: string; symbol: string }>(
+      `UPDATE shadow_trades
+         SET status='stopped_timeout', outcome_at=NOW()
+       WHERE strategy='w3-sniper' AND status='open'
+         AND created_at <= NOW() - INTERVAL '${TIME_LIMIT_SEC} seconds'
+       RETURNING id, symbol`,
+      []
+    );
+    const total = (restartRes.rows?.length ?? 0) + (timeoutRes.rows?.length ?? 0);
+    if (total > 0) {
+      const names = [...(restartRes.rows ?? []), ...(timeoutRes.rows ?? [])].map(r => r.symbol).join(', ');
+      console.info(`[w3-sniper] 🔄 State Recovery: ${restartRes.rows?.length ?? 0} stopped_restart, ${timeoutRes.rows?.length ?? 0} stopped_timeout (${names})`);
     }
   } catch (e: any) {
-    console.warn(`[w3-sniper] Cleanup error: ${e.message}`);
+    console.warn(`[w3-sniper] State recovery error: ${e.message}`);
   }
 }
 

@@ -14,6 +14,7 @@ import { startGraduationScanner } from './graduation-scanner';
 import { startBondingScanner } from './bonding-scanner';
 import { startBondingSmart } from './bonding-smart';
 import { startCopyTrader } from './copy-trader';
+import { startW3Sniper } from './w3-sniper';
 import { getRaydiumOnChainPrice, hasRaydiumVaults } from './raydium-price-fetcher';
 
 const POLL_MS    = Number(process.env.AUTOBUY_POLL_SECONDS  || '15') * 1000;
@@ -158,14 +159,21 @@ async function getPriceSolViaDS(mint: string): Promise<number> {
     } catch { /* fall through to Jupiter */ }
   }
 
-  // Try Jupiter Lite first — typically <200ms, no rate-limit issues with single-mint calls
+  // Try Jupiter Lite Price v3 — typically <300ms, no auth required.
+  // BUG FIX (02.07.26): old endpoint lite.jup.ag/v1/prices is DEAD (returns empty body),
+  // so this source never worked and every price check fell to DexScreener (15-45s lag =
+  // stop-loss slippage). Verified working endpoint: lite-api.jup.ag/price/v3.
+  // v3 returns USD prices only (no vsToken) → fetch token+SOL in one call and divide.
   try {
+    const SOL_MINT = 'So11111111111111111111111111111111111111112';
     const jupRes = await axios.get(
-      `https://lite.jup.ag/v1/prices?ids=${mint}&vsToken=So11111111111111111111111111111111111111112`,
+      `https://lite-api.jup.ag/price/v3?ids=${mint},${SOL_MINT}`,
       { timeout: 2500 }
     );
-    const jupPrice = Number(jupRes.data?.data?.[mint]?.price ?? 0);
-    if (jupPrice > 0) {
+    const tokUsd = Number(jupRes.data?.[mint]?.usdPrice ?? 0);
+    const solUsd = Number(jupRes.data?.[SOL_MINT]?.usdPrice ?? 0);
+    if (tokUsd > 0 && solUsd > 0) {
+      const jupPrice = tokUsd / solUsd; // SOL per readable token — same unit as priceNative
       priceCache.set(mint, { price: jupPrice, ts: Date.now() });
       return jupPrice;
     }
@@ -179,7 +187,15 @@ async function getPriceSolViaDS(mint: string): Promise<number> {
     );
     const pairs: any[] = r.data?.pairs ?? [];
     if (!pairs.length) return priceCache.get(mint)?.price ?? 0;
-    const best = pairs.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
+    // UNIT SAFETY (02.07.26): priceNative is denominated in the QUOTE token.
+    // entry_price_sol is SOL/token — a USDC-quoted pair would return USDC/token
+    // (~150x larger), instantly firing every TP. Prefer SOL-quoted pairs; fall back
+    // to best-liquidity pair only if no SOL pair exists (better than price=0 death).
+    const SOL_MINT = 'So11111111111111111111111111111111111111112';
+    const solQuoted = pairs.filter(p => p.quoteToken?.address === SOL_MINT);
+    const pool = (solQuoted.length ? solQuoted : pairs)
+      .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
+    const best = pool[0];
     const price = Number(best.priceNative ?? 0);
     if (price > 0) priceCache.set(mint, { price, ts: Date.now() });
     return price;
@@ -270,8 +286,11 @@ async function markBuyError(jobId: string, error: string, intervalSeconds: numbe
 // BUG FIX: Must extract regime from label and pass to getLiqTier.
 // Without this, getLiqTier defaults to NEUTRAL — wrong TP targets in FEAR/BULL.
 function getTierFromLabel(label: string | null): ReturnType<typeof getLiqTier> {
-  // Extract market regime from label suffix (:fear, :neutral, :bull, :euphoria, etc.)
-  const regimeMatch = label?.match(/:(fear|neutral|bull|euphoria|extreme_fear)$/i);
+  // Extract market regime from label suffix (:fear, :deep_fear, :neutral, :bull, :euphoria, etc.)
+  // BUG FIX (02.07.26): deep_fear was missing — DEEP_FEAR positions silently got NEUTRAL
+  // TP targets (1.12x vs intended 1.10x) and NEUTRAL trail (18% vs intended 10%).
+  // Longer alternatives must come first so ':deep_fear' doesn't fail to match.
+  const regimeMatch = label?.match(/:(deep_fear|extreme_fear|fear|neutral|bull|euphoria)$/i);
   const regime = regimeMatch ? regimeMatch[1].toUpperCase() : 'NEUTRAL';
 
   if (label?.includes(':t3')) {
@@ -1238,6 +1257,11 @@ export async function startAutobuyScheduler() {
   // Start smart bonding scanner — real-time WebSocket PumpFun trading (disabled by default)
   // Enable with: BONDING_SMART_ENABLED=true in .env (DO NOT enable without backtesting)
   startBondingSmart();
+
+  // Start W3 sniper — buy new pump.fun launches, exit after 15 min if no movement
+  // Shadow mode by default: W3_SNIPER_ENABLED=true, W3_SNIPER_SHADOW=true
+  // Review /w3stats after 12h before enabling live: W3_SNIPER_SHADOW=false
+  startW3Sniper().catch((e: any) => console.warn('[w3-sniper] startup error:', e.message));
 
   // Start copy-trader — mirrors buys from curated profitable wallets via Helius
   if (keypair) {
