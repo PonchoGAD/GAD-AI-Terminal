@@ -130,6 +130,17 @@ console.warn('[sell] ...')
 
 ## Что СДЕЛАНО (готово и в продакшне)
 
+- [x] **Раунд 4: Калибровка 4 ботов + X-trend Source 9 (03-04.07.2026):**
+  - **TX Velocity filter (W3 Sniper):** на PumpPortal create → очередь `pendingWatch` → через 10s читаем Helius getAccountInfo(bondingCurvePDA) → парсим bytes 16-23 (vSol в lamport) → если delta ≥ 0.30 SOL → вход; иначе `DEAD_LAUNCH` skip. Epsilon FP fix: `delta >= TX_VEL_SOL - 0.001` (lamport/1e9 = 0.2999... out of FP).
+  - **Dynamic stagnation stage 1 (W3 Sniper):** `dev_buy_sol >= 1.5` → 90s окно; иначе 45s. IIFE внутри else-if: `(() => { const s = pos.dev_buy_sol >= 1.5 ? 90 : 45; return ageSec >= s && ageSec < s+15; })()`.
+  - **TON Break-even после TP1:** После частичной продажи на TP1 (+35%) → `be_active=true` → если цена опускается ниже entry (mult < 1.0) → `BE_STOP` вместо ожидания -10% SL. Защита locked profit.
+  - **TON startup cleanup:** `cleanupStaleTonPositions()` при старте — закрывает позиции старше TIME_LIMIT_SEC с reason `EXPIRED_ON_RESTART`. Без этого postgres-recovery оставлял зависшие open-позиции.
+  - **Raydium max liq $60k → $95k + vol1h guard:** `RAYDIUM_MAX_LIQUIDITY_USD=95000` default. Для пула > $60k liq требуем `vol1h/liq ≥ 1.5x` (активный пул, не мёртвый). Убийца: T2 ($80-300k) давал 0% WR — теперь допускаем $60-95k только при высоком vol.
+  - **Raydium relaxed-shadow:** параллельный paper-pass с `strategy='raydium_relaxed'` — записывает кандидатов с мягкими фильтрами (vaccel 0.30, без vol1h guard) для сравнения WR strict vs relaxed. Решение о порогах — через 5 дней данных.
+  - **vaccel 0.40 → 0.30:** `RAYDIUM_VACCEL_MIN` снижен для большего потока при F&G<30.
+  - **X-trend Source 9 (ПЕРВЫЙ РАЗ ПОДКЛЮЧЁН):** autobuy раньше НИКОГДА не читал `x_trend_signals`. Добавлен: `SELECT coin_mint FROM x_trend_signals WHERE created_at > NOW()-'30m' AND coin_mint IS NOT NULL` → mint-ы инжектируются в список кандидатов Raydium с `_xtrend=true` в pair-объекте. До этого X-тренды существовали только в Telegram-алёртах и Polymarket стратегии.
+  - **Adaptive ADX threshold (Futures):** `calcBollinger(closes.slice(0,-1))` → если BB width расширяется >5% → `effectiveMinAdx = 19` вместо MIN_ADX=22. Ловит начало движения когда ADX ещё не разогнался.
+  - **Все патчи на VPS деплойнуты** через `/opt/gad-patches/` bind-mounts.
 - [x] **Деплой Раунд 3 + Futures macro-monitor fix (03.07.2026):**
   - **Futures `ok=false` при F&G=19 ИСПРАВЛЕН:** compiled `macro-monitor.js` имел `fg >= 20`. TS-патч с `fg >= 10` не был пересобран. Фикс: `score >= 40 && btcChange1h > -1.5 && fg >= 10`. Бот теперь торгует при F&G 10+.
   - **W3 Sniper zombie-WS heartbeat:** если >3 мин без PumpPortal сообщений → `conn.terminate()` + reconnect 5s.
@@ -138,6 +149,17 @@ console.warn('[sell] ...')
   - **F&G тег в shadow_trades:** w3-sniper и bonding-smart пишут `fg:N` в filter_params при каждом входе.
   - **Все патчи на VPS деплойнуты** через `/opt/gad-patches/` bind-mounts. Все контейнеры запущены.
   - **Статистика 03.07.2026:** W3 Sniper 297 shadow (0% WR — рынок F&G=19, нет покупателей в 45s), Base Scanner 8 shadow (**37.5% WR**, avg win +52.6%), Raydium 124 live (30.6% WR, net -0.04 SOL), Polymarket 62 DRY-RUN сигнала (avg EV 18.8%).
+- [x] **PumpSwap Graduate Movers — shadow-сборщик (03.07.2026):** `services/autobuy/src/pumpswap-movers.ts`
+  - Раздел Movers pump.fun (30мин-4ч, mcap $80k-$1.5M) структурно невидим Raydium-сканеру: pumpswap не в JUPITER_DEX_IDS + mcap выше лимитов
+  - Shadow-сборщик пишет каждого мувера в shadow_trades (strategy='pumpswap_movers') с полными входными метриками; runShadowCheck проставляет исходы 30м/1ч/4ч/8ч
+  - vps-stats.sh: профиль победителей (mcap/liq/age/pc5m/bs1h/volLiq по статусам) — Шаг 2
+  - Шаг 3 (покупки через W1) — ТОЛЬКО если профиль покажет +EV; W2/W3 не участвуют никогда
+  - Env: PUMPSWAP_MOVERS_SHADOW=false — выключить
+- [x] **Fear-market фиксы: X-trend wiring + relaxed-shadow (03.07.2026):**
+  - **X-тренд сигналы подключены к торговле:** autobuy НИКОГДА не читал `x_trend_signals` (сигналы шли только в TG и polymarket). Source 9 в fetchRaydiumPairs: coin_mint из x_trend_signals (<3ч) → кандидаты в общий пайплайн, метка `_xtrend` в shadow filter_params
+  - **Relaxed-shadow калибровка:** после ужесточений 01.07 бот в FEAR = 0 покупок/сутки. Второй paper-проход по тем же кандидатам с июньскими порогами (liq≥12k, pc1h≥5, buys 20/10, vol/liq≥12%) → `shadow_trades strategy='raydium_relaxed'`. Через 3-5 дней сравнение WR strict vs relaxed решит, что ослаблять. `RAYDIUM_RELAX_SHADOW=false` — выключить
+  - **Пороги в env:** `RAYDIUM_VACCEL_MIN` (дефолт 0.30, было hardcoded 0.40 — неаудированное ужесточение), `RAYDIUM_FEAR_MIN_PC1H` (10), `RAYDIUM_DEEP_FEAR_MIN_PC1H` (8) — тюнинг без пересборки
+  - vps-stats.sh: сравнение strict vs relaxed + судьба X-trend кандидатов
 - [x] **Polymarket ARB-сканер "YES+NO < $1" (02.07.2026, ночь):** `arb-scanner.ts`, migration 028
   - PAPER-ONLY детектор негативного спреда на коротких крипто Up/Down рынках (<6ч до конца)
   - POST /books батч-опрос стаканов каждые 5с, edge = 1 − (bestAskYES + bestAskNO) − fees
@@ -464,6 +486,28 @@ console.warn('[sell] ...')
 ---
 
 ## Decisions Log (почему так сделано)
+
+### 2026-07 — TX Velocity filter FP epsilon (04.07.2026)
+**Решение:** `delta >= TX_VEL_SOL - 0.001` вместо `delta >= TX_VEL_SOL`.
+**Почему:** vSol читается как `BigInt / 1e9` (lamport → SOL). Деление создаёт floating point drift: `0.300 SOL` представляется как `0.29999999...`. Лог показывал `only +0.300 SOL < 0.3 — skip (dead launch)` — токены точно на пороге отбрасывались. Epsilon 0.001 = 1 lamport погрешности — безопасно, ложных пропусков не будет.
+**Не менять** delta на ints/BigInt — порог TX_VEL_SOL может быть дробным и конфигурируется через env.
+
+### 2026-07 — X-trend Source 9 подключён к autobuy (03.07.2026)
+**Решение:** `auto-signal.ts` теперь читает `x_trend_signals` (последние 30 минут) и добавляет `coin_mint` в список кандидатов Raydium scannera с тегом `_xtrend=true`.
+**Почему был отключён:** Никогда не был реализован в autobuy. X-тренды создавались в `social-monitor` → шли только в Telegram-алёрт и в Polymarket стратегию. Физического провода от `x_trend_signals` к autobuy не существовало.
+**Как работает теперь:** Mint из x_trend_signals инжектируется как отдельный "pair" в список DexScreener candidates. Если DexScreener возвращает данные по этому mint → проходит через все Raydium фильтры как обычный токен, но в filter_params пишется `_xtrend: true`.
+**Ограничение:** X-trend scan работает раз в 15 мин, autobuy цикл раз в 30с → window = только если токен появился в последние 30 мин. Если тренд старше 30 мин — mint не будет в кандидатах.
+
+### 2026-07 — Raydium relaxed-shadow для калибровки (03.07.2026)
+**Решение:** Каждый Raydium кандидат, проходящий базовые Gate-1/2 проверки, пишется в `shadow_trades` с `strategy='raydium_relaxed'` — с мягкими порогами (vaccel 0.30, без vol1h/liq guard). Строгий проход (`strategy='raydium_scan'`) пишется только если токен прошёл все фильтры.
+**Почему:** При F&G<30 strict фильтры дают 0 сделок за 48ч — нет данных для решения. Relaxed-shadow накапливает что было бы куплено при более мягких условиях. Через 5 дней сравнение WR strict vs relaxed покажет: (a) relaxed дал больше WR → можно смягчить, (b) WR одинаковый → фильтры правильные, просто плохой рынок.
+**Таблица сравнения:** `vps-stats.sh` раздел `═══ КАЛИБРОВКА: strict vs relaxed ═══` → принять решение через 5 дней.
+**Не путать:** `raydium_relaxed` = только paper, никаких реальных покупок. Реальные покупки только через `raydium_scan` (strict).
+
+### 2026-07 — Adaptive ADX в Futures (03.07.2026)
+**Решение:** В Guard 5 перед `adx < MIN_ADX`: вычислить prevBb (Bollinger на closes без последней свечи), если `bb.width > prevBb.width * 1.05` (расширение >5%) → `effectiveMinAdx = 19` вместо 22.
+**Почему:** BB expansion = волатильность растёт прямо сейчас. ADX подтверждает тренд с лагом (~3 свечи). В начале движения BB уже расширяется, ADX ещё 20-21. Снижение порога с 22 до 19 позволяет войти раньше. Условие: expansion >5% — фильтрует шум (небольшие колебания BB ширины не считаются expansion).
+**Не снижать** ниже 19 — ADX < 19 = рынок без тренда, любое направление случайно.
 
 ### 2026-07 — Futures macro-monitor threshold (03.07.2026)
 **Решение:** `const ok = score >= 40 && btcChange1h > -1.5 && fg >= 10`

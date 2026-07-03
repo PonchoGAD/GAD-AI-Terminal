@@ -332,7 +332,7 @@ async function processPendingWatches(): Promise<void> {
 
     const delta = currentVSol - entry.initVSol;
     const symbol = entry.msg.symbol ?? mint.slice(0, 8);
-    if (delta >= TX_VEL_SOL) {
+    if (delta >= TX_VEL_SOL - 0.001) {  // -0.001 epsilon: lamport→SOL division creates FP drift (0.300 shows as 0.2999...)
       console.info(`[w3-sniper] ⚡ TX Velocity PASS ${symbol}: +${delta.toFixed(3)} SOL in ${(ageMs/1000).toFixed(0)}s — ENTERING`);
       // Pass updated vSol back in msg so entryPrice/mcap are accurate at entry time
       const updatedMsg = { ...entry.msg, vSolInBondingCurve: currentVSol };
