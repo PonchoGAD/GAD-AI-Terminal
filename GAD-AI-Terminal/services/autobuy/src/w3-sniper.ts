@@ -37,6 +37,7 @@ import WebSocket from 'ws';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { query } from '@lib/db';
 import { analyzeDevReputation } from './dev-profiler';
+import { getFearGreed } from './auto-signal';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -100,7 +101,12 @@ interface W3Position {
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-const positions = new Map<string, W3Position>();
+const positions    = new Map<string, W3Position>();
+// TX Velocity watch queue: on create event tokens wait here until organic buy velocity is confirmed.
+// Entry fires only if bonding curve accumulates ≥ 0.3 SOL from others within 10–25s of creation.
+// Reduces daily entries from ~100 to ~10-15 (only real momentum, not dev-only launches).
+const pendingWatch = new Map<string, { msg: any; initVSol: number; queuedAt: number }>();
+
 let ws: WebSocket | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let heartbeatTimer: NodeJS.Timeout | null = null;
@@ -197,7 +203,147 @@ function isLikelyRug(name: string, symbol: string): boolean {
   return RUG_KEYWORDS.some(k => lower.includes(k));
 }
 
-// ─── Open position ────────────────────────────────────────────────────────────
+// ─── Filter checks (shared by queue and direct entry) ────────────────────────
+
+async function passesFilters(msg: any): Promise<boolean> {
+  const mint   = msg.mint as string;
+  const symbol = (msg.symbol as string || '???').slice(0, 20);
+  const name   = (msg.name   as string || '').slice(0, 50);
+
+  if (!mint) return false;
+  if (positions.has(mint) || pendingWatch.has(mint)) return false;
+
+  const devSol = Number(msg.solAmount ?? 0);
+  if (devSol < MIN_DEV_SOL) {
+    console.debug(`[w3-sniper] Skip ${symbol}: dev_buy ${devSol.toFixed(4)} SOL < ${MIN_DEV_SOL}`);
+    return false;
+  }
+
+  const REQUIRE_SOCIALS     = process.env.W3_SNIPER_REQUIRE_SOCIALS !== 'false';
+  const HIGH_DEV_BYPASS_SOL = Number(process.env.W3_SNIPER_HIGH_DEV_BYPASS_SOL || '2.0');
+  if (REQUIRE_SOCIALS) {
+    const hasSocials    = !!(msg.twitter || msg.telegram || msg.website);
+    const highDevBypass = devSol >= HIGH_DEV_BYPASS_SOL;
+    if (!hasSocials && !highDevBypass) {
+      console.debug(`[w3-sniper] Skip ${symbol}: no socials & dev:${devSol.toFixed(2)}SOL < ${HIGH_DEV_BYPASS_SOL}SOL`);
+      return false;
+    }
+    if (!hasSocials && highDevBypass) {
+      console.info(`[w3-sniper] No socials BUT high-dev ${devSol.toFixed(2)} SOL — stealth launch`);
+    }
+  }
+
+  if (isLikelyRug(name, symbol)) {
+    console.debug(`[w3-sniper] Skip ${symbol}: rug keywords`);
+    return false;
+  }
+
+  const vSol = Number(msg.vSolInBondingCurve   ?? VIRTUAL_SOL_RESERVES);
+  const vTok = Number(msg.vTokensInBondingCurve ?? VIRTUAL_TOKEN_RESERVES);
+  if (vSol <= 0 || vTok <= 0) return false;
+
+  const extraSol = vSol - devSol - VIRTUAL_SOL_RESERVES;
+  if (extraSol > 0.15) {
+    console.info(`[w3-sniper] 🚨 Skip ${symbol}: bundle trap (+${extraSol.toFixed(2)} SOL in same block)`);
+    return false;
+  }
+
+  if (MIN_DEV_SCORE > 0) {
+    const devWallet = msg.traderPublicKey as string | undefined;
+    if (devWallet) {
+      try {
+        const repPromise = analyzeDevReputation(devWallet);
+        const timeout    = new Promise<null>(r => setTimeout(() => r(null), 2000));
+        const devRep     = await Promise.race([repPromise, timeout]);
+        if (devRep === null) {
+          console.debug(`[w3-sniper] ⏱️ Dev rep timeout ${symbol} — proceed`);
+        } else if (devRep.isSerialScammer) {
+          console.debug(`[w3-sniper] 🚨 Skip ${symbol}: serial scammer (${devRep.reason})`);
+          return false;
+        } else if (devRep.score < MIN_DEV_SCORE) {
+          console.debug(`[w3-sniper] 🚨 Skip ${symbol}: dev score ${devRep.score} < ${MIN_DEV_SCORE}`);
+          return false;
+        } else {
+          console.debug(`[w3-sniper] ✅ Dev score ${devRep.score}/100 for ${symbol}`);
+        }
+      } catch { /* fail-open */ }
+    }
+  }
+
+  return true;
+}
+
+// ─── TX Velocity queue handler ────────────────────────────────────────────────
+// On create event: run filters → if pass → add to pendingWatch with initVSol.
+// processPendingWatches() fires after 10s to check if ≥ 0.3 SOL of organic buy pressure
+// has accumulated in the bonding curve. Tokens that stagnate at creation (no buyers) are
+// dropped before we even enter — this is the primary WR fix for F&G<30 markets.
+
+async function queuePosition(msg: any): Promise<void> {
+  checkDailyReset();
+  if (positions.size >= MAX_POSITIONS) return;
+  if (dailyBuyCount >= DAILY_LIMIT) return;
+
+  const ok = await passesFilters(msg);
+  if (!ok) return;
+
+  const mint    = msg.mint as string;
+  const symbol  = (msg.symbol as string || '???').slice(0, 20);
+  const initVSol = Number(msg.vSolInBondingCurve ?? VIRTUAL_SOL_RESERVES);
+
+  pendingWatch.set(mint, { msg, initVSol, queuedAt: Date.now() });
+  console.debug(`[w3-sniper] ⏳ Queued ${symbol} (${mint.slice(0, 8)}) initVSol:${initVSol.toFixed(2)} — waiting 10s for TX velocity`);
+}
+
+// ─── Process pending velocity checks ─────────────────────────────────────────
+
+async function processPendingWatches(): Promise<void> {
+  const TX_VEL_SOL      = Number(process.env.W3_SNIPER_TX_VEL_SOL      || '0.30'); // min ΔvSol in 10s
+  const TX_VEL_DELAY_MS = Number(process.env.W3_SNIPER_TX_VEL_DELAY_MS || '10000'); // wait window
+  const TX_VEL_EXPIRE   = Number(process.env.W3_SNIPER_TX_VEL_EXPIRE   || '25000'); // max wait
+
+  const now = Date.now();
+  for (const [mint, entry] of pendingWatch) {
+    const ageMs = now - entry.queuedAt;
+    if (ageMs < TX_VEL_DELAY_MS) continue; // not yet time to check
+
+    pendingWatch.delete(mint); // remove regardless of outcome
+
+    if (ageMs > TX_VEL_EXPIRE) {
+      console.debug(`[w3-sniper] ⏰ Velocity check expired for ${entry.msg.symbol ?? mint.slice(0,8)} (${(ageMs/1000).toFixed(0)}s)`);
+      continue;
+    }
+
+    // Fetch current bonding curve vSol via Helius getAccountInfo
+    let currentVSol = entry.initVSol;
+    try {
+      const pda  = getBondingCurvePda(mint);
+      const info = await getConn().getAccountInfo(pda, 'confirmed');
+      if (info?.data && info.data.length >= 25) {
+        const data = Buffer.isBuffer(info.data) ? info.data : Buffer.from(info.data as any);
+        const vSolLam = Number(data.readBigUInt64LE(16));
+        currentVSol = vSolLam / 1e9;
+      }
+    } catch (e: any) {
+      console.debug(`[w3-sniper] Velocity getAccountInfo fail ${mint.slice(0,8)}: ${e.message?.slice(0,40)} — fail-open`);
+      // fail-open: proceed with entry if we can't read the account
+      currentVSol = entry.initVSol + TX_VEL_SOL;
+    }
+
+    const delta = currentVSol - entry.initVSol;
+    const symbol = entry.msg.symbol ?? mint.slice(0, 8);
+    if (delta >= TX_VEL_SOL) {
+      console.info(`[w3-sniper] ⚡ TX Velocity PASS ${symbol}: +${delta.toFixed(3)} SOL in ${(ageMs/1000).toFixed(0)}s — ENTERING`);
+      // Pass updated vSol back in msg so entryPrice/mcap are accurate at entry time
+      const updatedMsg = { ...entry.msg, vSolInBondingCurve: currentVSol };
+      await openPosition(updatedMsg);
+    } else {
+      console.debug(`[w3-sniper] ✗ TX Velocity FAIL ${symbol}: only +${delta.toFixed(3)} SOL < ${TX_VEL_SOL} — skip (dead launch)`);
+    }
+  }
+}
+
+// ─── Open position (called after TX velocity confirmed) ───────────────────────
 
 async function openPosition(msg: any): Promise<void> {
   checkDailyReset();
@@ -212,69 +358,9 @@ async function openPosition(msg: any): Promise<void> {
   if (positions.has(mint)) return;
 
   const devSol = Number(msg.solAmount ?? 0);
-  if (devSol < MIN_DEV_SOL) {
-    console.debug(`[w3-sniper] Skip ${symbol}: dev_buy ${devSol.toFixed(4)} SOL < ${MIN_DEV_SOL} (no skin in game)`);
-    return;
-  }
-
-  // Socials required: tokens with X/Telegram have community = less likely to die at 45s.
-  // Sliding scale: dev≥2.0 SOL → bypass socials (stealth launch — founder has real skin in game).
-  //                dev 0.3-2.0 SOL → socials required.
-  // Controlled by W3_SNIPER_REQUIRE_SOCIALS=false to disable entirely in tests.
-  const REQUIRE_SOCIALS = process.env.W3_SNIPER_REQUIRE_SOCIALS !== 'false';
-  const HIGH_DEV_BYPASS_SOL = Number(process.env.W3_SNIPER_HIGH_DEV_BYPASS_SOL || '2.0');
-  if (REQUIRE_SOCIALS) {
-    const hasSocials = !!(msg.twitter || msg.telegram || msg.website);
-    const highDevBypass = devSol >= HIGH_DEV_BYPASS_SOL;
-    if (!hasSocials && !highDevBypass) {
-      console.debug(`[w3-sniper] Skip ${symbol}: no socials & dev:${devSol.toFixed(2)}SOL < ${HIGH_DEV_BYPASS_SOL}SOL`);
-      return;
-    }
-    if (!hasSocials && highDevBypass) {
-      console.info(`[w3-sniper] No socials BUT high-dev ${devSol.toFixed(2)} SOL — stealth launch`);
-    }
-  }
-
-  if (isLikelyRug(name, symbol)) {
-    console.debug(`[w3-sniper] Skip ${symbol}: rug keywords`);
-    return;
-  }
-
-  const vSol = Number(msg.vSolInBondingCurve   ?? VIRTUAL_SOL_RESERVES);
-  const vTok = Number(msg.vTokensInBondingCurve ?? VIRTUAL_TOKEN_RESERVES);
+  const vSol   = Number(msg.vSolInBondingCurve   ?? VIRTUAL_SOL_RESERVES);
+  const vTok   = Number(msg.vTokensInBondingCurve ?? VIRTUAL_TOKEN_RESERVES);
   if (vSol <= 0 || vTok <= 0) return;
-
-  // Anti-bundle: detect if OTHER wallets (not dev) bought in the same block.
-  // Genesis vSol=30. After dev buy: vSol = 30 + devSol. Extra = what bundlers added.
-  // Old check (vSol>30.30) was WRONG: blocked devs buying ≥0.31 SOL (the good ones).
-  const extraSol = vSol - devSol - VIRTUAL_SOL_RESERVES;
-  if (extraSol > 0.15) {
-    console.info(`[w3-sniper] 🚨 Skip ${symbol}: bundle trap (other wallets +${extraSol.toFixed(2)} SOL in same block)`);
-    return;
-  }
-
-  // Dev reputation check — serial scammers launch dozens of dead tokens (2s timeout, fail-open)
-  if (MIN_DEV_SCORE > 0) {
-    const devWallet = msg.traderPublicKey as string | undefined;
-    if (devWallet) {
-      try {
-        const repPromise = analyzeDevReputation(devWallet);
-        const timeout   = new Promise<null>(r => setTimeout(() => r(null), 2000));
-        const devRep    = await Promise.race([repPromise, timeout]);
-        if (devRep === null) {
-          console.debug(`[w3-sniper] ⏱️ Dev rep timeout ${symbol} — proceed`);
-        } else if (devRep.isSerialScammer) {
-          console.debug(`[w3-sniper] 🚨 Skip ${symbol}: serial scammer (${devRep.reason})`);
-          return;
-        } else if (devRep.score < MIN_DEV_SCORE) {
-          console.debug(`[w3-sniper] 🚨 Skip ${symbol}: dev score ${devRep.score} < ${MIN_DEV_SCORE} (${devRep.reason})`);
-          return;
-        } else {
-          console.debug(`[w3-sniper] ✅ Dev score ${devRep.score}/100 for ${symbol}`);
-        }
-      } catch { /* fail-open: proceed without rep check */ }
-    }
-  }
 
   const entryPrice  = bcPrice(vSol, vTok);
   const tokenAmount = bcBuyTokens(vSol, vTok, BUY_SOL);
@@ -299,10 +385,8 @@ async function openPosition(msg: any): Promise<void> {
   positions.set(mint, pos);
   dailyBuyCount++;
 
-  // Subscribe Helius accountSubscribe for real-time price (replaces broken subscribeTokenTrade)
   subscribePriceTracking(pos);
 
-  // Persist to shadow_trades
   try {
     const res = await query<{ id: string }>(
       `INSERT INTO shadow_trades
@@ -313,7 +397,7 @@ async function openPosition(msg: any): Promise<void> {
       [
         symbol, mint, entryPrice,
         mcapSol * (Number(process.env.SOL_PRICE_USD) || 150),
-        JSON.stringify({ dev_buy_sol: devSol, token_amount: tokenAmount, buy_sol: BUY_SOL, shadow: SHADOW }),
+        JSON.stringify({ dev_buy_sol: devSol, token_amount: tokenAmount, buy_sol: BUY_SOL, shadow: SHADOW, fg: await getFearGreed().catch(() => null) }),
         TP1_MULT * 100 - 100,
         STOP_PCT * 100,
       ]
@@ -354,10 +438,13 @@ async function checkPositions(): Promise<void> {
       exitReason = `STOP_LOSS_${((1 - mult) * 100).toFixed(1)}pct`;
     }
 
-    // ─── Stagnation Exit: 3-stage fast exit (v3) ────────────────────────────
-    // Stage 1 (45s): no buyers at all → exit near-zero
-    else if (ageSec >= 45 && ageSec < 60 && mult < 1.01) {
-      exitReason = `STAGNATION_45s_${(mult * 100 - 100).toFixed(1)}pct`;
+    // ─── Stagnation Exit: 3-stage fast exit (v3+dynamic) ───────────────────
+    // Stage 1 dynamic: high-conviction dev (≥1.5 SOL) gets 90s instead of 45s.
+    // Stealth launches with large dev buys attract buyers more slowly — 45s was too aggressive.
+    // Low-dev (<1.5 SOL) keeps 45s: if no momentum by then, the token is dead.
+    else if ((() => { const s = pos.dev_buy_sol >= 1.5 ? 90 : 45; return ageSec >= s && ageSec < s + 15; })() && mult < 1.01) {
+      const stag1Sec = pos.dev_buy_sol >= 1.5 ? 90 : 45;
+      exitReason = `STAGNATION_${stag1Sec}s_${(mult * 100 - 100).toFixed(1)}pct`;
     }
     // Stage 2 (90s): failed to hold +3% → momentum dead
     else if (ageSec >= 90 && ageSec < 105 && mult < 1.03) {
@@ -490,7 +577,7 @@ function connect(): void {
     try {
       const msg = JSON.parse(data.toString());
       if (!msg.txType) return;
-      if (msg.txType === 'create') await openPosition(msg);
+      if (msg.txType === 'create') await queuePosition(msg);
       // txType 'buy'/'sell' removed — no longer subscribing to token trades
     } catch { }
   });
@@ -637,5 +724,8 @@ export async function startW3Sniper(): Promise<void> {
   console.info('[w3-sniper] 📡 Price source: Helius accountSubscribe (free, real-time) — subscribeTokenTrade DISABLED');
 
   connect();
-  setInterval(checkPositions, 10_000);
+  setInterval(async () => {
+    await processPendingWatches();
+    await checkPositions();
+  }, 10_000);
 }

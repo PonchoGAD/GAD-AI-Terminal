@@ -29,6 +29,7 @@ interface TonPosition {
   tp_index:        number;
   trail_high:      number;
   bought_at:       Date;
+  be_active?:      boolean;  // break-even mode: after TP1, SL moves to entry price (0% loss)
 }
 
 export async function runTonMonitorCycle(): Promise<void> {
@@ -100,6 +101,8 @@ export async function runTonMonitorCycle(): Promise<void> {
         if (result.ok) {
           const isLastStage = pos.tp_index + 1 >= TP_STAGES.length;
           const remaining   = (tokenAmountNano - sellNano).toString();
+          // Activate break-even after TP1: remaining tokens are now "house money" — SL moves to entry.
+          if (pos.tp_index === 0) pos.be_active = true;
           await query(
             `UPDATE ton_positions
              SET tp_index=$1, token_amount=$2, sell_tx=$3, last_activity_at=NOW(),
@@ -122,6 +125,15 @@ export async function runTonMonitorCycle(): Promise<void> {
           await closePosition(pos, 'TRAIL_STOP');
           continue;
         }
+      }
+
+      // ─── Break-even stop (after TP1 hit) ──────────────────────────────────
+      // Once we've locked 70% profit at TP1 (+35%), the remaining 30% risks nothing.
+      // SL moves to entry price: if it falls back to entry → exit at 0% on remainder.
+      if (pos.be_active && multiplier < 1.0) {
+        console.info(`${label} 🔒 BE STOP ${sym} ${multiplier.toFixed(2)}x — locked TP1 profit, exit remainder at entry`);
+        await closePosition(pos, 'BE_STOP');
+        continue;
       }
 
       // ─── Stop loss ─────────────────────────────────────────────────────────
@@ -176,8 +188,31 @@ async function closePosition(pos: TonPosition, reason: string): Promise<void> {
   }
 }
 
-export function startTonMonitor(): void {
+async function cleanupStaleTonPositions(): Promise<void> {
+  // On restart: close positions that exceeded their time limit while DB was unreachable.
+  // Without this, positions stuck in 'open' state from PostgreSQL recovery events would
+  // hold the TON wallet balance hostage indefinitely and inflate "active positions" count.
+  try {
+    const res = await query<{ id: string; symbol: string }>(
+      `UPDATE ton_positions
+         SET is_active=false, sold_at=NOW(), sell_reason='EXPIRED_ON_RESTART'
+       WHERE is_active=true
+         AND bought_at < NOW() - INTERVAL '${TIME_LIMIT_SEC} seconds'
+       RETURNING id, symbol`,
+      []
+    );
+    if (res.rows?.length) {
+      const names = res.rows.map(r => r.symbol).join(', ');
+      console.info(`[ton-monitor] 🔄 Startup cleanup: expired ${res.rows.length} stale positions (${names})`);
+    }
+  } catch (e: any) {
+    console.warn(`[ton-monitor] Startup cleanup error: ${e.message}`);
+  }
+}
+
+export async function startTonMonitor(): Promise<void> {
   console.info(`[ton-monitor] starting — SL:${STOP_LOSS_PCT}% trail:${TRAIL_PCT}% time_limit:${TIME_LIMIT_SEC}s poll:${POLL_INTERVAL/1000}s`);
+  await cleanupStaleTonPositions();
   runTonMonitorCycle();
   setInterval(runTonMonitorCycle, POLL_INTERVAL);
 }

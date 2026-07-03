@@ -232,7 +232,7 @@ async function recentlyBought(mint: string): Promise<boolean> {
   return Number(rows[0]?.cnt ?? 0) > 0;
 }
 
-// Block tokens we previously lost money on (>20% loss in last 7 days).
+// Block tokens we previously lost money on (>10% loss in last 14 days).
 // Prevents re-buying rugs or already-crashed tokens after cooldown expires.
 async function previouslyLost(mint: string): Promise<boolean> {
   const { rows } = await query<{ cnt: string }>(
@@ -442,7 +442,7 @@ const RAYDIUM_MIN_LIQUIDITY_USD = 12000; // 23.06.26: hardcoded 12k (VPS intent;
 // Max liquidity — avoid large-cap tokens (slow movers)
 // T2 ($80k+) has 0% win rate across 79-trade audit — default excludes T2/T3.
 // Override in .env: RAYDIUM_MAX_LIQUIDITY_USD=250000 to allow T2 after backtesting.
-const RAYDIUM_MAX_LIQUIDITY_USD = Number(process.env.RAYDIUM_MAX_LIQUIDITY_USD || '60000'); // 01.07.26: T2 0% WR → $60k cap
+const RAYDIUM_MAX_LIQUIDITY_USD = Number(process.env.RAYDIUM_MAX_LIQUIDITY_USD || '95000'); // 03.07.26: expanded to $95k — tokens $60-95k eligible IF vol1h/liq > 1.5x (active pool guard)
 // No separate vol1h floor — Gate 4 vol/liq ratio check is the real stale-pool filter
 const RAYDIUM_MIN_VOLUME_H1_USD = Number(process.env.RAYDIUM_MIN_VOLUME_H1_USD || '0');
 // Min 1h price change — organic growth signal
@@ -1031,6 +1031,13 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       console.debug(`[raydium-scan] ✗liq  ${sym.padEnd(10)} liq:$${liq.toFixed(0)} vol1h:$${vol1h.toFixed(0)} pc1h:${pc1h.toFixed(1)}%`);
       skipped.liq++; continue;
     }
+    // Upper liq zone guard ($60k-$95k): requires vol1h/liq > 1.5x to prove the pool is ACTIVE.
+    // T2 tokens with high liq but stagnant volume = institutional holdings, not meme momentum.
+    // Only enter when recent volume = at least 1.5x the liquidity (hourly turnover confirms it's live).
+    if (liq > 60000 && vol1h / liq < 1.5) {
+      console.debug(`[raydium-scan] ✗t2vol ${sym.padEnd(10)} liq:$${liq.toFixed(0)} vol1h/liq:${(vol1h/liq).toFixed(2)}x < 1.5x (inactive pool in upper range)`);
+      skipped.liq++; continue;
+    }
     // Liquidity floors by regime — lower in DEEP_FEAR, bypass with strong 5m momentum.
     // vol5m > $12k = real buying pressure RIGHT NOW → override liq floor (anomaly signal).
     // DEEP_FEAR (F&G 10-20): $18k floor — micro-scalp opportunities still exist at lower liq.
@@ -1172,7 +1179,7 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     }
 
     if (await recentlyBought(mint)) { skipped.cooldown++; continue; }
-    if (await previouslyLost(mint)) { skipped.cooldown++; console.debug(`[raydium-scan] ♻️ Skip ${mint.slice(0,8)} — previously lost on this token (7-day blacklist)`); continue; }
+    if (await previouslyLost(mint)) { skipped.cooldown++; console.debug(`[raydium-scan] ♻️ Skip ${mint.slice(0,8)} — previously lost on this token (14-day blacklist)`); continue; }
 
     // ── Multi-module signal validation ──
     const trend = analyzeTrend(pair);
