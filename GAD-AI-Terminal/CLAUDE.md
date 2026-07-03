@@ -130,6 +130,33 @@ console.warn('[sell] ...')
 
 ## Что СДЕЛАНО (готово и в продакшне)
 
+- [x] **Деплой Раунд 3 + Futures macro-monitor fix (03.07.2026):**
+  - **Futures `ok=false` при F&G=19 ИСПРАВЛЕН:** compiled `macro-monitor.js` имел `fg >= 20`. TS-патч с `fg >= 10` не был пересобран. Фикс: `score >= 40 && btcChange1h > -1.5 && fg >= 10`. Бот теперь торгует при F&G 10+.
+  - **W3 Sniper zombie-WS heartbeat:** если >3 мин без PumpPortal сообщений → `conn.terminate()` + reconnect 5s.
+  - **W3 Sniper State Recovery:** рестарт не вайпает open-позиции с `outcome_pct=0` — пишет `stopped_restart` / `stopped_timeout`. Исключены из WR.
+  - **W3 Sniper Rapid Dump Guard:** `-5% с 5-20s` (было -3% с 0s — ловил слипидж при покупке).
+  - **F&G тег в shadow_trades:** w3-sniper и bonding-smart пишут `fg:N` в filter_params при каждом входе.
+  - **Все патчи на VPS деплойнуты** через `/opt/gad-patches/` bind-mounts. Все контейнеры запущены.
+  - **Статистика 03.07.2026:** W3 Sniper 297 shadow (0% WR — рынок F&G=19, нет покупателей в 45s), Base Scanner 8 shadow (**37.5% WR**, avg win +52.6%), Raydium 124 live (30.6% WR, net -0.04 SOL), Polymarket 62 DRY-RUN сигнала (avg EV 18.8%).
+- [x] **Polymarket ARB-сканер "YES+NO < $1" (02.07.2026, ночь):** `arb-scanner.ts`, migration 028
+  - PAPER-ONLY детектор негативного спреда на коротких крипто Up/Down рынках (<6ч до конца)
+  - POST /books батч-опрос стаканов каждые 5с, edge = 1 − (bestAskYES + bestAskNO) − fees
+  - Пишет возможности в `polymarket_arb_ops` (дедуп 60с), эндпоинт `/arb`, часовой лог `[poly-arb] hourly`
+  - НЕ размещает ордера. Решение о live — только если неделя данных покажет регулярные исполнимые гэпы
+  - Источник идеи — вирусные посты о Polymarket-арбитраже; их цифры ($570k и т.п.) непроверяемы, реф-ссылки = маркетинг. Математика ядра верна, но гэпы выедаются HFT — поэтому сначала измерение
+- [x] **Раунд 2 доработок по статистике (02.07.2026, вечер):**
+  - **TON unit-баг исправлен:** entry_price был в смешанных единицах (GT=TON, DexScreener=quote-токен) → аномалии +622536%. Теперь весь shadow-контур в USD (`price_usd` в TonToken, priceUsd в мониторе), legacy-строки без `price_unit:'usd'` авто-закрываются как `status='invalid'`, гард mult>20x
+  - **Polymarket impulse-TP баг:** буфер истории 10×30с=5мин, а окно импульса 20мин → IMPULSE_TP никогда не срабатывал. Буфер → 45 чтений
+  - **Polymarket воронка:** счётчики отказов по каждому гарду (max_open/dup/validator по причинам), эндпоинт `/funnel` + часовой лог `[poly-funnel]` — покажет, почему 62 сигнала дали 0 позиций (подозрение: EXCESSIVE_DURATION в validator)
+  - **Polymarket LIVE-gate:** реальные ордера жёстко заблокированы в trader.ts пока dry-run не покажет ≥30 сделок И WR≥65% (`POLY_GATE_MIN_TRADES/POLY_GATE_MIN_WR`, аварийный `POLY_GATE_OVERRIDE=true`). Даже с POLYMARKET_DRY_RUN=false бот пишет paper-позиции до открытия гейта
+  - **F&G-теги в shadow_trades:** w3-sniper и bonding-smart теперь пишут `fg` в filter_params — для анализа WR по режимам рынка ("W3 работает при F&G>35" станет проверяемо)
+  - Деплой: polymarket = scp 3 .ts в /opt/gad-patches/polymarket-src + restart; autobuy = build + scp dist; ton = rebuild (нужен свободный диск) или hot-patch libs/ton
+- [x] **Аудит всех ботов + 3 бага исправлено (02.07.2026):** см. `ОТЧЁТ_АУДИТ_БОТОВ_02.07.2026.md`
+  - scheduler.ts: `deep_fear` отсутствовал в regex getTierFromLabel → DEEP_FEAR позиции получали NEUTRAL TP (1.12x вместо 1.10x) и NEUTRAL trail (18% вместо 10%)
+  - scheduler.ts: эндпоинт цен `lite.jup.ag/v1/prices` МЁРТВ (пустое тело) → замена на `lite-api.jup.ag/price/v3?ids=<mint>,<SOL>` (цена = tokUsd/solUsd)
+  - scheduler.ts: DexScreener price fallback теперь приоритизирует SOL-котируемые пары (priceNative номинирован в quote-токене — USDC-пара давала цену ~150x)
+  - Хот-патч без сборки: `scripts/patch-autobuy-scheduler.js` (правит /opt/gad-patches/autobuy-dist/scheduler.js, делает .bak)
+  - ⚠️ copy-trader включён по умолчанию (`COPY_TRADE_ENABLED !== 'false'`) — прописать `COPY_TRADE_ENABLED=false` в VPS .env, если не используется
 - [x] Полная схема БД (11 SQL-миграций)
 - [x] Все 18 shared-либ + trend-engine (GDELT + Google News + AI идеи)
 - [x] API сервер: токены, watchlist, alerts, portfolio, subscription, tg-user linking
@@ -207,6 +234,7 @@ console.warn('[sell] ...')
   - libs/base: ethers v6, Uniswap V3 + Aerodrome, DexScreener price, Basescan safety
   - base-scanner: token discovery (DexScreener + GeckoTerminal every 30s), position monitor (10s poll)
   - 5 TP levels: 1.3/1.8/2.5/4.0/7.0x, trailing stop 8%, time limit 1h, stop-loss 10%
+  - **БАГ ИСПРАВЛЕН (29.06.2026):** `total_sold_eth=0` после TP — был balance diff с RPC race. Фикс: `result.amount_out` из WETH Withdrawal event в receipt
   - Telegram: /basestatus /basepositions /basetrades /basetokens (PRO/STARTER+)
   - API: /base/* routes proxied from api service to base-scanner:4005
   - Docker: `BASE_AUTO_BUY=false` by default (dry-run) — set to true + add BASE_WALLET_PRIVATE_KEY to activate
@@ -221,8 +249,8 @@ console.warn('[sell] ...')
 - [x] **Market Regime Gating для Raydium autobuy (14.06.2026):**
   - `getFearGreed()` — Fear&Greed API (alternative.me), кеш 30мин
   - `getMarketRegime()` → EXTREME_FEAR/FEAR/NEUTRAL/BULL/EUPHORIA (или overrideMARKET_REGIME=AUTO)
-  - **EXTREME_FEAR (F&G < 13):** все новые покупки заморожены — только реальная капитуляция (было: < 25)
-  - **FEAR (F&G 13-45):** контрарная зона покупок — мин pc1h 15%, TP снижен (1.18x/1.15x/1.12x)
+  - **EXTREME_FEAR (F&G < 10):** все новые покупки заморожены — только реальная капитуляция (было: < 13 → снижено 29.06.2026)
+  - **FEAR (F&G 10-45):** контрарная зона покупок — мин pc1h 15%, TP снижен (1.18x/1.15x/1.12x)
   - Стратегия: покупать на страхе (buy the fear) — изменено с 14.06.2026 по решению владельца
   - NEUTRAL: 1.30x/1.28x/1.25x; BULL/EUPHORIA: 1.55x/1.45x/1.38x
   - HOT poller: buys5m снижен с 20 до 15 (более мягкий рынок)
@@ -240,7 +268,26 @@ console.warn('[sell] ...')
   - API: `POST /launcher/submit` в `services/api/src/launcher.routes.ts`
   - Сайт (`gadai.shop`): Vercel → `PonchoGAD/gadai.git` → `C:\Users\gafit\saas-landing-demo`
   - Деплой сайта: `cd C:\Users\gafit\saas-landing-demo && git push gadai main`
-- [x] **EXTREME_FEAR порог снижен до 13 (14.06.2026):** бот покупает при F&G 13-45 (FEAR = contrarian buy zone)
+- [x] **EXTREME_FEAR порог снижен до 10 (29.06.2026, было 13):** бот покупает при F&G 10-45 (FEAR = contrarian buy zone). F&G=12 теперь разрешён.
+- [x] **Raydium T2 заблокирован + HIGH_LIQ_RUG guard (29.06.2026):**
+  - `RAYDIUM_MAX_LIQUIDITY_USD=80000` на VPS (было 120k) — T2 ($80k+) имел 0% win rate, исключён
+  - `HIGH_LIQ_RUG` guard в `auto-signal.js`: liq > $100k AND rug_risk ≥ 25 → skip (whale trap)
+  - Патч: `/opt/gad-patches/autobuy-dist/auto-signal.js`
+- [x] **Futures Guard 6: EMA200 на 1H (29.06.2026):**
+  - Добавлен `fetchCandles1H(210)` → EMA200 на 1H таймфрейме
+  - LONG заблокирован если price < EMA200(1H) (макро-даунтренд)
+  - SHORT заблокирован если price > EMA200(1H) (макро-аптренд)
+  - Патч: `/opt/gad-patches/futures-src/entry-strategy.ts`
+- [x] **W3 Sniper F&G guard (29.06.2026):**
+  - `checkFGHistorySafe()` — проверяет F&G > 45 за последние 5 дней
+  - AUTO-ENABLE заблокирован пока не 5 дней подряд BULL (F&G > 45)
+  - Патч: `/opt/gad-patches/autobuy-dist/w3-sniper.js`
+- [x] **Polymarket улучшения (29.06.2026):**
+  - Liquidity gate: рынки с `liquidityUsd < $1000` отфильтровываются перед FAST PATH
+  - Dead market filter в `keyword-matcher.ts`: `entryPrice < 0.05 OR > 0.95` → skip
+  - `aiProb` hard cap: `Math.min(rawAiProb, 0.95)` — предотвращает EV>0 при entry=1.0
+  - Sentiment required для MEDIUM confidence: `(bull + bear) >= 1`, иначе → LOW → filtered
+  - Патчи: `/opt/gad-patches/polymarket-src/keyword-matcher.ts`, `scorer.ts`, `markets.ts`
 - [x] **GRAD/Score80/Whale стратегии отключены (17.06.2026):** 100% loss rate
   - `graduation-scanner.ts`: добавлен `GRAD_HUNTER_ENABLED` чек перед покупкой — при false логирует и пропускает
   - `scheduler.ts`: явный лог `✅ GRAD scanner disabled` при старте; `SCORE80_SIGNAL_ENABLED=false`, `WHALE_SIGNAL_ENABLED=false` — hardcoded
@@ -267,9 +314,12 @@ console.warn('[sell] ...')
   - **Правило:** W2/W3 участвуют только как создатели монет в `launchTriple()`, никаких buy/sell токенов
 - [x] **Polymarket Prediction Market Bot (20.06.2026):** migration 021, services/polymarket-bot, port 4009
   - Gamma API: 94 активных рынка, обновление каждые 15 мин
-  - AI scoring: Claude Haiku (2 вызова/сигнал: matchNewsToMarket + EV scoring, MIN_EV=0.12)
-  - 3 стратегии: X Trends (слабо матчит), GDELT clusters main_title, Volume Spikes
-  - DRY-RUN → LIVE после WR≥65% на 30+ сделках. Полная документация: `!аналитика бота полимаркет.md`
+  - **FAST PATH (29.06.2026):** `keyword-matcher.ts` — zero cost (<1ms), без LLM. Named entities + word overlap + sentiment + naive Bayesian EV
+  - **SLOW PATH:** LLM (Claude Haiku, $0.001/сигнал) — только при LOW keyword confidence
+  - 3 стратегии: X Trends, GDELT clusters, Volume Spikes
+  - **БАГ (29.06.2026 — ИСПРАВЛЕН):** Docker IMAGE содержал `CMD: sleep 600` → бот не запускался 9 дней (0 сигналов)
+  - Fix: `docker-compose.override.yml` с `entrypoint: ['node']` + `command: ['-r', 'ts-node/register'...]` override
+  - DRY-RUN → LIVE после WR≥65% на 30+ сделках. Документация: `!полимаркет настройка.md`
   - Telegram: /polystatus /polypositions /polytrades /polymarkets (Admin only)
 - [x] **Payment system USDT/Stars (20.06.2026):** migration 022
   - USDT на BSC: treasury `0x4C0B07Ad19D47994639D18ac2Af2FF82A0F95F37`, BSC USDT 18 decimals
@@ -347,8 +397,8 @@ console.warn('[sell] ...')
 | landing | 3001 | ✅ 24/7 | gadai.shop |
 | futures | 4003 | ✅ 24/7 | BTC futures анализ (paper mode) |
 | base-scanner | 4005 | ✅ 24/7 | Base Network EVM (dry-run) |
-| ton-scanner | 4007 | ✅ 24/7 | TON Network / STON.fi (dry-run, needs TON_WALLET_MNEMONIC) |
-| polymarket-bot | 4009 | ✅ 24/7 | Polymarket prediction market (DRY-RUN, target WR≥65% on 30 trades) |
+| ton-scanner | 4007 | ✅ 24/7 | TON Network / STON.fi (dry-run, shadow stats only — экосистема не подходит для стратегии, см. `!ТОН настройка.md`) |
+| polymarket-bot | 4009 | ✅ 24/7 | Polymarket (DRY-RUN, keyword+LLM, target WR≥65% on 30 trades) |
 
 **Только локально (НЕ на VPS):**
 - `scripts/launch-*.ts` — запуск токенов на pump.fun (нужен ключ + pumpdotfun-sdk локально)
@@ -414,6 +464,20 @@ console.warn('[sell] ...')
 ---
 
 ## Decisions Log (почему так сделано)
+
+### 2026-07 — Futures macro-monitor threshold (03.07.2026)
+**Решение:** `const ok = score >= 40 && btcChange1h > -1.5 && fg >= 10`
+**Почему:** Скомпилированный `macro-monitor.js` содержал `fg >= 20`. TS-патч с `fg >= 10` был сделан ранее но JS так и не пересобирался. F&G=19 → `ok=false` → бот пропустил SOL +$10 движение. Порог score снижен с 45 до 40 (нет смысла требовать 45/100 макро-скора для LONG когда рынок в легкой коррекции). btcChange1h смягчен с -1 до -1.5 (коррекция до -1.5% за час = нормально для Long).
+**Не менять** назад на `fg >= 20` — это слишком жёсткий порог, блокирует торговлю в FEAR-зоне.
+
+### 2026-07 — Источник цен: Jupiter Lite Price v3 (02.07.2026)
+**Решение:** `getPriceSolViaDS` использует `https://lite-api.jup.ag/price/v3?ids=<mint>,<SOL_MINT>` (usdPrice ratio), затем DexScreener fallback с приоритетом SOL-котируемых пар.
+**Почему:** Старый эндпоинт `lite.jup.ag/v1/prices` мёртв — быстрый источник цен НИКОГДА не работал, каждая проверка цены шла через DexScreener (лаг 15-45с) → стоп-лоссы исполнялись с проскальзыванием. v3 не поддерживает vsToken — только USD, поэтому цена в SOL = tokUsd/solUsd из одного запроса.
+**Не менять** на `price.jup.ag/v4` или `lite.jup.ag` — оба мертвы.
+
+### 2026-07 — deep_fear в getTierFromLabel regex (02.07.2026)
+**Решение:** regex `/:(deep_fear|extreme_fear|fear|neutral|bull|euphoria)$/i` — длинные альтернативы первыми.
+**Почему:** `:deep_fear` не матчился старым regex (перед `fear` стоял `_`, а не `:`) → все DEEP_FEAR покупки получали NEUTRAL TP/trail. При добавлении нового режима в getMarketRegime ОБЯЗАТЕЛЬНО добавлять его и в этот regex.
 
 ### 2026-06 — Entry price: SOL/readable-token, не SOL/base-unit
 **Решение:** `entry_price_sol` хранится в SOL per human-readable token (совпадает с DexScreener `priceNative`).
@@ -679,7 +743,63 @@ MIN_HOLDERS_24H=10              # min holders через 24ч — иначе п�
 2. `docker cp /tmp/file.ts container:/usr/src/app/services/autobuy/src/`
 3. `docker exec container sh -c 'cd /usr/src/app && npm --workspace services/autobuy run build'`
 4. `docker restart container`
-**ВАЖНО:** при `docker compose up -d --no-deps` контейнер пересоздаётся из IMAGE → patch теряется → нужно снова hot-patch после каждого recreate.
+**ВАЖНО (29.06.2026 — РЕШЕНО):** при `docker compose up -d --no-deps` контейнер пересоздаётся из IMAGE → patch теряется. Решение: `docker-compose.override.yml` с bind mounts (см. ниже).
+
+### 2026-06 — Patch persistence через docker-compose.override.yml (29.06.2026)
+**Решение:** Все hot-patches хранятся в `/opt/gad-patches/` на хосте VPS. Bind mounts в `docker-compose.override.yml` монтируют эти директории поверх container dist/.
+**Файл:** `/opt/gad-ai-terminal/GAD-AI-Terminal/docker-compose.override.yml`
+```yaml
+services:
+  autobuy:      volumes: [/opt/gad-patches/autobuy-dist:/usr/src/app/services/autobuy/dist]
+  base-scanner: volumes: [/opt/gad-patches/base-scanner-dist:/usr/src/app/services/base-scanner/dist]
+  ton-scanner:  volumes: [/opt/gad-patches/ton-scanner-dist:/usr/src/app/services/ton-scanner/dist]
+  polymarket-bot:
+    entrypoint: ['node']
+    command: ['-r', 'ts-node/register', '-r', 'tsconfig-paths/register', 'services/polymarket-bot/src/index.ts']
+    volumes: [/opt/gad-patches/polymarket-src:/usr/src/app/services/polymarket-bot/src]
+```
+**Patching process (теперь):**
+1. Отредактировать файл на хосте: `/opt/gad-patches/<service>-dist/file.js` (или `/opt/gad-patches/polymarket-src/file.ts`)
+2. `docker restart gad-ai-<service>` — готово. Recreate тоже не потеряет patch.
+**Текущие патчи в patch dirs:**
+- `autobuy-dist/auto-signal.js` → F&G < 10 (было < 13), `raydium-price-fetcher.js` → stub
+- `base-scanner-dist/monitor.js` → использует `result.amount_out` вместо balance diff
+- `ton-scanner-dist/scanner.js` → shadow_trades INSERT при dry-run
+- `polymarket-src/keyword-matcher.ts` → новый файл (zero-cost matcher) + dead market filter + aiProb cap (29.06.2026)
+- `polymarket-src/scorer.ts` → FAST PATH перед LLM + liquidity gate
+- `polymarket-src/markets.ts` → liquidityUsd field added
+- `futures-src/entry-strategy.ts` → Guard 6: EMA200 on 1H timeframe (29.06.2026)
+
+### 2026-06 — EXTREME_FEAR порог снижен до 10 (29.06.2026, было 13)
+**Решение:** `getMarketRegime()` возвращает EXTREME_FEAR только при F&G < 10 (было < 13).
+**Почему:** F&G=12 → режим EXTREME_FEAR → все Raydium покупки заморожены. Но F&G=12-13 = обычный коррекционный страх, не чёрный лебедь. Настоящая капитуляция = F&G < 10 (исторически: COVID (15), FTX collapse (6)).
+**Текущий F&G:** 12 → теперь попадает в FEAR zone → buys разрешены.
+**Не менять** без явного решения владельца.
+
+### 2026-06 — Raydium T2 заблокирован + HIGH_LIQ_RUG (29.06.2026)
+**Решение:** `RAYDIUM_MAX_LIQUIDITY_USD=80000` на VPS. T2 ($80k-$300k liq) — 0% win rate в аудите 79 сделок.
+**HIGH_LIQ_RUG guard:** Если `liq > $100k AND rug_risk >= 25` → skip. Правило: крупные пулы без сильного liqHealth score = whale trap (накопили ликвидность, готовятся к дампу).
+**Данные:** T1 ($12-80k) FEAR режим 46.2% win rate. T2: ни одной прибыльной сделки за всю историю трейдинга.
+**Не менять** обратно пока нет минимум 20 прибыльных T2 сделок.
+
+### 2026-06 — Futures Guard 6: EMA200 на 1H (29.06.2026)
+**Решение:** Дополнительный гвард в `entry-strategy.ts`: `fetchCandles1H(210)` → EMA200 на часовом графике.
+**Почему:** LONG в макро-даунтренде (price < EMA200/1H) → контртрендовые позиции. Исторически 70%+ убыточных фьючерс-трейдов — контртрендовые. Это "Guard 6" = последний фильтр перед сигналом.
+**Логика:** SHORT заблокирован если price > EMA200 (рынок в аптренде, шортить опасно). LONG заблокирован если price < EMA200 (рынок в даунтренде, лонговать опасно). Non-fatal: если 1H fetch упал → ошибка логируется, Guard 6 пропускается.
+**Не убирать** этот гвард — он защищает от худшего класса сделок.
+
+### 2026-06 — W3 Sniper F&G guard (29.06.2026)
+**Решение:** `startW3Sniper()` проверяет `checkFGHistorySafe()` перед любой активностью.
+**Почему:** W2/W3 кошельки несколько раз слили SOL до 0. Trейдинг на pump.fun разрешён только в устойчивом бычьем рынке (F&G > 45 × 5 дней подряд). Одиночный BULL день может быть dead cat bounce.
+**Параметры:** alternative.me API `/fng/?limit=5` → проверяет все 5 значений > 45. Если хоть один < 45 → BLOCKED.
+**Не включать** без явного подтверждения пользователя даже при F&G=50+.
+
+### 2026-06 — Polymarket dead market filter + aiProb cap (29.06.2026)
+**Проблема:** `entry_price=1.000` появлялся для рынков с priceYes≈0 (уже resolved). `aiProb` формула: `entryPrice*(1-strength*0.4) + strength*(0.55+strength*0.3)` при entryPrice=1.0 может давать aiProb=1.45 → EV=0.45 (математически > 0 но физически невозможно).
+**Фикс 1 (dead market):** `if (entryPrice < 0.05 || entryPrice > 0.95) continue;` перед EV-расчётом.
+**Фикс 2 (aiProb cap):** `Math.min(rawAiProb, 0.95)` — вероятность не может быть > 95%. При entryPrice > 0.95 → dead market filter поймает раньше.
+**Фикс 3 (sentiment gate):** `(bull + bear) >= 1` для MEDIUM confidence — направление без sentiment слов = случайный выбор YES/NO.
+**Не убирать** dead market filter — маркеты с priceYes < 5% или > 95% = нет ликвидности, нет смысла.
 
 ---
 
