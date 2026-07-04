@@ -72,9 +72,8 @@ export interface BaseToken {
 }
 
 // ─── DexScreener ─────────────────────────────────────────────────────────────
-// IMPORTANT: Do NOT use token-profiles or token-boosts endpoints — those return
-// ANY established token on Base (cbADA, SOL impersonators, etc.) which are not memes.
-// Use only new-pairs and trending-small-cap sources.
+// Uses ALL DexScreener endpoints. Impersonator guard + MAX_MCAP cap ($2M) filter
+// established tokens safely — no endpoint needs to be avoided.
 async function fetchDexScreener(): Promise<BaseToken[]> {
   const tokens: BaseToken[] = [];
 
@@ -160,6 +159,46 @@ async function fetchDexScreener(): Promise<BaseToken[]> {
     for (const p of pairs) {
       const token = mapDexPair(p);
       if (token) tokens.push(token);
+    }
+  } catch { }
+
+  // Source 6: DexScreener token-boosts/latest — recently boosted Base tokens.
+  // Projects paying for boosts have active communities = current momentum signal.
+  // Impersonator guard + MAX_MCAP cap eliminates established scam tokens.
+  try {
+    const r = await axios.get('https://api.dexscreener.com/token-boosts/latest/v1', { timeout: 6000 });
+    const boosts: any[] = Array.isArray(r.data) ? r.data : (r.data?.data ?? []);
+    const baseAddrs = boosts
+      .filter((b: any) => b.chainId === 'base' && b.tokenAddress)
+      .map((b: any) => (b.tokenAddress as string).toLowerCase())
+      .slice(0, 20);
+    for (let i = 0; i < baseAddrs.length; i += 5) {
+      const chunk = baseAddrs.slice(i, i + 5);
+      try {
+        const pr = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${chunk.join(',')}`, { timeout: 6000 });
+        const pairs: any[] = (pr.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
+        for (const p of pairs) { const t = mapDexPair(p); if (t) tokens.push(t); }
+      } catch { }
+    }
+    if (baseAddrs.length > 0) console.debug(`[base-scan] boosts/latest: ${baseAddrs.length} Base tokens`);
+  } catch { }
+
+  // Source 7: DexScreener token-boosts/top — tokens with most active boosts (highest spend).
+  // Different from /latest: these are the tokens with sustained community investment.
+  try {
+    const r = await axios.get('https://api.dexscreener.com/token-boosts/top/v1', { timeout: 6000 });
+    const boosts: any[] = Array.isArray(r.data) ? r.data : (r.data?.data ?? []);
+    const baseAddrs = boosts
+      .filter((b: any) => b.chainId === 'base' && b.tokenAddress)
+      .map((b: any) => (b.tokenAddress as string).toLowerCase())
+      .slice(0, 10); // top-10 only — these are high-mcap tokens, most will fail MAX_MCAP filter
+    for (let i = 0; i < baseAddrs.length; i += 5) {
+      const chunk = baseAddrs.slice(i, i + 5);
+      try {
+        const pr = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${chunk.join(',')}`, { timeout: 6000 });
+        const pairs: any[] = (pr.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
+        for (const p of pairs) { const t = mapDexPair(p); if (t) tokens.push(t); }
+      } catch { }
     }
   } catch { }
 
@@ -307,6 +346,52 @@ async function fetchDexScreenerFresh(): Promise<BaseToken[]> {
       }
     } catch { }
   }
+
+  // Source: community-takeovers/latest — tokens with recent community takeovers.
+  // CTO (Community TakeOver) = original devs abandoned, community took over → organic narrative.
+  // These are often low-mcap tokens with renewed momentum.
+  try {
+    const r = await axios.get('https://api.dexscreener.com/community-takeovers/latest/v1', { timeout: 6000 });
+    const ctos: any[] = Array.isArray(r.data) ? r.data : [];
+    const baseAddrs = ctos
+      .filter((c: any) => c.chainId === 'base' && c.tokenAddress)
+      .map((c: any) => (c.tokenAddress as string).toLowerCase())
+      .slice(0, 10);
+    for (let i = 0; i < baseAddrs.length; i += 5) {
+      const chunk = baseAddrs.slice(i, i + 5);
+      try {
+        const pr = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${chunk.join(',')}`, { timeout: 6000 });
+        const pairs: any[] = (pr.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
+        for (const p of pairs) { const t = mapDexPair(p); if (t) tokens.push(t); }
+      } catch { }
+    }
+    if (baseAddrs.length > 0) console.debug(`[base-scan] community-takeovers: ${baseAddrs.length} Base CTOs`);
+  } catch { }
+
+  // Source: metas/trending — top trending meme narratives on DexScreener.
+  // Fetches slugs with highest h1 marketCapChange → finds Base pairs in those metas.
+  // Example slugs: "ai-agent", "meme", "dog-themed", "based" — narrative plays in motion.
+  try {
+    const r = await axios.get('https://api.dexscreener.com/metas/trending/v1', { timeout: 6000 });
+    const metas: any[] = Array.isArray(r.data) ? r.data : [];
+    // Pick top 5 by h1 marketCapChange — fastest-moving narratives right now
+    const topMetas = metas
+      .filter((m: any) => m.slug && typeof m.marketCapChange?.h1 === 'number')
+      .sort((a: any, b: any) => b.marketCapChange.h1 - a.marketCapChange.h1)
+      .slice(0, 5);
+    for (const meta of topMetas) {
+      try {
+        const mr = await axios.get(`https://api.dexscreener.com/metas/meta/v1/${meta.slug}`, { timeout: 6000 });
+        const pairs: any[] = (mr.data?.pairs ?? []).filter((p: any) => p.chainId === 'base');
+        for (const p of pairs) {
+          const t = mapDexPair(p);
+          if (t) { (t as any)._hint = `meta:${meta.slug}`; tokens.push(t); }
+        }
+        if (pairs.length > 0) console.debug(`[base-scan] meta "${meta.slug}" (+${meta.marketCapChange?.h1?.toFixed(0)}% h1): ${pairs.length} Base pairs`);
+      } catch { }
+    }
+  } catch { }
+
   return tokens;
 }
 
@@ -480,10 +565,10 @@ export async function runScanCycle(): Promise<BaseToken[]> {
   ]);
   const all = dedupeByAddress([...dex, ...gecko, ...fresh, ...clanker]);
 
-  const geckoNote   = gecko.length   > 0 ? ` + ${gecko.length} Gecko`   : '';
-  const freshNote   = fresh.length   > 0 ? ` + ${fresh.length} DexFresh` : '';
+  const geckoNote   = gecko.length   > 0 ? ` + ${gecko.length} Gecko`    : '';
+  const freshNote   = fresh.length   > 0 ? ` + ${fresh.length} DexFresh+Metas` : '';
   const clankerNote = clanker.length > 0 ? ` + ${clanker.length} Clanker` : '';
-  console.info(`[base-scan] ${all.length} candidates from ${dex.length} DexScreener${geckoNote}${freshNote}${clankerNote}`);
+  console.info(`[base-scan] ${all.length} candidates from ${dex.length} DexScreener(boosts+CTO)${geckoNote}${freshNote}${clankerNote}`);
 
   const passed: BaseToken[] = [];
 
