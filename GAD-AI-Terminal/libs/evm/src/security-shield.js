@@ -40,6 +40,30 @@ async function isTokenSafeToTrade(tokenAddress, chainId = 8453, ageSec) {
     _cache.set(cacheKey, { result, expiresAt: Date.now() + CACHE_TTL_MS });
     return result;
 }
+// Layer 2b: honeypot.is — реальная симуляция buy+sell, включая V3-пулы (POKERBULL fix)
+async function checkHoneypotIs(address, chainId, maxTax) {
+    if (process.env.EVM_HONEYPOT_IS === 'false')
+        return { verdict: 'unknown', reason: 'DISABLED' };
+    try {
+        const r = await axios_1.default.get(`https://api.honeypot.is/v2/IsHoneypot?address=${address}&chainID=${chainId}`, { timeout: 8000 });
+        const d = r.data ?? {};
+        if (d.honeypotResult?.isHoneypot === true) {
+            const why = d.honeypotResult?.honeypotReason ? `:${String(d.honeypotResult.honeypotReason).slice(0, 40)}` : '';
+            return { verdict: 'block', reason: `HONEYPOT_IS_CONFIRMED${why}` };
+        }
+        const sellTax = Number(d.simulationResult?.sellTax ?? 0);
+        if (d.simulationSuccess === true && sellTax > maxTax) {
+            return { verdict: 'block', reason: `HONEYPOT_IS_SELL_TAX_${Math.round(sellTax)}PCT` };
+        }
+        if (d.simulationSuccess === false) {
+            return { verdict: 'unknown', reason: `SIM_FAILED:${String(d.simulationError ?? '').slice(0, 40)}` };
+        }
+        return { verdict: 'pass' };
+    }
+    catch (e) {
+        return { verdict: 'unknown', reason: `API_ERROR:${e.message?.slice(0, 30)}` };
+    }
+}
 async function _run(address, chainId, ageSec) {
     try {
         // ── Layer 1: Contract verification ────────────────────────────────────────
@@ -75,7 +99,13 @@ async function _run(address, chainId, ageSec) {
                 console.debug(`[evm-shield] ⚠ GoPlus no data + token <${GOPLUS_MIN_AGE_SEC/60}min old (${Math.round((ageSec ?? 0) / 60)}min) — BLOCKING ${address.slice(0, 10)}`);
                 return { isSafe: false, reason: 'GOPLUS_NO_DATA_NEW_TOKEN_UNDER_20MIN' };
             }
-            console.debug(`[evm-shield] ⚠ GoPlus no data for ${address.slice(0, 10)} (age unknown/old) — proceeding`);
+            // 03.07.26: раньше здесь был чистый fail-open — дыра POKERBULL.
+            const hpNoData = await checkHoneypotIs(address, chainId, chainId === 56 ? 5 : 12);
+            if (hpNoData.verdict === 'block')
+                return { isSafe: false, reason: hpNoData.reason };
+            if (hpNoData.verdict !== 'pass')
+                return { isSafe: false, reason: `NO_SAFETY_DATA_FAIL_CLOSED (${hpNoData.reason ?? 'no data'})` };
+            console.debug(`[evm-shield] GoPlus no data, honeypot.is PASS for ${address.slice(0, 10)} — proceeding`);
             return { isSafe: true };
         }
         // Hard blocks — each of these alone is sufficient to reject
@@ -99,6 +129,27 @@ async function _run(address, chainId, ageSec) {
             const tag = chainId === 56 ? 'BSC' : 'BASE';
             return { isSafe: false, reason: `${tag}_EXCESSIVE_TAX_${Math.round(Math.max(buyTax, sellTax))}PCT_LIMIT${maxTax}` };
         }
+        // Real-coin checks (03.07.26) — данные уже в GoPlus-отчёте, 0 доп. запросов.
+        // holder_count < 25 у токена с моментумом = бот-накрутка на пустом токене.
+        const holderCount = parseInt(report.holder_count ?? '0', 10);
+        const MIN_HOLDERS = Number(process.env.EVM_MIN_HOLDERS ?? '25');
+        if (holderCount > 0 && holderCount < MIN_HOLDERS) {
+            return { isSafe: false, reason: `LOW_HOLDERS_${holderCount}_MIN${MIN_HOLDERS}` };
+        }
+        // Владелец/создатель >30% supply = может сдампить. GoPlus отдаёт дробь 0-1.
+        const ownerPct = parseFloat(report.owner_percent ?? '0') * 100;
+        const creatorPct = parseFloat(report.creator_percent ?? '0') * 100;
+        const MAX_OWNER_PCT = Number(process.env.EVM_MAX_OWNER_PCT ?? '30');
+        if (ownerPct > MAX_OWNER_PCT || creatorPct > MAX_OWNER_PCT) {
+            return { isSafe: false, reason: `OWNER_HOLDS_${Math.round(Math.max(ownerPct, creatorPct))}PCT_MAX${MAX_OWNER_PCT}` };
+        }
+        // Layer 2b: honeypot.is финальная проверка (03.07.26 — POKERBULL fix).
+        // 'unknown' не блокирует здесь — финальную точку ставит canary в index.ts.
+        const hp = await checkHoneypotIs(address, chainId, maxTax);
+        if (hp.verdict === 'block')
+            return { isSafe: false, reason: hp.reason };
+        if (hp.verdict === 'unknown')
+            console.debug(`[evm-shield] honeypot.is inconclusive for ${address.slice(0, 10)} (${hp.reason}) — canary probe will verify`);
         return { isSafe: true };
     }
     catch (err) {

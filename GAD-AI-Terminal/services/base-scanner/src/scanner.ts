@@ -2,6 +2,7 @@ import axios from 'axios';
 import { query } from '@lib/db';
 import { checkTokenSafety, checkBaseSmartMoney } from '@lib/base';
 import { checkLaunchpadOrigin } from './launcher-filter';
+import { isBaseTokenImpersonator } from './impersonator-guard';
 
 // ─── Inline impersonator guard ───────────────────────────────────────────────
 // Blocks cross-chain scam tokens (cbADA, cbXRP, fake SOL, BNB, etc.)
@@ -407,6 +408,24 @@ const TIER2_MIN_BUYS = Number(process.env.BASE_TIER2_MIN_BUYS_H1   || '80');
 
 // ─── Filter ──────────────────────────────────────────────────────────────────
 function passesFilter(t: BaseToken): string | null {
+  // ── GUARD 0: Impersonator check (03.07.26 — КРИТИЧЕСКИЙ ФИКС) ──────────────
+  // БАГ: оба гарда (inline isChainImpersonator + модуль impersonator-guard.ts)
+  // существовали в коде, но НИ ОДИН не вызывался из passesFilter — мёртвый код.
+  // Именно поэтому cbXRP/cbADA/фейковый SOL покупались (все исторические убытки).
+  // Теперь: проверка по СИМВОЛУ (оба гарда) И по ИМЕНИ токена ("Coinbase Wrapped
+  // XRP" ловится паттерном \bXRP\b даже если символ замаскирован).
+  if (isChainImpersonator(t.symbol)) return `IMPERSONATOR symbol:${t.symbol}`;
+  if (isBaseTokenImpersonator(t.symbol, t.contract_address)) return `IMPERSONATOR pattern:${t.symbol}`;
+  if (t.name && isBaseTokenImpersonator(t.name, t.contract_address)) return `IMPERSONATOR name:"${t.name.slice(0, 30)}"`;
+
+  // ── GUARD 0b: Fake-mcap sanity (03.07.26) ───────────────────────────────────
+  // «Реальная капа» = за mcap стоит реальный пул. У настоящих мемов на Base
+  // liq/mcap обычно 5-50%. mcap $50k+ при пуле <2% от капы = нарисованный FDV
+  // на пустом пуле (классический сетап рага) — выход из такой позиции невозможен.
+  if (t.mcap_usd > 50000 && t.liquidity_usd > 0 && t.liquidity_usd / t.mcap_usd < 0.02) {
+    return `FAKE_MCAP: liq/mcap ${(t.liquidity_usd / t.mcap_usd * 100).toFixed(1)}% < 2% (painted FDV, thin pool)`;
+  }
+
   // PRIMARY GUARD: mcap cap — the only reliable way to exclude all established tokens.
   // SOL=$80B, ADA=$15B, cbXRP scams=$100M+. Real meme launches: $1k-$2.5M.
   // Tier 1: mcap ≤ MAX_MCAP (default $350k) — standard meme entry.
@@ -526,6 +545,7 @@ export async function runScanCycle(): Promise<BaseToken[]> {
     }
 
     // ⛽ Gas Reserve Safeguard — block buy if B1 ETH < buy_amount + 0.002 reserve for sells
+    const BUY_ETH = Number(process.env.BASE_BUY_ETH || '0.001');
     const BASE_ETH_RESERVE = Number(process.env.BASE_ETH_RESERVE || '0.002');
     const _ethWallet = process.env.BASE_WALLET_ADDRESS;
     if (_ethWallet) {

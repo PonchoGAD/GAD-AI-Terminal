@@ -166,7 +166,9 @@ async function sendAnalysis(chatId: number, mint: string) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 bot.onText(/\/start/, async (msg) => {
-  const name = msg.from?.first_name ?? 'degen';
+  // Escape Markdown special chars in user's name — usernames like "Theo_ne" crash bot with 400
+  const name = (msg.from?.first_name ?? 'degen')
+    .replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
   const tgId = msg.from?.id ?? msg.chat.id;
   const status = await getSubStatus(tgId);
   const tier = status.active ? planTier(status.plan) : 'free';
@@ -2364,6 +2366,20 @@ bot.onText(/^\/crossstatus(@\w+)?$/, async (msg) => {
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 bot.on('polling_error', (err) => log('error', 'polling:', err.message));
+
+// Prevent process crash from unhandled Telegram 400/429 errors (e.g. Markdown parse failure on user names)
+process.on('unhandledRejection', (reason: any) => {
+  const msg = reason?.message ?? String(reason);
+  if (msg.includes('ETELEGRAM') || msg.includes('TelegramError')) {
+    log('warn', 'TelegramError (unhandled, suppressed):', msg.slice(0, 120));
+  } else {
+    log('error', 'UnhandledRejection:', msg.slice(0, 200));
+  }
+});
+process.on('uncaughtException', (err) => {
+  log('error', 'UncaughtException (survived):', err.message?.slice(0, 200));
+});
+
 if (ADMIN_ID) bot.sendMessage(ADMIN_ID, '🤖 GAD AI Terminal online.').catch(() => {});
 log('info', 'Telegram bot running. t.me/gadai_sol_bot');
 

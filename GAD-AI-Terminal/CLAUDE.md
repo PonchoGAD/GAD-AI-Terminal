@@ -149,12 +149,24 @@ console.warn('[sell] ...')
   - **F&G тег в shadow_trades:** w3-sniper и bonding-smart пишут `fg:N` в filter_params при каждом входе.
   - **Все патчи на VPS деплойнуты** через `/opt/gad-patches/` bind-mounts. Все контейнеры запущены.
   - **Статистика 03.07.2026:** W3 Sniper 297 shadow (0% WR — рынок F&G=19, нет покупателей в 45s), Base Scanner 8 shadow (**37.5% WR**, avg win +52.6%), Raydium 124 live (30.6% WR, net -0.04 SOL), Polymarket 62 DRY-RUN сигнала (avg EV 18.8%).
-- [x] **PumpSwap Graduate Movers — shadow-сборщик (03.07.2026):** `services/autobuy/src/pumpswap-movers.ts`
+- [x] **POKERBULL post-mortem: honeypot.is в shield + CANARY-проба + poly dead-market fix (03.07.2026, ночь):**
+  - Корень POKERBULL: honeypot.is в safety.ts был недоступен (503) → score-=20 fail-open (исправлено владельцем: fail-closed). ДОПОЛНИТЕЛЬНО закрыты дыры в security-shield: (1) GoPlus-no-data для 20мин+ токенов был чистый fail-open → теперь требует honeypot.is PASS, иначе NO_SAFETY_DATA_FAIL_CLOSED; (2) добавлен Layer 2b — honeypot.is симуляция (V3-пулы!) после прохождения GoPlus (`EVM_HONEYPOT_IS=false` — выключить). TS+JS зеркально
+  - **🐤 CANARY-проба в index.ts (последний рубеж):** перед основной позицией микро-покупка 0.0003 ETH → немедленная продажа. Sell-revert = хонипот, blacklist 24ч, запись CANARY_HONEYPOT в base_positions. Единственная защита, работающая при лжи/даунтайме ВСЕХ API. `BASE_CANARY_ENABLED=false` — выключить, `BASE_CANARY_ETH` — размер
+  - **Polymarket dead-market fix:** сигналы с entry_price=1.000 шли через LLM SLOW PATH, который вставляет в БД напрямую и не имел фильтра 0.05-0.95. Гард добавлен в 2 точках: saveAndReturnSignal (все пути) + slow-path перед Claude gate
+  - Base остаётся BASE_AUTO_BUY=false (решение владельца) — включать только после shadow-статистики с новыми гардами
+- [x] **Base Scanner: impersonator-гард ПОДКЛЮЧЁН + real-coin проверки (03.07.2026):**
+  - **КРИТИЧЕСКИЙ БАГ:** оба анти-подделочных гарда (inline `isChainImpersonator` + модуль `impersonator-guard.ts`) существовали, но НИ ОДИН не вызывался из `passesFilter` — мёртвый код. Все покупки cbXRP/cbADA/fake-SOL прошли из-за этого
+  - Фикс: Guard 0 в passesFilter — проверка обоими гардами по СИМВОЛУ + по ИМЕНИ токена ("Coinbase Wrapped XRP" ловится по имени)
+  - Guard 0b FAKE_MCAP: mcap>$50k при liq/mcap<2% = нарисованный FDV на пустом пуле → skip
+  - security-shield (TS+JS зеркально): GoPlus real-coin checks — holder_count<25 → block (`EVM_MIN_HOLDERS`), owner/creator>30% supply → block (`EVM_MAX_OWNER_PCT`). 0 доп. API-запросов
+  - Деплой: build base-scanner → scp dist/scanner.js в /opt/gad-patches/base-scanner-dist/; scp libs/evm/src/security-shield.js (+.ts) в /opt/gad-patches/evm-src/; docker restart gad-ai-base-scanner
+- [x] **PumpSwap Graduate Movers — shadow-сборщик + W3 live-контур (03.07.2026):** `services/autobuy/src/pumpswap-movers.ts`
   - Раздел Movers pump.fun (30мин-4ч, mcap $80k-$1.5M) структурно невидим Raydium-сканеру: pumpswap не в JUPITER_DEX_IDS + mcap выше лимитов
   - Shadow-сборщик пишет каждого мувера в shadow_trades (strategy='pumpswap_movers') с полными входными метриками; runShadowCheck проставляет исходы 30м/1ч/4ч/8ч
-  - vps-stats.sh: профиль победителей (mcap/liq/age/pc5m/bs1h/volLiq по статусам) — Шаг 2
-  - Шаг 3 (покупки через W1) — ТОЛЬКО если профиль покажет +EV; W2/W3 не участвуют никогда
-  - Env: PUMPSWAP_MOVERS_SHADOW=false — выключить
+  - **W3 live-контур (решение владельца 03.07.2026 — отменяет запрет 19.06 ТОЛЬКО для этой стратегии):** покупки через PUMPFUN_WALLET_PRIVATE_KEY_2 при `PUMPSWAP_MOVERS_LIVE=true` И открытом data-gate (≥40 закрытых shadow, WR≥40%; аварийный `PUMPSWAP_GATE_OVERRIDE=true`)
+  - Live-параметры: 0.02 SOL/поз, max 1 позиция, 0.06 SOL/день, TP +30% / SL -15% / trail 12% после +15% / лимит 90 мин; входные пороги строже shadow (mcap $100-600k, liq≥$25k, buys5m≥5, bs1h≥1.2, volLiq≥25%); sell 100% через PumpPortal pool auto; state recovery после рестарта
+  - vps-stats.sh: профиль победителей + таблица W3 live-сделок (strategy='pumpswap_movers_live')
+  - Env: PUMPSWAP_MOVERS_SHADOW=false — выключить сборщик целиком
 - [x] **Fear-market фиксы: X-trend wiring + relaxed-shadow (03.07.2026):**
   - **X-тренд сигналы подключены к торговле:** autobuy НИКОГДА не читал `x_trend_signals` (сигналы шли только в TG и polymarket). Source 9 в fetchRaydiumPairs: coin_mint из x_trend_signals (<3ч) → кандидаты в общий пайплайн, метка `_xtrend` в shadow filter_params
   - **Relaxed-shadow калибровка:** после ужесточений 01.07 бот в FEAR = 0 покупок/сутки. Второй paper-проход по тем же кандидатам с июньскими порогами (liq≥12k, pc1h≥5, buys 20/10, vol/liq≥12%) → `shadow_trades strategy='raydium_relaxed'`. Через 3-5 дней сравнение WR strict vs relaxed решит, что ослаблять. `RAYDIUM_RELAX_SHADOW=false` — выключить
@@ -396,9 +408,10 @@ console.warn('[sell] ...')
 |---|---|---|---|
 | W1 WALLET_PRIVATE_KEY | EL4mS7Xg | Главный/казна/dev launch/Raydium autobuy | ~0.29 SOL (14.06.26) |
 | W2 PUMPFUN_WALLET_PRIVATE_KEY | CFmHWpmQ | **ТОЛЬКО ЗАПУСК МОНЕТ** (трейдинг ОТКЛЮЧЁН навсегда) | ~0.244 SOL (14.06.26) |
-| W3 PUMPFUN_WALLET_PRIVATE_KEY_2 | DJ8Tq8vi | **ТОЛЬКО ЗАПУСК МОНЕТ** (трейдинг ОТКЛЮЧЁН навсегда) | ~0.13 SOL (19.06.26) |
+| W3 PUMPFUN_WALLET_PRIVATE_KEY_2 | DJ8Tq8vi | Запуск монет + **PumpSwap Movers live** (единственная разрешённая торговая стратегия, за data-gate) | ~0.13 SOL (19.06.26) |
 
-> **ВАЖНО (19.06.2026):** W2 и W3 = ТОЛЬКО для `launchTriple()`. Трейдинг (BONDING_HOT, SOL_VELOCITY) на них слил все SOL в 0 несколько раз. Hardcoded: `BONDING_HOT_ENABLED=false`, `SOL_VELOCITY_ENABLED=false` в VPS .env.
+> **ВАЖНО (19.06.2026, обновлено 03.07.2026):** W2 = ТОЛЬКО для `launchTriple()`. Трейдинг (BONDING_HOT, SOL_VELOCITY) на W2/W3 слил все SOL в 0 несколько раз. Hardcoded: `BONDING_HOT_ENABLED=false`, `SOL_VELOCITY_ENABLED=false` в VPS .env.
+> **Исключение для W3 (03.07.2026, решение владельца):** стратегия PumpSwap Movers (`pumpswap-movers.ts`) МОЖЕТ торговать W3 — но только при `PUMPSWAP_MOVERS_LIVE=true` И открытом data-gate (≥40 закрытых shadow-сделок, WR≥40%). Никакие другие стратегии на W2/W3 не разрешены.
 > **Адреса:** W1=EL4mS7XgNPWRLca38vHu8JHPhpZcupLKuMipPNJeNwqt | W3=DJ8Tq8viRtMPb3HsK9NwoM2yhVgUdcwuxxePuQ1zPF6e | W2=CFmHWpmQki6dDhV9G82JWCq68x2axTwdnKDQvu7dPTcL
 
 ---
