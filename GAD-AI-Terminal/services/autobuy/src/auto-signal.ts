@@ -609,6 +609,9 @@ function geckoPoolToPair(pool: any): any | null {
 let lastRaydiumScan = 0;
 const RAYDIUM_SCAN_INTERVAL_MS = 120_000;
 
+// Relaxed-shadow дедуп: mint → ts последней записи (не спамим одну монету)
+const _relaxSeen = new Map<string, number>();
+
 // Birdeye Source 5 backoff — skip for 60min after 3 consecutive API errors (quota/400)
 let birdeyeFailCount = 0;
 let birdeyeBackoffUntil = 0;
@@ -937,6 +940,97 @@ async function fetchRaydiumPairs(): Promise<any[]> {
     }
   }
 
+  // Source 9: X-trend coins (03.07.26) — social-monitor находит тренд+монету и шлёт
+  // алерт в Telegram, но торговый конвейер эти сигналы НИКОГДА не читал (провод не был
+  // подключён). Теперь coin_mint из x_trend_signals попадает в общий фильтр-пайплайн.
+  // Монета всё равно проходит ВСЕ гейты — тренд лишь добавляет её в кандидаты.
+  try {
+    const { rows: xs } = await query<{ coin_mint: string }>(
+      `SELECT DISTINCT coin_mint FROM x_trend_signals
+       WHERE coin_mint IS NOT NULL
+         AND created_at > now() - interval '3 hours'
+       LIMIT 10`
+    );
+    let xAdded = 0;
+    for (const r of xs) {
+      const cm = r.coin_mint;
+      if (!cm || seen.has(cm) || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(cm)) continue;
+      const pair = await fetchTokenPairs(cm);
+      if (!pair) continue;
+      seen.add(cm);
+      (pair as any)._xtrend = true; // помечаем для shadow-статистики
+      results.push(pair);
+      xAdded++;
+    }
+    if (xAdded > 0) console.info(`[raydium-scan] 📣 X-trend coins: ${xAdded} candidates from x_trend_signals`);
+  } catch (e: any) {
+    console.debug(`[raydium-scan] x_trend source error: ${e.message?.slice(0, 40)}`);
+  }
+
+  // Source 10: DexScreener community-takeovers/latest — CTO tokens on Solana.
+  // CTO = original devs abandoned, community took over → renewed organic narrative = new buying.
+  // Often low-mcap tokens that got a second life — prime momentum trade setup.
+  try {
+    const ctoR = await axios.get('https://api.dexscreener.com/community-takeovers/latest/v1', { timeout: 6_000 });
+    const ctos: any[] = Array.isArray(ctoR.data) ? ctoR.data : [];
+    const ctoMints = ctos
+      .filter((c: any) => c.chainId === 'solana' && c.tokenAddress)
+      .map((c: any) => c.tokenAddress as string)
+      .filter((m: string) => !seen.has(m))
+      .slice(0, 15);
+    if (ctoMints.length > 0) {
+      const pairR = await axios.get(`${DEXSCREENER_BASE}/tokens/${ctoMints.join(',')}`, { timeout: 8_000 });
+      const pairs: any[] = pairR.data?.pairs ?? [];
+      let ctoAdded = 0;
+      for (const p of pairs) {
+        if (p.chainId !== 'solana') continue;
+        if (!JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')) continue;
+        const mint = p.baseToken?.address;
+        if (!mint || seen.has(mint)) continue;
+        seen.add(mint);
+        (p as any)._cto = true;
+        results.push(p);
+        ctoAdded++;
+      }
+      if (ctoAdded > 0) console.debug(`[raydium-scan] community-takeovers: ${ctoAdded} CTO Solana pairs`);
+    }
+  } catch (e: any) {
+    console.debug(`[raydium-scan] community-takeovers error: ${(e as any).message?.slice(0, 40)}`);
+  }
+
+  // Source 11: DexScreener metas/trending — top trending meme narratives right now.
+  // Fetches top 5 metas by h1 marketCapChange → finds Solana pairs in those narratives.
+  // Complements X-trend (Source 9): X-trend = Twitter signal, metas/trending = on-chain capital flow.
+  try {
+    const metaR = await axios.get('https://api.dexscreener.com/metas/trending/v1', { timeout: 6_000 });
+    const metas: any[] = Array.isArray(metaR.data) ? metaR.data : [];
+    const topMetas = metas
+      .filter((m: any) => m.slug && typeof m.marketCapChange?.h1 === 'number' && m.marketCapChange.h1 > 5)
+      .sort((a: any, b: any) => b.marketCapChange.h1 - a.marketCapChange.h1)
+      .slice(0, 5);
+    for (const meta of topMetas) {
+      try {
+        const mr = await axios.get(`https://api.dexscreener.com/metas/meta/v1/${meta.slug}`, { timeout: 6_000 });
+        const pairs: any[] = (mr.data?.pairs ?? []);
+        let metaAdded = 0;
+        for (const p of pairs) {
+          if (p.chainId !== 'solana') continue;
+          if (!JUPITER_DEX_IDS.includes(p.dexId?.toLowerCase() ?? '')) continue;
+          const mint = p.baseToken?.address;
+          if (!mint || seen.has(mint)) continue;
+          seen.add(mint);
+          (p as any)._meta = meta.slug;
+          results.push(p);
+          metaAdded++;
+        }
+        if (metaAdded > 0) console.debug(`[raydium-scan] meta "${meta.slug}" (+${meta.marketCapChange?.h1?.toFixed(0)}% h1): ${metaAdded} Solana pairs`);
+        await new Promise(r => setTimeout(r, 200));
+      } catch { /* skip per-meta errors */ }
+    }
+  } catch (e: any) {
+    console.debug(`[raydium-scan] metas/trending error: ${(e as any).message?.slice(0, 40)}`);
+  }
+
   const dxCount = results.length - raydiumDexCount;
   console.debug(`[raydium-scan] total: ${results.length} unique candidates (${raydiumDexCount} raydium-dex + ${dxCount} dx)`);
   return results;
@@ -965,10 +1059,13 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
   // FEAR/DEEP_FEAR: require stronger 1h momentum — tokens bucking the bearish trend need to prove it.
   // DEEP_FEAR (F&G 10-20): 8% floor (weaker market, real movers still show 8%+)
   // FEAR (F&G 20-45): 10% floor (contrarian thesis only valid with clear upside)
+  // 03.07.26: пороги вынесены в env — тюнинг без пересборки по relaxed-shadow данным
+  const FEAR_MIN_PC1H      = Number(process.env.RAYDIUM_FEAR_MIN_PC1H      || '10');
+  const DEEP_FEAR_MIN_PC1H = Number(process.env.RAYDIUM_DEEP_FEAR_MIN_PC1H || '8');
   const minPc1hOverride = regime === 'DEEP_FEAR'
-    ? Math.max(RAYDIUM_MIN_PC1H, 8)
+    ? Math.max(RAYDIUM_MIN_PC1H, DEEP_FEAR_MIN_PC1H)
     : regime === 'FEAR'
-      ? Math.max(RAYDIUM_MIN_PC1H, 10)
+      ? Math.max(RAYDIUM_MIN_PC1H, FEAR_MIN_PC1H)
       : RAYDIUM_MIN_PC1H;
 
   const dailySpent = await getDailySpent();
@@ -1171,10 +1268,13 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
       console.debug(`[raydium-scan] ✗ratio ${sym.padEnd(10)} vol/liq:${(vol1h/liq*100).toFixed(1)}% vol1h:$${vol1h.toFixed(0)} liq:$${liq.toFixed(0)}`);
       skipped.vol++; continue;
     }
-    // Vol acceleration: current 5m rate must be ≥40% of 1h average (was 25% — too loose).
-    // Prevents buying tokens where volume is tapering off (early dump detection).
-    if (vol5m > 0 && vol1h > 0 && vol5m * 12 < vol1h * 0.40) {
-      console.debug(`[raydium-scan] ✗vaccel ${sym.padEnd(10)} vol5m*12:$${(vol5m*12).toFixed(0)} < vol1h*40%:$${(vol1h*0.40).toFixed(0)} (tapering)`);
+    // Vol acceleration: current 5m rate vs 1h average — tapering-volume guard.
+    // 03.07.26: 0.40 был неаудированным ужесточением и в FEAR-рынке душил все входы
+    // (0 покупок/сутки). Дефолт 0.30 (середина между старым 0.25 и 0.40), настраивается
+    // через env без пересборки. Решение о финальном значении — по relaxed-shadow данным.
+    const VACCEL_MIN = Number(process.env.RAYDIUM_VACCEL_MIN || '0.30');
+    if (vol5m > 0 && vol1h > 0 && vol5m * 12 < vol1h * VACCEL_MIN) {
+      console.debug(`[raydium-scan] ✗vaccel ${sym.padEnd(10)} vol5m*12:$${(vol5m*12).toFixed(0)} < vol1h*${(VACCEL_MIN*100).toFixed(0)}%:$${(vol1h*VACCEL_MIN).toFixed(0)} (tapering)`);
       skipped.vol++; continue;
     }
 
@@ -1259,7 +1359,7 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`,
           ['solana','raydium',pair.baseToken?.symbol ?? mint.slice(0,8),mint,
            Number(pair.priceNative ?? 0),Number(pair.marketCap ?? 0),liq,pc1h,
-           JSON.stringify({pc5m,liq,vol1h,ageSec,regime,tier:tier.label}),
+           JSON.stringify({pc5m,liq,vol1h,ageSec,regime,tier:tier.label,xtrend:!!(pair as any)._xtrend,cto:!!(pair as any)._cto,meta:(pair as any)._meta||null}),
            tier.stopPct <= 0.08 ? 25 : 30, tier.stopPct * 100]
         ).catch(()=>{});
         newJobs++;
@@ -1317,5 +1417,65 @@ export async function processRaydiumOpportunities(walletAddress: string): Promis
     console.info(
       `[raydium-scan] ❌ No entries — liq=${skipped.liq} age=${skipped.age} mom=${skipped.momentum} ratio=${skipped.vol} cooldown=${skipped.cooldown} known=${skipped.known} trend=${skipped.trend} hype=${skipped.hype} liqH=${skipped.liqH} bot=${skipped.bot} holders=${skipped.holder}`
     );
+  }
+
+  // ── Relaxed-shadow калибровка (03.07.26) ────────────────────────────────────
+  // Проблема: после ужесточений 01.07 бот в FEAR даёт 0 покупок/сутки, хотя до
+  // 19.06 брал прибыльные сделки и в худшем страхе. Слепо ослаблять фильтры
+  // нельзя — вместо этого ВТОРОЙ проход по тем же кандидатам с июньскими
+  // (relaxed) порогами пишет shadow-сделки БЕЗ денег (strategy='raydium_relaxed').
+  // Через 3-5 дней сравниваем WR strict vs relaxed и ослабляем только то,
+  // что данные подтверждают. Полностью аддитивный блок — реальную торговлю
+  // не трогает; любая ошибка внутри гасится try/catch.
+  try {
+    if (process.env.RAYDIUM_RELAX_SHADOW !== 'false') {
+      let relaxed = 0;
+      for (const pair of uniquePairs) {
+        if (relaxed >= 8) break;
+        const mint = pair.baseToken?.address ?? '';
+        if (!mint || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint) || SKIP_MINTS.has(mint)) continue;
+        const seenTs = _relaxSeen.get(mint);
+        if (seenTs && Date.now() - seenTs < 6 * 3600e3) continue;
+
+        const entryPx = Number(pair.priceNative ?? 0);
+        if (entryPx <= 0) continue; // gecko-пары без цены — shadow-чекеру нечего мерить
+
+        const liq    = pair.liquidity?.usd ?? 0;
+        const vol1h  = pair.volume?.h1 ?? 0;
+        const vol5m  = pair.volume?.m5 ?? 0;
+        const pc1h   = Number(pair.priceChange?.h1 ?? 0);
+        const pc5m   = Number(pair.priceChange?.m5 ?? 0);
+        const pc6h   = Number(pair.priceChange?.h6 ?? 0);
+        const buys1h  = (pair.txns?.h1?.buys  ?? 0) as number;
+        const sells1h = (pair.txns?.h1?.sells ?? 0) as number;
+        const createdAt = pair.pairCreatedAt ? Number(pair.pairCreatedAt) : 0;
+        const ageSec = createdAt > 0 ? (Date.now() - createdAt) / 1000 : -1;
+
+        // Июньские (pre-hardening) пороги — то, с чем бот раньше торговал в страхе:
+        if (liq < 12000 || liq > 150000) continue;
+        if (ageSec >= 0 && (ageSec < 1800 || ageSec > 12 * 3600)) continue;
+        if (pc1h < 5 || pc1h > 60) continue;
+        if (vol5m > 0 && (pc5m < 1.5 || pc5m > 25 || pc5m < -20)) continue;
+        const isFreshR = ageSec >= 0 && ageSec < 6 * 3600;
+        if (isFreshR ? buys1h < 20 : buys1h < 10) continue;
+        if (buys1h > 0 && sells1h > buys1h * 1.3) continue;
+        if (liq > 0 && vol1h / liq < 0.12) continue;
+        if (pc6h < -15) continue;
+
+        _relaxSeen.set(mint, Date.now());
+        query(
+          `INSERT INTO shadow_trades (chain,strategy,symbol,contract_address,entry_price,entry_mcap_usd,entry_liq_usd,entry_pc1h,filter_params,tp1_target,stop_pct)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`,
+          ['solana', 'raydium_relaxed', pair.baseToken?.symbol ?? mint.slice(0, 8), mint,
+           entryPx, Number(pair.marketCap ?? 0), liq, pc1h,
+           JSON.stringify({ pc5m, vol1h, ageSec: Math.round(ageSec), regime, fg: cachedFearGreed, xtrend: !!(pair as any)._xtrend, cto: !!(pair as any)._cto, meta: (pair as any)._meta||null, relaxed: true }),
+           25, 10]
+        ).catch(() => {});
+        relaxed++;
+      }
+      if (relaxed > 0) console.info(`[raydium-scan] 🧪 relaxed-shadow: ${relaxed} candidates recorded (paper, June thresholds)`);
+    }
+  } catch (e: any) {
+    console.debug(`[raydium-scan] relaxed-shadow error: ${e.message?.slice(0, 40)}`);
   }
 }
