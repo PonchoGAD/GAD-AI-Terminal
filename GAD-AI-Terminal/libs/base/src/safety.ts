@@ -63,9 +63,10 @@ export async function checkTokenSafety(address: string): Promise<TokenSafetyResu
     score -= 25;
   }
   if (!hp.available) {
-    // API unavailable — penalize but don't block outright (GoPlus still runs)
-    flags.push('HONEYPOT_IS_UNAVAILABLE');
-    score -= 20;
+    // Fail-closed: if honeypot.is is down we can't confirm the token is sellable.
+    // POKERBULL (04.07.2026): passed all guards but reverted on sell — honeypot.is was unavailable at buy time.
+    console.warn(`[base-safety] ⛔ ${address.slice(0,8)} honeypot.is UNAVAILABLE — blocking buy (fail-closed)`);
+    return { is_verified: false, is_renounced: false, lp_locked: false, top10_pct: 0, safe_score: 0, flags: ['HONEYPOT_IS_UNAVAILABLE_BLOCK'] };
   }
 
   // ── STEP 2: GoPlus + Token Sniffer in parallel ────────────────────────────

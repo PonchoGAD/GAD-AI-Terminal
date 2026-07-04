@@ -10,9 +10,49 @@ const ethers_1 = require("ethers");
 const provider_1 = require("./provider");
 const BASESCAN_API = process.env.BASESCAN_API_KEY || '';
 const BASESCAN_URL = 'https://api.basescan.org/api';
+// PRIMARY honeypot check — simulates actual buy+sell on-chain via honeypot.is
+// More reliable than GoPlus for detecting sell-tax honeypots
+async function checkHoneypotIs(address) {
+    const safe = { available: false, isHoneypot: false, sellTax: 0, buyTax: 0 };
+    try {
+        const r = await axios_1.default.get(`https://api.honeypot.is/v2/IsHoneypot?address=${address}&chain=base`, { timeout: 7000 });
+        const d = r.data;
+        return {
+            available: true,
+            isHoneypot: d?.honeypotResult?.isHoneypot === true,
+            sellTax: Number(d?.simulationResult?.sellTax ?? 0),
+            buyTax: Number(d?.simulationResult?.buyTax ?? 0),
+        };
+    }
+    catch {
+        return safe; // available=false → caller will penalize
+    }
+}
 async function checkTokenSafety(address) {
     const flags = [];
     let score = 100;
+    // ── STEP 1: honeypot.is (PRIMARY, before anything else) ──────────────────
+    // Simulates an actual buy+sell transaction on-chain — most reliable honeypot check.
+    const hp = await checkHoneypotIs(address);
+    if (hp.isHoneypot) {
+        console.warn(`[base-safety] 🚨 ${address.slice(0, 8)} HONEYPOT confirmed by honeypot.is`);
+        return { is_verified: false, is_renounced: false, lp_locked: false, top10_pct: 0, safe_score: 0, flags: ['HONEYPOT_IS_CONFIRMED'] };
+    }
+    if (hp.sellTax > 5) {
+        console.warn(`[base-safety] 🚨 ${address.slice(0, 8)} SELL_TAX ${hp.sellTax.toFixed(0)}% detected by honeypot.is`);
+        return { is_verified: false, is_renounced: false, lp_locked: false, top10_pct: 0, safe_score: 0, flags: [`HONEYPOT_IS_SELL_TAX_${Math.round(hp.sellTax)}PCT`] };
+    }
+    if (hp.buyTax > 10) {
+        flags.push(`HONEYPOT_IS_BUY_TAX_${Math.round(hp.buyTax)}PCT`);
+        score -= 25;
+    }
+    if (!hp.available) {
+        // Fail-closed: if honeypot.is is down we can't confirm the token is sellable.
+        // POKERBULL (04.07.2026): passed all guards but reverted on sell — honeypot.is was unavailable at buy time.
+        console.warn(`[base-safety] ⛔ ${address.slice(0, 8)} honeypot.is UNAVAILABLE — blocking buy (fail-closed)`);
+        return { is_verified: false, is_renounced: false, lp_locked: false, top10_pct: 0, safe_score: 0, flags: ['HONEYPOT_IS_UNAVAILABLE_BLOCK'] };
+    }
+    // ── STEP 2: GoPlus + Token Sniffer in parallel ────────────────────────────
     // Run GoPlus + Token Sniffer in parallel (both non-blocking)
     const [goplus, tsResult] = await Promise.all([
         checkGoPlusHoneypot(address),
@@ -23,34 +63,41 @@ async function checkTokenSafety(address) {
         flags.push(...tsResult.flags);
         score = Math.min(score, tsResult.score);
     }
-    // GoPlus honeypot check runs first — fastest way to kill bad tokens
-    if (goplus.is_honeypot) {
-        flags.push('HONEYPOT');
-        score -= 80;
-    }
-    if (goplus.buy_tax > 10) {
-        flags.push(`BUY_TAX_${Math.round(goplus.buy_tax)}PCT`);
-        score -= 30;
-    }
-    if (goplus.sell_tax > 10) {
-        flags.push(`SELL_TAX_${Math.round(goplus.sell_tax)}PCT`);
-        score -= 40;
-    }
-    if (goplus.cannot_sell) {
-        flags.push('CANNOT_SELL');
-        score -= 80;
-    }
-    if (goplus.is_blacklisted) {
-        flags.push('BLACKLIST_FUNC');
-        score -= 20;
-    }
-    if (goplus.is_mintable) {
-        flags.push('MINTABLE');
+    // GoPlus secondary checks (ownership, mintable, blacklist, etc.)
+    if (goplus._failed) {
+        // GoPlus unavailable — penalize but don't block (honeypot.is already ran above)
+        flags.push('GOPLUS_UNAVAILABLE');
         score -= 15;
     }
-    if (goplus.hidden_owner) {
-        flags.push('HIDDEN_OWNER');
-        score -= 25;
+    else {
+        if (goplus.is_honeypot) {
+            flags.push('HONEYPOT');
+            score -= 80;
+        }
+        if (goplus.buy_tax > 10) {
+            flags.push(`BUY_TAX_${Math.round(goplus.buy_tax)}PCT`);
+            score -= 30;
+        }
+        if (goplus.sell_tax > 10) {
+            flags.push(`SELL_TAX_${Math.round(goplus.sell_tax)}PCT`);
+            score -= 40;
+        }
+        if (goplus.cannot_sell) {
+            flags.push('CANNOT_SELL');
+            score -= 80;
+        }
+        if (goplus.is_blacklisted) {
+            flags.push('BLACKLIST_FUNC');
+            score -= 20;
+        }
+        if (goplus.is_mintable) {
+            flags.push('MINTABLE');
+            score -= 15;
+        }
+        if (goplus.hidden_owner) {
+            flags.push('HIDDEN_OWNER');
+            score -= 25;
+        }
     }
     const [verified, renounced] = await Promise.all([
         checkVerified(address),
@@ -130,25 +177,28 @@ async function checkTokenSniffer(address) {
     }
 }
 // GoPlus Security API — free, no API key, covers Base (chain_id=8453)
+// IMPORTANT: catch returns a "failed" marker so callers can penalize instead of silently passing
 async function checkGoPlusHoneypot(address) {
-    const empty = { is_honeypot: false, buy_tax: 0, sell_tax: 0, cannot_sell: false, is_blacklisted: false, is_mintable: false, hidden_owner: false };
+    const failed = { is_honeypot: false, buy_tax: 0, sell_tax: 0, cannot_sell: false, is_blacklisted: false, is_mintable: false, hidden_owner: false, _failed: true };
+    const empty = { is_honeypot: false, buy_tax: 0, sell_tax: 0, cannot_sell: false, is_blacklisted: false, is_mintable: false, hidden_owner: false, _failed: false };
     try {
         const r = await axios_1.default.get(`https://api.gopluslabs.io/api/v1/token_security/8453?contract_addresses=${address}`, { timeout: 6000 });
         const result = r.data?.result?.[address.toLowerCase()];
         if (!result)
-            return empty;
+            return empty; // no data but API responded — treat as unknown
         return {
+            _failed: false,
             is_honeypot: result.is_honeypot === '1',
             buy_tax: Number(result.buy_tax ?? 0) * 100,
             sell_tax: Number(result.sell_tax ?? 0) * 100,
-            cannot_sell: result.cannot_sell_all === '1' || result.sell_tax === '1',
+            cannot_sell: result.cannot_sell_all === '1' || Number(result.sell_tax ?? 0) >= 1,
             is_blacklisted: result.is_blacklisted === '1',
             is_mintable: result.is_mintable === '1',
             hidden_owner: result.hidden_owner === '1',
         };
     }
     catch {
-        return empty; // GoPlus unavailable → continue without it
+        return failed; // GoPlus unavailable — flagged so caller can penalize
     }
 }
 async function checkVerified(address) {
