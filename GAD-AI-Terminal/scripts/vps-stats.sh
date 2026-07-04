@@ -11,7 +11,7 @@ OUT="vps-report/stats_${TS}.txt"
 
 ssh -i "$KEY" "$HOST" 'bash -s' <<'REMOTE' | tee "$OUT"
 set +e
-PG=$(docker ps --format '{{.Names}}' | grep -i postgres | head -1)
+PG=$(docker ps --format '{{.Names}}' | grep -i 'gad-ai-postgres' | head -1)
 AUTOBUY=$(docker ps --format '{{.Names}}' | grep -i autobuy | head -1)
 FUTURES=$(docker ps --format '{{.Names}}' | grep -i futures | head -1)
 POLY=$(docker ps --format '{{.Names}}' | grep -i polymarket | head -1)
