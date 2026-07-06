@@ -14,14 +14,14 @@ const MAX_POSITIONS  = Number(process.env.TON_MAX_POSITIONS      || '3');
 const DAILY_MAX_TON  = Number(process.env.TON_DAILY_MAX_TON      || '20');
 const SCAN_INTERVAL  = Number(process.env.TON_SCAN_INTERVAL_SEC  || '60') * 1000;
 
-const MIN_LIQ        = Number(process.env.TON_MIN_LIQUIDITY_USD  || '5000');
+const MIN_LIQ        = Number(process.env.TON_MIN_LIQUIDITY_USD  || '10000');  // ↑ was 5000 — liq<10k = rug-bait
 const MAX_LIQ        = Number(process.env.TON_MAX_LIQUIDITY_USD  || '200000');
 const MIN_PC1H       = Number(process.env.TON_MIN_PC1H           || '5');
 const MAX_PC1H       = Number(process.env.TON_MAX_PC1H           || '60');
-const MIN_PC5M       = Number(process.env.TON_MIN_PC5M           || '1');
-const MAX_AGE_SEC    = Number(process.env.TON_MAX_AGE_SEC        || '86400'); // 24h
-const MAX_BS_RATIO   = Number(process.env.TON_MAX_BUY_SELL_RATIO  || '3.0');
-const MIN_BUYS_H1    = Number(process.env.TON_MIN_BUYS_H1        || '5');
+const MIN_PC5M       = Number(process.env.TON_MIN_PC5M           || '3');      // ↑ was 1 — require real momentum
+const MAX_AGE_SEC    = Number(process.env.TON_MAX_AGE_SEC        || '21600');  // ↓ was 86400 — fresh tokens only (6h)
+const MAX_BS_RATIO   = Number(process.env.TON_MAX_BUY_SELL_RATIO  || '2.5');  // ↓ was 3.0 — tighter manipulation guard
+const MIN_BUYS_H1    = Number(process.env.TON_MIN_BUYS_H1        || '8');      // ↑ was 5 — require real activity
 const MIN_SAFE_SCORE = Number(process.env.TON_MIN_SAFE_SCORE     || '40');
 
 const seen = new Set<string>();
@@ -49,6 +49,9 @@ async function getOpenCount(): Promise<number> {
 
 function filterToken(t: TonToken): string | null {
   if (!t.jetton_address) return 'no_address';
+  // Skip unknown/test tokens with UKWN prefix or empty symbol
+  const sym = (t.symbol ?? '').toUpperCase();
+  if (!sym || sym.startsWith('UKWN') || sym === 'UNKNOWN') return `unknown_symbol:${t.symbol}`;
   if (t.liquidity_usd < MIN_LIQ) return `liq:${t.liquidity_usd.toFixed(0)}<${MIN_LIQ}`;
   if (t.liquidity_usd > MAX_LIQ) return `liq:${t.liquidity_usd.toFixed(0)}>${MAX_LIQ}`;
   if (t.age_sec > MAX_AGE_SEC)   return `age:${Math.floor(t.age_sec/3600)}h>${MAX_AGE_SEC/3600}h`;
@@ -233,23 +236,25 @@ async function monitorTonShadowTrades(): Promise<void> {
 
         const ageHours = (Date.now() - new Date(trade.created_at).getTime()) / 3_600_000;
 
-        // Time limit: 24h — close with last known price
-        if (ageHours >= 24) {
-          await query(
-            `UPDATE shadow_trades SET status='stopped', outcome_pct=0 WHERE id=$1`,
-            [trade.id]
-          );
-          console.info(`[ton-shadow] TIME_LIMIT ${trade.symbol} (24h)`);
-          continue;
-        }
-
         // Fetch current TON price via DexScreener
         const r = await axios.get(
           `https://api.dexscreener.com/latest/dex/tokens/${trade.contract_address}`,
           { timeout: 5_000 }
         );
         const tonPairs: any[] = (r.data?.pairs ?? []).filter((p: any) => p.chainId === 'ton');
-        if (!tonPairs.length) continue;
+
+        // No pairs found = token delisted / rugged
+        if (!tonPairs.length) {
+          if (ageHours >= 4) {
+            // Old enough to be sure it's gone, not just DS lag — record as -100%
+            await query(
+              `UPDATE shadow_trades SET status='stopped', outcome_pct=-100, outcome_at=NOW() WHERE id=$1`,
+              [trade.id]
+            );
+            console.info(`[ton-shadow] DELISTED ${trade.symbol} (no pairs, age:${ageHours.toFixed(1)}h) → -100%`);
+          }
+          continue;
+        }
 
         const bestPair = tonPairs.sort((a: any, b: any) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
         // priceUsd — same unit as entry_price (USD per readable token). Never priceNative:
@@ -261,7 +266,7 @@ async function monitorTonShadowTrades(): Promise<void> {
         // Anomaly guard: >20x in <24h on TON = data error, not a real trade we'd catch.
         // Real winners exit at TP1 (1.35x) anyway — a 20x cap can't hide legitimate wins.
         if (mult > 20 || mult <= 0) {
-          await query(`UPDATE shadow_trades SET status='invalid', outcome_pct=NULL WHERE id=$1`, [trade.id]);
+          await query(`UPDATE shadow_trades SET status='invalid', outcome_pct=NULL, outcome_at=NOW() WHERE id=$1`, [trade.id]);
           console.warn(`[ton-shadow] INVALID ${trade.symbol} — mult ${mult.toFixed(1)}x is a data anomaly`);
           continue;
         }
@@ -269,15 +274,25 @@ async function monitorTonShadowTrades(): Promise<void> {
         const tpMult  = 1 + (trade.tp1_target  / 100);  // e.g. tp1_target=35 → 1.35x
         const slMult  = 1 - (trade.stop_pct    / 100);  // e.g. stop_pct=10  → 0.90x
 
+        // Time limit: 24h — record actual price at expiry, not hardcoded 0
+        if (ageHours >= 24) {
+          await query(
+            `UPDATE shadow_trades SET status='expired', outcome_pct=$1, outcome_at=NOW() WHERE id=$2`,
+            [outcomePct, trade.id]
+          );
+          console.info(`[ton-shadow] EXPIRED ${trade.symbol} (24h) outcome:${outcomePct.toFixed(1)}%`);
+          continue;
+        }
+
         if (mult >= tpMult) {
           await query(
-            `UPDATE shadow_trades SET status='tp1_hit', outcome_price=$1, outcome_pct=$2 WHERE id=$3`,
+            `UPDATE shadow_trades SET status='tp1_hit', outcome_price=$1, outcome_pct=$2, outcome_at=NOW() WHERE id=$3`,
             [currentPrice, outcomePct, trade.id]
           );
           console.info(`[ton-shadow] TP1 ${trade.symbol} +${outcomePct.toFixed(1)}% (${mult.toFixed(3)}x)`);
         } else if (mult <= slMult) {
           await query(
-            `UPDATE shadow_trades SET status='stopped', outcome_pct=$1 WHERE id=$2`,
+            `UPDATE shadow_trades SET status='stopped', outcome_pct=$1, outcome_at=NOW() WHERE id=$2`,
             [outcomePct, trade.id]
           );
           console.info(`[ton-shadow] SL ${trade.symbol} ${outcomePct.toFixed(1)}% (${mult.toFixed(3)}x)`);
@@ -293,9 +308,9 @@ export function startTonScanner(): void {
   console.info(`[ton-scan] starting — AUTO_BUY:${AUTO_BUY} BUY:${BUY_TON}TON interval:${SCAN_INTERVAL/1000}s min_liq:$${MIN_LIQ} min_pc1h:${MIN_PC1H}%`);
   runTonScanCycle();
   setInterval(runTonScanCycle, SCAN_INTERVAL);
-  // Monitor shadow trades every 5 min — close TP/SL/TIME_LIMIT positions
+  // Monitor shadow trades every 2 min — 5 min was too slow, tokens crashed -34% before SL at -10%
   setTimeout(() => {
     monitorTonShadowTrades();
-    setInterval(monitorTonShadowTrades, 5 * 60 * 1000);
+    setInterval(monitorTonShadowTrades, 2 * 60 * 1000);
   }, 30_000); // 30s delay on startup
 }

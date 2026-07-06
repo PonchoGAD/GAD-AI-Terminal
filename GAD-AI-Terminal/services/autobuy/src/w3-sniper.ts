@@ -97,6 +97,7 @@ interface W3Position {
   remaining_pct:    number;
   db_id?:           string;
   price_sub_id?:    number;  // Helius accountSubscribe ID
+  last_price_update: number; // timestamp of last price update (accountSubscribe or DS fallback)
 }
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -163,9 +164,10 @@ function subscribePriceTracking(pos: W3Position): void {
         const vSol  = vSolLam / 1e9;
         const price = vSol / vTokens;
         pos.current_price = price;
+        pos.last_price_update = Date.now();
         if (price > pos.peak_price) pos.peak_price = price;
         const mult = price / pos.entry_price_sol;
-        console.debug(`[w3-sniper] 📊 ${pos.symbol} price=${(price * 1e9).toFixed(2)}n mult=${mult.toFixed(3)}x`);
+        console.debug(`[w3-sniper] 📊 ${pos.symbol} price=${(price * 1e9).toFixed(2)}n mult=${mult.toFixed(3)}x [WS]`);
       } catch (e: any) {
         console.warn(`[w3-sniper] parse err ${pos.symbol}: ${e.message?.slice(0, 50)}`);
       }
@@ -182,6 +184,36 @@ function unsubscribePriceTracking(pos: W3Position): void {
     try { getConn().removeAccountChangeListener(pos.price_sub_id); } catch {}
     pos.price_sub_id = undefined;
   }
+}
+
+// ─── DexScreener price fallback ───────────────────────────────────────────────
+// Helius accountSubscribe may silently fail on pump.fun PDAs (WS derivation from
+// https:// URL is fragile). This fallback polls DexScreener every ~25s so positions
+// are never blind even when accountSubscribe doesn't deliver.
+
+async function fetchPriceFallback(pos: W3Position): Promise<void> {
+  try {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 3_000);
+    const r = await fetch(
+      `https://api.dexscreener.com/latest/dex/tokens/${pos.mint}`,
+      { signal: ctrl.signal }
+    );
+    clearTimeout(tid);
+    if (!r.ok) return;
+    const j: any = await r.json();
+    const pairs: any[] = (j?.pairs ?? []).filter((p: any) => p.chainId === 'solana');
+    if (!pairs.length) return;
+    const best = pairs.sort((a: any, b: any) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
+    const priceNative = Number(best.priceNative ?? 0);
+    if (priceNative > 0 && priceNative !== pos.entry_price_sol) {
+      pos.current_price = priceNative;
+      pos.last_price_update = Date.now();
+      if (priceNative > pos.peak_price) pos.peak_price = priceNative;
+      const mult = priceNative / pos.entry_price_sol;
+      console.debug(`[w3-sniper] 📊 ${pos.symbol} price=${(priceNative * 1e9).toFixed(2)}n mult=${mult.toFixed(3)}x [DS-fallback]`);
+    }
+  } catch { /* silently ignore DS errors */ }
 }
 
 // ─── Daily limit reset ────────────────────────────────────────────────────────
@@ -375,11 +407,12 @@ async function openPosition(msg: any): Promise<void> {
     amount_sol:      BUY_SOL,
     token_amount:    tokenAmount,
     current_price:   entryPrice,
-    peak_price:      entryPrice,
-    tp1_triggered:   false,
-    tp2_triggered:   false,
-    tp3_triggered:   false,
-    remaining_pct:   100,
+    peak_price:        entryPrice,
+    tp1_triggered:     false,
+    tp2_triggered:     false,
+    tp3_triggered:     false,
+    remaining_pct:     100,
+    last_price_update: Date.now(),
   };
 
   positions.set(mint, pos);
@@ -397,7 +430,7 @@ async function openPosition(msg: any): Promise<void> {
       [
         symbol, mint, entryPrice,
         mcapSol * (Number(process.env.SOL_PRICE_USD) || 150),
-        JSON.stringify({ dev_buy_sol: devSol, token_amount: tokenAmount, buy_sol: BUY_SOL, shadow: SHADOW, fg: await getFearGreed().catch(() => null) }),
+        JSON.stringify({ dev_buy_sol: devSol, mcap_sol: mcapSol, token_amount: tokenAmount, buy_sol: BUY_SOL, shadow: SHADOW, fg: await getFearGreed().catch(() => null) }),
         TP1_MULT * 100 - 100,
         STOP_PCT * 100,
       ]
@@ -420,6 +453,12 @@ async function checkPositions(): Promise<void> {
   const now = Date.now();
 
   for (const [mint, pos] of positions) {
+    // DS fallback: if Helius accountSubscribe hasn't delivered a price update in 25s,
+    // poll DexScreener so positions are never blind due to WS connection issues.
+    if (now - pos.last_price_update > 25_000) {
+      await fetchPriceFallback(pos);
+    }
+
     const ageSec   = (now - pos.bought_at) / 1000;
     const mult     = pos.current_price / pos.entry_price_sol;
     const peakMult = pos.peak_price    / pos.entry_price_sol;
